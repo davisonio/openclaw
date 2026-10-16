@@ -20,7 +20,6 @@ import {
   UpdateRecoveryRequiredError,
 } from "../../infra/update-run-recovery.js";
 import { renderUpdateRunReport } from "../../infra/update-run-report.js";
-import type { UpdateRunResult } from "../../infra/update-runner-types.js";
 import * as updateFailureTriage from "../../infra/update-triage.js";
 import { defaultRuntime, ExitError } from "../../runtime.js";
 import * as existingStateWrite from "../../state/openclaw-state-db-existing-write.js";
@@ -29,6 +28,7 @@ import { closeStateDatabaseForTest } from "../../test-utils/database-cleanup.js"
 import { confirmUpdateDowngrade } from "./shared.js";
 import { updateExecutorNativeEntrypoints } from "./update-command-executor-native-runtime.test-support.js";
 import { snapshotUpdateFixtureTree } from "./update-command-filesystem-snapshot.test-support.js";
+import { resultFixture, stepFixture } from "./update-command-fixtures.test-support.js";
 import { failUpdateCommandRun } from "./update-command-result.js";
 import {
   registerUpdateRunReceiptTests,
@@ -55,7 +55,6 @@ vi.mock("node:crypto", async () => {
   const actual = await vi.importActual<typeof import("node:crypto")>("node:crypto");
   return { ...actual, randomUUID: vi.fn(actual.randomUUID) };
 });
-afterEach(() => vi.mocked(crypto.randomUUID).mockReset());
 
 const sourceImportArgs = resolveRuntimeWorkerUrl(
   updateExecutorNativeEntrypoints.commandRun,
@@ -70,11 +69,11 @@ function createRun(prefix: string, extraEnv: NodeJS.ProcessEnv = {}) {
   return { runId: createUpdateRun({ trigger: "cli" }, { env }).runId, env };
 }
 
-function updateResult(overrides: Partial<UpdateRunResult>): UpdateRunResult {
-  return { status: "error", mode: "npm", durationMs: 1, steps: [], ...overrides };
-}
+const updateResult = (overrides: Parameters<typeof resultFixture>[1]) =>
+  resultFixture(undefined, { status: "error", durationMs: 1, ...overrides });
 
 afterEach(async () => {
+  vi.mocked(crypto.randomUUID).mockReset();
   await closeStateDatabaseForTest();
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
@@ -102,15 +101,14 @@ it("persists fingerprint warnings before closing a rolled-back run", async () =>
       },
       durationMs: 50,
       steps: [
-        {
-          name: "global install rollback",
+        stepFixture("global install rollback", {
           command: "restore",
           cwd: env.OPENCLAW_STATE_DIR,
           durationMs: 1,
           exitCode: 0,
           advisory: { kind: "recoverable-maintenance", message: warnings.join("\n") },
           warnings,
-        },
+        }),
       ],
     }),
     { rolledBack: true, downtimeMs: 25 },
@@ -181,9 +179,9 @@ it("refuses interrupted update admission without touching SQLite when reusing it
   const { root, run, record, snapshot } = pendingRecovery();
   vi.stubEnv(UPDATE_RUN_ID_ENV, run.runId);
   const before = snapshot();
-  await expect(
-    admitUpdateCommandRun({ opts: { dryRun: false }, root }).then(() => "admitted"),
-  ).rejects.toBeInstanceOf(UpdateRecoveryRequiredError);
+  await expect(admitUpdateCommandRun({ opts: { dryRun: false }, root })).rejects.toBeInstanceOf(
+    UpdateRecoveryRequiredError,
+  );
   expect(snapshot()).toEqual(before);
   expect(loadUpdateRecovery(run.runId, { env: run.env })).toEqual(record);
 });
@@ -205,7 +203,7 @@ it.each(["displaced", "replacement", "both", "unreadable"] as const)(
       fs.writeFileSync(path.join(family, "displaced"), "incomplete database");
     }
     const before = snapshot();
-    await expect(admitUpdateCommandRun({ opts: {}, root }).then(() => "admitted")).rejects.toThrow(
+    await expect(admitUpdateCommandRun({ opts: {}, root })).rejects.toThrow(
       "Interrupted shared-database publication is read-only while full-state recovery is deferred",
     );
     expect(fs.existsSync(file)).toBe(false);
@@ -328,14 +326,12 @@ it("saves the complete error diagnostics before printing the Markdown path", asy
     updateResult({
       reason: "doctor-failed",
       steps: [
-        {
-          name: "candidate doctor lint",
+        stepFixture("candidate doctor lint", {
           command: "doctor --lint --json",
           cwd: "/fixture",
           durationMs: 1,
-          exitCode: 1,
           doctorLintFindings,
-        },
+        }),
       ],
     }),
     { rolledBack: false },

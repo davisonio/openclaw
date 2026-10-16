@@ -15,6 +15,7 @@ import { isDefaultInstallIdentity } from "../../config/paths.js";
 import { readGatewayServiceState, resolveGatewayService } from "../../daemon/service.js";
 import { FILE_LOCK_TIMEOUT_ERROR_CODE, withFileLock } from "../../infra/file-lock.js";
 import { runPackagePostInstallVerification } from "../../infra/package-update-verification-step.js";
+import { materializeUpdateCandidateStateWorker } from "../../infra/update-candidate-state.test-support.js";
 import { NativePackageRollbackError } from "../../infra/update-native-package-stage.js";
 import { createUpdateRun, getUpdateRun } from "../../infra/update-run-ledger.js";
 import { renderUpdateRunReport } from "../../infra/update-run-report.js";
@@ -22,6 +23,7 @@ import type { UpdateRunResult } from "../../infra/update-runner-types.js";
 import * as processRunner from "../../process/exec.js";
 import { closeOpenClawStateDatabaseAsync } from "../../state/openclaw-state-db.js";
 import type { UpdateConfigSnapshot } from "./update-command-config-snapshot.js";
+import { resultFixture } from "./update-command-fixtures.test-support.js";
 import * as packageIdentity from "./update-command-package-identity.js";
 import { inspectManagedGatewayServiceBeforeUpdate } from "./update-command-service-plan.js";
 import { createWindowsTaskAutoStartRecovery } from "./update-command-windows-task.js";
@@ -80,17 +82,14 @@ function setVersion(file: string, version: number) {
 }
 
 function failedCandidate(overrides: Partial<UpdateRunResult> = {}): UpdateRunResult {
-  return {
+  return resultFixture(candidateRoot, {
     status: "error",
-    mode: "npm",
-    root: candidateRoot,
     reason: "readyz-unhealthy",
     before: { version: "2026.9.1" },
     after: { version: "2026.9.3" },
-    steps: [],
     durationMs: 1,
     ...overrides,
-  };
+  });
 }
 
 function restoredStep(name = "rollback") {
@@ -139,7 +138,7 @@ function runRollback(input: Pick<RollbackInput, "configSnapshot"> & Partial<Roll
 }
 
 describe("verified package rollback", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetAllMocks();
     const serviceHome = fs.realpathSync(dirs.make("rollback-service-home-"));
     serviceStateDir = path.join(serviceHome, ".openclaw");
@@ -166,12 +165,7 @@ describe("verified package rollback", () => {
       fs.mkdirSync(path.join(root, "dist"));
       fs.writeFileSync(path.join(root, "dist", "index.js"), "export {};\n");
     }
-    const worker = "dist/infra/update-candidate-state.worker.js";
-    fs.mkdirSync(path.dirname(path.join(candidateRoot, worker)), { recursive: true });
-    fs.writeFileSync(
-      path.join(candidateRoot, worker),
-      `import ${JSON.stringify(pathToFileURL(path.resolve(worker)).href)};\n`,
-    );
+    await materializeUpdateCandidateStateWorker(candidateRoot);
     mocks.serviceState.mockImplementation(async (_service, options) => ({
       installed: true,
       loadState: { status: "loaded" },
@@ -507,25 +501,21 @@ describe("verified package rollback", () => {
           change === "doctor-settled-exception"
             ? await runPackagePostInstallVerification(candidateRoot, runDoctor)
             : await runDoctor();
-        if (change === "doctor-settled-exception") {
-          assert(doctorStep);
+        if (change === "doctor-settled-exception" || change === "doctor-compensated") {
+          assert(doctorStep, "Doctor failure did not return an update step");
+          const settled = change === "doctor-settled-exception";
           expect(doctorStep).toMatchObject({
-            name: "post-install-verify",
+            ...(settled ? { name: "post-install-verify" } : {}),
             exitCode: 1,
-            stderrTail: expect.stringContaining(settledFailure.message),
+            stderrTail: expect.stringContaining(
+              settled ? settledFailure.message : "Doctor runtime activation refused",
+            ),
           });
-          result.reason = "runtime-verification-failed";
-          result.steps.push(doctorStep);
-        }
-        if (change === "doctor-compensated") {
-          if (!doctorStep) {
-            throw new Error("Doctor compensation did not return an update step");
+          if (settled) {
+            result.reason = "runtime-verification-failed";
+          } else {
+            expect(doctorStep.advisory).toBeUndefined();
           }
-          expect(doctorStep).toMatchObject({
-            exitCode: 1,
-            stderrTail: expect.stringContaining("Doctor runtime activation refused"),
-          });
-          expect(doctorStep.advisory).toBeUndefined();
           result.steps.push(doctorStep);
         }
         expect(fs.readFileSync(`${configPath}.pre-update`, "utf8")).toBe(originalRaw);
@@ -811,22 +801,12 @@ describe("verified package rollback", () => {
         backupRoot: previousRoot,
         complete: async () => {},
         rollback: async () => {
-          try {
-            await withFileLock(configPath, lockOptions, async () => {
-              foreignWrite = true;
-              fs.writeFileSync(configPath, '{"gateway":{"mode":"local","port":19103}}\n');
-            });
-          } catch (error) {
-            if (
-              !(
-                error instanceof Error &&
-                "code" in error &&
-                error.code === FILE_LOCK_TIMEOUT_ERROR_CODE
-              )
-            ) {
-              throw error;
-            }
-          }
+          const write = withFileLock(configPath, lockOptions, async () => {
+            foreignWrite = true;
+            fs.writeFileSync(configPath, '{"gateway":{"mode":"local","port":19103}}\n');
+          });
+          await expect(write).rejects.toBeInstanceOf(Error);
+          await expect(write).rejects.toHaveProperty("code", FILE_LOCK_TIMEOUT_ERROR_CODE);
           return restoredStep("package rollback");
         },
       },

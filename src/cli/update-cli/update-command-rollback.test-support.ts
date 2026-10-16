@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { expect, it, vi, type Mock } from "vitest";
+import { assert, expect, it, vi, type Mock } from "vitest";
 import {
   createConfigIO,
   setRuntimeConfigSnapshotRefreshHandler,
@@ -8,12 +8,7 @@ import {
   writeConfigFile,
 } from "../../config/config.js";
 import { hashConfigRaw } from "../../config/io.read-helpers.js";
-import type { ConfigWriteOptions } from "../../config/io.types.js";
-import type {
-  AgentDefaultsConfig,
-  ConfigFileSnapshot,
-  OpenClawConfig,
-} from "../../config/types.js";
+import type { AgentDefaultsConfig, OpenClawConfig } from "../../config/types.js";
 import { readUpdateStateSchemaVersionsInProcess } from "../../infra/update-candidate-state.js";
 import {
   captureUpdateDoctorConfigWrites,
@@ -22,19 +17,22 @@ import {
 import { prepareUpdateFailureReport } from "../../infra/update-failure-report-prepare.js";
 import { updateRecoverySchema } from "../../infra/update-recovery.js";
 import { createUpdateRun, getUpdateRun } from "../../infra/update-run-ledger.js";
-import type { UpdateRunResult } from "../../infra/update-runner-types.js";
 import { CommandProcessCleanupError } from "../../process/exec-result.js";
 import { defaultRuntime } from "../../runtime.js";
 import { closeOpenClawStateDatabaseAsync } from "../../state/openclaw-state-db.js";
 import { printResult } from "./progress.js";
+import { resultFixture, stepFixture } from "./update-command-fixtures.test-support.js";
 import { rollbackFailedUpdate } from "./update-command-rollback.js";
 import { completeUpdateCommandRun } from "./update-command-run.js";
 
+type SchemaInput = Parameters<typeof readUpdateStateSchemaVersionsInProcess>[0];
+const doctorMetadata = {
+  meta: { migrations: { modelPolicyAllowlist: true }, lastTouchedVersion: "2026.9.3" },
+  wizard: { lastRunVersion: "2026.9.3", lastRunCommand: "doctor" },
+};
+
 export async function readRollbackFixtureSchemaVersions(
-  input: Pick<
-    Parameters<typeof readUpdateStateSchemaVersionsInProcess>[0],
-    "stateDir" | "config" | "env"
-  >,
+  input: Pick<SchemaInput, "stateDir" | "config" | "env">,
 ) {
   // Config and ledger setup can retain SQLite handles. Drain them before the
   // fixture reader closes source descriptors; candidate checks stay isolated.
@@ -46,10 +44,8 @@ export async function readRollbackFixtureState(
   stateDir: string,
   env: NodeJS.ProcessEnv = { OPENCLAW_STATE_DIR: stateDir },
 ) {
-  const configSnapshot = await createConfigIO({
-    env,
-    pluginValidation: "skip",
-  }).readConfigFileSnapshot();
+  const io = createConfigIO({ env, pluginValidation: "skip" });
+  const configSnapshot = await io.readConfigFileSnapshot();
   const schemaVersions = await readRollbackFixtureSchemaVersions({
     stateDir,
     config: configSnapshot.sourceConfigBeforeMigrations ?? configSnapshot.sourceConfig,
@@ -108,17 +104,13 @@ export async function writeDoctorRollbackReceipt(params: {
     } else if (change !== "doctor-unchanged") {
       const nextConfig: OpenClawConfig = {
         ...(input.sourceConfigBeforeMigrations ?? input.sourceConfig),
-        meta: {
-          migrations: { modelPolicyAllowlist: true },
-          lastTouchedVersion: "2026.9.3",
-        },
+        ...doctorMetadata,
         agents: {
           defaults: {
             ...authored.agents.defaults,
             modelPolicy: { allow: ["openai/gpt-5.6-luna"] },
           },
         },
-        wizard: { lastRunVersion: "2026.9.3", lastRunCommand: "doctor" },
       };
       const writeOptions = {
         baseSnapshot: input,
@@ -126,7 +118,29 @@ export async function writeDoctorRollbackReceipt(params: {
         skipPluginValidation: true,
       };
       if (change === "doctor-compensated") {
-        doctorError = await writeWithRefreshFailure(nextConfig, writeOptions, originalRaw);
+        const writtenPath = input.path;
+        setRuntimeConfigSnapshotRefreshHandler({
+          preflight: () => undefined,
+          refresh: () => {
+            expect(JSON.parse(fs.readFileSync(writtenPath, "utf8"))).toMatchObject(doctorMetadata);
+            throw new Error("Doctor runtime activation refused");
+          },
+        });
+        try {
+          const error = await writeConfigFile(nextConfig, writeOptions).catch(
+            (cause: unknown) => cause,
+          );
+          expect(error).toMatchObject({
+            name: "ConfigWritePostCommitError",
+            configPath: writtenPath,
+            rollbackStatus: "restored",
+          });
+          expect(fs.readFileSync(writtenPath, "utf8")).toBe(originalRaw);
+          assert(error instanceof Error, "Doctor must reject after its refresh failure");
+          doctorError = error;
+        } finally {
+          setRuntimeConfigSnapshotRefreshHandler(null);
+        }
       } else {
         await io.writeConfigFile(nextConfig, writeOptions);
       }
@@ -152,47 +166,10 @@ export async function writeDoctorRollbackReceipt(params: {
   return doctorError;
 }
 
-async function writeWithRefreshFailure(
-  nextConfig: OpenClawConfig,
-  writeOptions: ConfigWriteOptions & { baseSnapshot: ConfigFileSnapshot },
-  originalRaw: string,
-): Promise<Error> {
-  const configPath = writeOptions.baseSnapshot.path;
-  setRuntimeConfigSnapshotRefreshHandler({
-    preflight: () => undefined,
-    refresh: () => {
-      expect(JSON.parse(fs.readFileSync(configPath, "utf8"))).toMatchObject({
-        meta: { migrations: { modelPolicyAllowlist: true } },
-        wizard: { lastRunCommand: "doctor" },
-      });
-      throw new Error("Doctor runtime activation refused");
-    },
-  });
-  try {
-    const error = await writeConfigFile(nextConfig, writeOptions).catch((cause: unknown) => cause);
-    expect(error).toMatchObject({
-      name: "ConfigWritePostCommitError",
-      configPath,
-      rollbackStatus: "restored",
-    });
-    expect(fs.readFileSync(configPath, "utf8")).toBe(originalRaw);
-    if (!(error instanceof Error)) {
-      throw new Error("Doctor config write completed without the expected refresh failure");
-    }
-    return error;
-  } finally {
-    setRuntimeConfigSnapshotRefreshHandler(null);
-  }
-}
-
 export async function expectActiveRollbackIdentity(params: {
   failure:
     | "partial-restore"
-    | "restart-unhealthy"
-    | "restart-refused"
-    | "restart-threw"
-    | "restart-cleanup"
-    | "restart-timeout";
+    | `restart-${"unhealthy" | "refused" | "threw" | "cleanup" | "timeout"}`;
   candidateRoot: string;
   previousRoot: string;
   stateDir: string;
@@ -203,16 +180,13 @@ export async function expectActiveRollbackIdentity(params: {
   const activePackageRoot = rollbackSucceeded ? previousRoot : null;
   const env = { OPENCLAW_STATE_DIR: stateDir };
   const { configSnapshot, schemaVersions } = await readRollbackFixtureState(stateDir, env);
-  const result: UpdateRunResult = {
+  const result = resultFixture(candidateRoot, {
     status: "error",
-    mode: "npm",
-    root: candidateRoot,
     reason: "readyz-unhealthy",
-    steps: [],
     durationMs: 1,
     before: { version: "2026.9.1" },
     after: { version: "2026.9.3" },
-  };
+  });
   const cleanup = new AggregateError(
     [new CommandProcessCleanupError()],
     "rollback inspection cleanup uncertain",
@@ -251,11 +225,11 @@ export async function expectActiveRollbackIdentity(params: {
       complete: vi.fn(async () => {}),
       rollback: vi.fn(async () => ({
         name: "rollback",
-        activePackageRoot,
         command: "restore",
         cwd: previousRoot,
         exitCode: rollbackSucceeded ? 0 : 1,
         durationMs: 1,
+        activePackageRoot,
       })),
     },
   });
@@ -313,27 +287,23 @@ export function registerRollbackReportTests(
         outcome === "advisory"
           ? "Restored detached HEAD; branch main still points to the activated commit."
           : `Cannot verify rollback branch transition: expected ${"a".repeat(40)} -> ${"b".repeat(40)}.`;
-      const restored = {
-        name: "git-runtime-rollback",
+      const restored = stepFixture("git-runtime-rollback", {
         command: "restore previous Git runtime",
         cwd: previousRoot,
-        durationMs: 0,
         exitCode: outcome === "advisory" ? 0 : 1,
         ...(outcome === "advisory"
           ? { advisory: { kind: "recoverable-maintenance" as const, message } }
           : { stderrTail: message }),
-      };
+      });
       const rolledBack = await rollbackFailedUpdate({
         definitionRecovery: {},
-        result: {
+        result: resultFixture(candidateRoot, {
           status: "error",
           mode: "git",
-          root: candidateRoot,
           reason: "readyz-unhealthy",
           verification: { readyz: false, settled: false },
-          steps: [],
           durationMs: 1,
-        },
+        }),
         previousRoot,
         schemaVersions,
         configSnapshot,

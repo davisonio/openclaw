@@ -1,16 +1,20 @@
+import { lstatSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createDeferred } from "../../../test/helpers/promise.js";
+import { awaitGateBeforeSettlement, createDeferred } from "../../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { createConfigIO } from "../../config/config.js";
 import { createRetainedPackageSwap } from "../../infra/package-update-swap.test-support.js";
 import { readUpdateStateSchemaVersions } from "../../infra/update-candidate-state.js";
+import { materializeUpdateCandidateStateWorker as writeCandidateWorker } from "../../infra/update-candidate-state.test-support.js";
 import { createRetainedUpdateRecovery } from "../../infra/update-retained-recovery.test-support.js";
 import { createUpdateRun, getUpdateRun } from "../../infra/update-run-ledger.js";
 import { OPENCLAW_STATE_SCHEMA_VERSION } from "../../state/openclaw-state-db-contract.js";
 import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
+import { snapshotUpdateFixtureTree } from "./update-command-filesystem-snapshot.test-support.js";
+import { resultFixture } from "./update-command-fixtures.test-support.js";
 import { rollbackFailedUpdate } from "./update-command-rollback.js";
 import * as service from "./update-command-service.js";
 
@@ -49,14 +53,7 @@ async function rollbackFixture(root: string) {
     authority,
     params: {
       definitionRecovery: {},
-      result: {
-        status: "error" as const,
-        mode: "npm" as const,
-        root,
-        reason: "readyz-unhealthy",
-        steps: [],
-        durationMs: 1,
-      },
+      result: resultFixture(root, { status: "error", reason: "readyz-unhealthy", durationMs: 1 }),
       previousRoot: root,
       schemaVersions,
       configSnapshot,
@@ -74,22 +71,6 @@ function observeStat(target: string, observed: () => void | Promise<void>, defau
     }
     return result;
   });
-}
-
-async function writeCandidateWorker(root: string) {
-  const worker = path.join(root, "dist/infra/update-candidate-state.worker.js");
-  await fs.mkdir(path.dirname(worker), { recursive: true });
-  // Run this source generation's child reader without an unrelated checkout build.
-  await fs.writeFile(
-    worker,
-    `
-      import { tsImport } from ${JSON.stringify(import.meta.resolve("tsx/esm/api"))};
-      await tsImport(${JSON.stringify(new URL("../../infra/update-candidate-state.worker.ts", import.meta.url).href)}, {
-        parentURL: import.meta.url,
-        tsconfig: ${JSON.stringify(path.resolve("tsconfig.json"))},
-      });
-    `,
-  );
 }
 
 describe("package rollback executor ownership", () => {
@@ -115,7 +96,7 @@ describe("package rollback executor ownership", () => {
     });
     const result = await rollbackFailedUpdate({
       definitionRecovery: {},
-      result: { status: "error", mode: "npm", root, steps: [], durationMs: 0 },
+      result: resultFixture(root, { status: "error" }),
       previousRoot: root,
       rollbackBlockedReason: "state-migrated-no-rollback",
       configSnapshot,
@@ -139,23 +120,8 @@ describe("package rollback executor ownership", () => {
       '{"name":"openclaw","version":"2.0.0","type":"module"}',
     );
     const { env, run, authority, params } = await rollbackFixture(packageRoot);
-    const snapshot = async () => {
-      const root = path.join(base, "live");
-      const entries = (await fs.readdir(root, { recursive: true })).toSorted();
-      return await Promise.all(
-        entries.map(async (entry) => {
-          const file = path.join(root, entry);
-          const stat = await fs.lstat(file);
-          return {
-            entry,
-            ino: stat.ino,
-            mode: stat.mode,
-            content: stat.isFile() ? await fs.readFile(file) : null,
-          };
-        }),
-      );
-    };
-    const before = await snapshot();
+    const snapshot = () => snapshotUpdateFixtureTree(path.join(base, "live"), lstatSync);
+    const before = snapshot();
     const history = getUpdateRun(run.runId, { env });
     const observed = createDeferred();
     const resume = createDeferred();
@@ -173,12 +139,11 @@ describe("package rollback executor ownership", () => {
       packageTransaction: transaction,
     });
     try {
-      await Promise.race([
+      await awaitGateBeforeSettlement(
         observed.promise,
-        pending.then(() => {
-          throw new Error("Rollback finished before the package observation");
-        }),
-      ]);
+        pending,
+        "Rollback finished before the package observation",
+      );
       authority.live = false;
       resume.resolve();
       const outcome = await pending;
@@ -187,13 +152,13 @@ describe("package rollback executor ownership", () => {
         pendingRecoveryReason: "original executor lost",
         result: { recovery: { serviceRestartSafe: false } },
       });
-      expect(await snapshot()).toEqual(before);
+      expect(snapshot()).toEqual(before);
       expect(getUpdateRun(run.runId, { env })).toEqual(history);
       expect(restart).not.toHaveBeenCalled();
       await expect(transaction.complete({ activationVerified: true }, () => {})).rejects.toThrow(
         "original executor lost",
       );
-      expect(await snapshot()).toEqual(before);
+      expect(snapshot()).toEqual(before);
     } finally {
       resume.resolve();
       await pending;
@@ -225,11 +190,11 @@ describe("package rollback executor ownership", () => {
         authority.live = false;
         return {
           name: "global install rollback",
-          activePackageRoot: previousRoot,
           command: "restore",
           cwd: previousRoot,
           durationMs: 1,
           exitCode: 0,
+          activePackageRoot: previousRoot,
         };
       });
       const outcome = await rollbackFailedUpdate({

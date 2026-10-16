@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
-import { createServer, type Socket } from "node:net";
 import path from "node:path";
-import { createInterface } from "node:readline";
 import { DatabaseSync } from "node:sqlite";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  fixtureReceiptClientSource,
+  openFixtureReceiptChannel,
+} from "../../../test/helpers/fixture-receipts.js";
 import { createDeferred, withinTest } from "../../../test/helpers/promise.js";
 import { runQaGatewayFixture } from "../../../test/helpers/qa-gateway-cleanup.js";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
@@ -21,7 +23,6 @@ import { resolveRuntimeWorkerUrl } from "../../infra/runtime-worker-url.js";
 import * as tempRoot from "../../infra/tmp-openclaw-dir.js";
 import { createManagedHandoffLeaseStore } from "../../infra/update-managed-service-handoff-lease.js";
 import { runUtf8CommandWithTimeout } from "../../process/exec.js";
-import { reserveTestPortListener } from "../../test-utils/port-claims.js";
 import type { UpdateCommandOptions } from "./shared.js";
 import { updateExecutorNativeEntrypoints } from "./update-command-executor-native-runtime.test-support.js";
 import {
@@ -131,51 +132,25 @@ describe.skipIf(process.platform === "win32")("retained POSIX native restart", (
     "restarts retained A with a real child and keeps both owners until %s",
     async (outcome, { signal }) => {
       const effect = path.join(a, "effect");
-      const started = createDeferred();
+      const receipts = await openFixtureReceiptChannel();
       const definition = path.join(a, "unit");
       fs.writeFileSync(definition, "original Node A and service definition");
       let pid = 0;
       let complete = false;
       let work: Promise<void> | undefined;
-      let connection: Socket | undefined;
-      let reader: ReturnType<typeof createInterface> | undefined;
-      let releaseRequested = false;
       const readinessError = new Error("fixture readiness observer failed");
-      const releaseChild = () => {
-        releaseRequested = true;
-        if (connection && !connection.writableEnded) {
-          connection.end("release\n");
-        }
-      };
+      const releaseChild = () => receipts.release("native", "release");
       // Directory notifications can coalesce. Keep readiness and release outside
       // native custody so a failed observer can still unblock the owned child.
-      const listener = await reserveTestPortListener({
-        offsets: [0],
-        signal,
-        createListener: () =>
-          createServer((socket) => {
-            connection = socket;
-            socket.on("error", started.reject);
-            reader = createInterface({ input: socket });
-            reader.once("line", (line) => {
-              try {
-                pid = Number(fs.readFileSync(effect, "utf8"));
-                expect(Number(line)).toBe(pid);
-                if (outcome === "readiness failure") {
-                  started.reject(readinessError);
-                } else {
-                  started.resolve();
-                }
-              } catch (error) {
-                started.reject(error);
-              }
-            });
-            if (releaseRequested) {
-              releaseChild();
-            }
-          }),
+      const started = receipts.waitFor("native", "pid:").then(async () => {
+        pid = Number(fs.readFileSync(effect, "utf8"));
+        await receipts.waitFor("native", `pid:${pid}:`);
+        expect(pid).toBeGreaterThan(0);
+        expect(pid).not.toBe(process.pid);
+        if (outcome === "readiness failure") {
+          throw readinessError;
+        }
       });
-      listener.listener.on("error", started.reject);
       await runQaGatewayFixture(
         async () => {
           const native = vi
@@ -188,21 +163,16 @@ describe.skipIf(process.platform === "win32")("retained POSIX native restart", (
               }
               expect(args).toEqual(["restart", "fixture-A.service"]);
               return await execFileUtf8(process.execPath, [
+                "--input-type=module",
                 "-e",
                 `
-      const fs = require("node:fs");
-      const socket = require("node:net").connect(${listener.claim.port}, "127.0.0.1", () => {
+      import fs from "node:fs";
+      ${fixtureReceiptClientSource(receipts.endpoint)}
         fs.writeFileSync(${JSON.stringify(effect + ".tmp")}, String(process.pid));
         fs.renameSync(${JSON.stringify(effect + ".tmp")}, ${JSON.stringify(effect)});
-        socket.write(String(process.pid) + "\\n");
-      });
-      const lines = require("node:readline").createInterface({ input: socket });
-      lines.once("line", (line) => {
-        if (line !== "release") throw new Error("Unexpected fixture release");
-        lines.close();
+        sendReceipt("native", "pid:" + process.pid + ":");
+        await awaitRelease("native", "release");
         process.stdout.write("drained");
-        socket.end();
-      });
     `,
               ]);
             });
@@ -221,9 +191,7 @@ describe.skipIf(process.platform === "win32")("retained POSIX native restart", (
           });
           work = running;
           const observe = async () => {
-            await withinTest(Promise.race([started.promise, running]), signal);
-            expect(pid).toBeGreaterThan(0);
-            expect(pid).not.toBe(process.pid);
+            await withinTest(Promise.race([started, running]), signal);
             expect(complete).toBe(false);
             expectOwners("busy");
             expect(createManagedHandoffLeaseStore().read(c)).toEqual({ kind: "absent" });
@@ -239,8 +207,6 @@ describe.skipIf(process.platform === "win32")("retained POSIX native restart", (
             await running.catch(() => undefined);
           }
           await running;
-          expect(pid).toBeGreaterThan(0);
-          expect(complete).toBe(true);
           expect(native.mock.calls.map((call) => call[1][0])).toEqual(["reset-failed", "restart"]);
           expect(fs.readFileSync(definition, "utf8")).toBe(
             "original Node A and service definition",
@@ -250,11 +216,8 @@ describe.skipIf(process.platform === "win32")("retained POSIX native restart", (
         async () => {
           releaseChild();
           await work?.catch(() => undefined);
-          reader?.close();
-          connection?.destroy();
-          await listener.releaseListener();
         },
-        () => listener.claim.release(),
+        () => receipts.close(),
       );
     },
   );

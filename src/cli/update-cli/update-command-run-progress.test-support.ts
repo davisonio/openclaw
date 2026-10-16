@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { expect, it, vi } from "vitest";
+import { awaitGateBeforeSettlement } from "../../../test/helpers/promise.js";
 import type { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { withTriageTerminal } from "../../commands/triage.test-support.js";
 import { collectNestedErrorCandidates } from "../../infra/error-graph-internal.js";
@@ -53,28 +54,18 @@ async function withProgressRun(
 }
 
 function observeHostLedgerWrites() {
-  const writes: string[] = [];
-  const observe = (sql: string) => {
-    if (/\b(?:UPDATE|INSERT\s+INTO|DELETE\s+FROM)\s+["`]?update_runs\b/i.test(sql)) {
-      writes.push(sql);
-    }
-  };
-  const prepare = vi.spyOn(DatabaseSync.prototype, "prepare");
-  const exec = vi.spyOn(DatabaseSync.prototype, "exec");
-  DatabaseSync.prototype.prepare = function (this: DatabaseSync, sql) {
-    observe(sql);
-    return prepare.call(this, sql);
-  };
-  DatabaseSync.prototype.exec = function (this: DatabaseSync, sql) {
-    observe(sql);
-    return exec.call(this, sql);
-  };
+  const calls = (["prepare", "exec"] as const).map((method) =>
+    vi.spyOn(DatabaseSync.prototype, method),
+  );
   return {
-    writes,
-    restore: () => {
-      prepare.mockRestore();
-      exec.mockRestore();
+    get writes() {
+      return calls
+        .flatMap((call) => call.mock.calls.map(([sql]) => sql))
+        .filter((sql) =>
+          /\b(?:UPDATE|INSERT\s+INTO|DELETE\s+FROM)\s+["`]?update_runs\b/i.test(sql),
+        );
     },
+    restore: () => calls.forEach((call) => call.mockRestore()),
   };
 }
 
@@ -116,14 +107,11 @@ export function registerUpdateRunReceiptTests(dirs: ProgressDirectories) {
             runCommand,
           });
           try {
-            await Promise.race([
+            await awaitGateBeforeSettlement(
               entered.promise,
-              pending.then(() => {
-                throw new Error(
-                  `Command finished without its worker receipt; host ledger writes: ${host.writes.length}`,
-                );
-              }),
-            ]);
+              pending,
+              "Command finished without its worker receipt",
+            );
             expect(runCommand).not.toHaveBeenCalled();
             expect(log).not.toHaveBeenCalledWith("validating — fetch...");
             expect(

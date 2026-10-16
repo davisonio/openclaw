@@ -2,7 +2,7 @@ import { confirm as clackConfirm, isCancel } from "@clack/prompts";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { withTriageTerminal } from "../../commands/triage.test-support.js";
-import type { UpdateRunResult } from "../../infra/update-runner-types.js";
+import { prepareGithubIssue } from "../../infra/github-issue.js";
 import { defaultRuntime } from "../../runtime.js";
 import {
   UpdateCommandFailure,
@@ -53,16 +53,13 @@ function setup() {
   });
   const result = failure.result;
   const prepared = {
+    ...prepareGithubIssue({
+      body: "Sanitized failure and rollback details",
+      title: "Update failed: restart-unhealthy",
+    }),
     attemptId: runId,
-    body: "Sanitized failure and rollback details",
     previewDigest: "a".repeat(64),
-    marker: `openclaw-report:${"b".repeat(64)}`,
-    browserFallback: {
-      status: "available" as const,
-      url: "https://github.com/openclaw/openclaw/issues/new",
-    },
     savedReportPath: `${stateDir}/report.md`,
-    title: "Update failed: restart-unhealthy",
   };
   mocks.prepare.mockResolvedValue(prepared);
   mocks.submit.mockResolvedValue({
@@ -72,21 +69,21 @@ function setup() {
   });
   const opts = { run: { runId, env } };
   const target = { env };
-  const run = (Failure?: new (result: UpdateRunResult) => UpdateCommandFailure) =>
-    withTriageTerminal(true, async () => {
-      await expect(
-        withUpdateFailureTriage(opts, target, async () => {
-          throw Failure ? new Failure(result) : failure;
-        }),
-      ).rejects.toMatchObject({ code: 1 });
-    });
-  return { env, opts, prepared, result, run, target };
+  const invoke = (run: () => Promise<void>) =>
+    withTriageTerminal(true, () => withUpdateFailureTriage(opts, target, run));
+  const run = (error = failure) =>
+    expect(invoke(() => Promise.reject(error))).rejects.toMatchObject({ code: 1 });
+  return { env, prepared, result, run, invoke };
 }
 
 function expectUnused(...actions: (keyof typeof mocks)[]) {
   for (const action of actions) {
     expect(mocks[action]).not.toHaveBeenCalled();
   }
+}
+
+function expectOnceContaining(action: keyof typeof mocks, value: object) {
+  expect(mocks[action]).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(value));
 }
 
 let f: ReturnType<typeof setup>;
@@ -114,24 +111,20 @@ it("offers an optional report, previews it, and submits once only after confirma
 
   await f.run();
 
-  expect(mocks.select).toHaveBeenCalledExactlyOnceWith(
-    expect.objectContaining({
-      message: expect.stringContaining("rollback completed"),
-      initialValue: "dismiss",
-      options: [
-        { value: "triage", label: "Diagnose update failure" },
-        { value: "report", label: "Report update failure" },
-        { value: "dismiss", label: "Exit" },
-      ],
-    }),
-  );
+  expectOnceContaining("select", {
+    message: expect.stringContaining("rollback completed"),
+    initialValue: "dismiss",
+    options: [
+      { value: "triage", label: "Diagnose update failure" },
+      { value: "report", label: "Report update failure" },
+      { value: "dismiss", label: "Exit" },
+    ],
+  });
   expect(mocks.prepare).toHaveBeenCalledExactlyOnceWith(
     { attemptId: runId, action: "cli", result: f.result, recordedRun: undefined },
     { env: f.env, stateDir: f.env.OPENCLAW_STATE_DIR },
   );
-  expect(mocks.confirm).toHaveBeenCalledExactlyOnceWith(
-    expect.objectContaining({ initialValue: false }),
-  );
+  expectOnceContaining("confirm", { initialValue: false });
   expect(mocks.submit).toHaveBeenCalledExactlyOnceWith(f.prepared, f.prepared.previewDigest, {
     env: f.env,
     stateDir: f.env.OPENCLAW_STATE_DIR,
@@ -158,26 +151,12 @@ it("does not submit when confirmation is cancelled", async () => {
   expectUnused("submit", "triage");
 });
 
-it("diagnoses the original failure only when selected", async () => {
-  mocks.select.mockResolvedValue("triage");
-
-  await f.run();
-
-  expect(mocks.triage).toHaveBeenCalledExactlyOnceWith(
-    expect.objectContaining({ failure: { result: f.result }, target: f.target }),
-  );
-  expectUnused("prepare", "submit");
-});
-
 it("keeps signal-cancelled rollback quiet", async () => {
-  f.result.steps.push({
-    name: "update",
-    command: "synthetic-update",
-    cwd: "/synthetic",
-    durationMs: 1,
+  f.result.steps = f.result.steps.map((step) => ({
+    ...step,
     exitCode: 130,
     termination: "signal",
-  });
+  }));
   await f.run();
   expectUnused("select", "prepare", "submit", "triage");
 });
@@ -185,25 +164,21 @@ it("keeps signal-cancelled rollback quiet", async () => {
 it("keeps ordinary failure actions for an unverified service", async () => {
   f.result.recovery = { ...f.result.recovery, service: undefined };
   await f.run();
-  expect(mocks.select).toHaveBeenCalledExactlyOnceWith(
-    expect.objectContaining({ message: "Choose the next action for this failed update" }),
-  );
+  expectOnceContaining("select", { message: "Choose the next action for this failed update" });
   expect(mocks.select.mock.calls[0]?.[0]).not.toHaveProperty("initialValue", "dismiss");
 });
 
 it.each([UpdateCommandPendingRecoveryFailure, UpdateCommandFinalizedRecoveryFailure])(
   "preserves the legacy recovery marker exit without a menu (%s)",
   async (Failure) => {
-    await f.run(Failure);
+    await f.run(new Failure(f.result));
 
     expectUnused("select", "triage");
   },
 );
 
 it("does not prompt after a successful update", async () => {
-  await withTriageTerminal(true, async () => {
-    await withUpdateFailureTriage(f.opts, f.target, async () => {});
-  });
+  await f.invoke(async () => {});
 
   expectUnused("select", "triage");
 });

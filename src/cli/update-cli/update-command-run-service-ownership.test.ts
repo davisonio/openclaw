@@ -5,7 +5,11 @@ import { afterEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import * as daemonExec from "../../daemon/exec-file.js";
 import * as gatewayService from "../../daemon/service.js";
-import { createMockGatewayService } from "../../daemon/service.test-helpers.js";
+import {
+  buildSystemdManagerPropertyOutput,
+  buildSystemdUnitPropertyOutput,
+  createMockGatewayService,
+} from "../../daemon/service.test-helpers.js";
 import * as systemdExec from "../../daemon/systemd-exec.js";
 import {
   readSystemdServiceExecStart,
@@ -21,6 +25,7 @@ import {
   UpdateRecoveryRequiredError,
 } from "../../infra/update-run-recovery.js";
 import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
+import { createCommandResult } from "../../test-utils/npm-spec-install-test-helpers.js";
 import { snapshotUpdateFixtureTree } from "./update-command-filesystem-snapshot.test-support.js";
 import { collectServiceInspectionFailureFacts } from "./update-command-result.js";
 import { admitUpdateCommandRun } from "./update-command-run.js";
@@ -63,10 +68,7 @@ it.each([
     const foreignRoot = path.join(home, "foreign");
     for (const packageRoot of [root, foreignRoot]) {
       fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true });
-      fs.writeFileSync(
-        path.join(packageRoot, "package.json"),
-        JSON.stringify({ name: "openclaw" }),
-      );
+      fs.writeFileSync(path.join(packageRoot, "package.json"), '{"name":"openclaw"}');
       fs.writeFileSync(path.join(packageRoot, "dist", "entry.js"), "// fixture");
     }
     vi.spyOn(os, "userInfo").mockReturnValue({ ...os.userInfo(), homedir: home });
@@ -120,54 +122,36 @@ it.each([
             path.join(scenario === "stale-install" ? foreignRoot : root, "dist", "entry.js"),
             "gateway",
           ];
-    const response = (...values: [type: string, data: unknown][]) => ({
-      code: 0,
-      termination: "exit" as const,
-      stderr: "",
-      stdout: values.map(([type, data]) => JSON.stringify({ type, data })).join("\n"),
-    });
     const bus = vi.spyOn(systemdExec, "execBusctlUser").mockImplementation(async (_env, args) => {
       if (scenario === "timeout") {
-        return {
+        return createCommandResult({
           code: 1,
           termination: "timeout",
-          stdout: "",
           stderr: "inspection timed out",
-        };
+        });
       }
       if (scenario === "absent" || scenario === "unloaded-local") {
         const unit = "openclaw-gateway-caller.service";
-        return {
+        return createCommandResult({
           code: 1,
-          termination: "exit",
-          stdout: "",
           stderr: args.includes("GetUnitFileState")
             ? `Call failed: Unit file ${unit} does not exist.`
             : `Call failed: Unit ${unit} ${args.includes("GetUnit") ? "not loaded" : "not found"}.`,
-        };
+        });
       }
-      if (args.includes("GetUnit") || args.includes("LoadUnit")) {
-        return response(["o", ["/org/freedesktop/systemd1/unit/gateway"]]);
-      }
-      if (args.includes("FragmentPath")) {
-        return response(
-          ["s", sourcePath],
-          ["as", []],
-          ["b", false],
-          ["s", "loaded"],
-          ["s", "enabled"],
-          ["s", "active"],
-          ["b", true],
-          ["b", false],
-        );
-      }
-      return response(
-        ["a(sasbttttuii)", [[command[0], command, false, 0, 0, 0, 0, 0, 0, 0]]],
-        ["s", ""],
-        ["as", Object.entries(serviceOverrides).map(([key, value]) => `${key}=${value}`)],
-        ["a(sb)", []],
-        ["as", []],
-      );
+      return createCommandResult({
+        stdout:
+          args.includes("GetUnit") || args.includes("LoadUnit")
+            ? JSON.stringify({ type: "o", data: ["/org/freedesktop/systemd1/unit/gateway"] })
+            : args.includes("FragmentPath")
+              ? buildSystemdUnitPropertyOutput({ fragmentPath: sourcePath })
+              : buildSystemdManagerPropertyOutput({
+                  programArguments: command,
+                  environment: Object.entries(serviceOverrides).map(
+                    ([key, value]) => `${key}=${value}`,
+                  ),
+                }),
+      });
     });
     if (scenario === "native-rejection") {
       bus.mockRejectedValue(nativeFailure);
@@ -193,19 +177,14 @@ it.each([
         false,
       );
     } else if (scenario === "owned-pending" || scenario === "root-probe-error") {
-      const failure: unknown = await admitUpdateCommandRun({ opts: {}, root }).then(
-        () => "admitted",
-        (error: unknown) => error,
-      );
-      if (scenario === "owned-pending") {
-        expect(failure).toBeInstanceOf(UpdateRecoveryRequiredError);
-      } else if (scenario === "root-probe-error") {
-        expect(failure).toBe(rootFailure);
+      const admission = admitUpdateCommandRun({ opts: {}, root });
+      if (pending) {
+        await expect(admission).rejects.toBeInstanceOf(UpdateRecoveryRequiredError);
+        expect(loadUpdateRecovery(pending.runId, { env: serviceEnv })).toEqual(pending);
+      } else {
+        await expect(admission).rejects.toBe(rootFailure);
       }
       expect(snapshot()).toEqual(before);
-      if (pending) {
-        expect(loadUpdateRecovery(pending.runId, { env: serviceEnv })).toEqual(pending);
-      }
     } else {
       expect(await servicePlan.resolveManagedServicePackageUpdatePlan({ root })).toEqual({
         rootRedirect: null,
