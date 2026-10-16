@@ -842,7 +842,12 @@ export async function createAttachedBrowserToolRuntime(params) {
 
     const transformed = plugin.transform.call({ error: fail }, source, nativePath);
 
-    expect(transformed).toBeNull();
+    const { optionalDependencies } = JSON.parse(
+      fs.readFileSync(path.resolve("node_modules/@openclaw/fs-safe/package.json"), "utf8"),
+    );
+    expect(transformed).toBe(
+      source.replace('require("../package.json")', JSON.stringify({ optionalDependencies })),
+    );
   });
 
   it.each<{
