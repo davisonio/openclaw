@@ -115,23 +115,26 @@ it("resolves resume ownership off-thread, preserving backend, order, and lifecyc
       backendId: "fixture",
       requesterSessionKey: requester,
     };
+    const expectOwnership = async (
+      resumeSessionId: string,
+      allowed: boolean,
+      overrides: Partial<typeof input> = {},
+    ) => {
+      expect(
+        (await validateAcpResumeSessionOwnership({ ...input, ...overrides, resumeSessionId })).ok,
+        `${resumeSessionId}: ${overrides.requesterSessionKey ?? requester}/${overrides.runtimeAgentId ?? "coder"}`,
+      ).toBe(allowed);
+    };
     for (const [requesterSessionKey, runtimeAgentId, allowed] of [
       [requester, "coder", true],
       ["agent:other:main", "coder", false],
       [requester, "cursor", false],
     ] as const) {
-      expect(
-        (
-          await validateAcpResumeSessionOwnership({
-            ...input,
-            ownerAgentId: "reviewer",
-            runtimeAgentId,
-            requesterSessionKey,
-            resumeSessionId: "owned",
-          })
-        ).ok,
-        `historical harness-owned row: ${requesterSessionKey}/${runtimeAgentId}`,
-      ).toBe(allowed);
+      await expectOwnership("owned", allowed, {
+        ownerAgentId: "reviewer",
+        runtimeAgentId,
+        requesterSessionKey,
+      });
     }
     const cases = [
       ["owned", true],
@@ -157,86 +160,50 @@ it("resolves resume ownership off-thread, preserving backend, order, and lifecyc
     const observe = observeHostDataSql();
     try {
       for (const [resumeSessionId, allowed] of cases) {
-        expect(
-          (await validateAcpResumeSessionOwnership({ ...input, resumeSessionId })).ok,
-          resumeSessionId,
-        ).toBe(allowed);
+        await expectOwnership(resumeSessionId, allowed);
       }
-      expect(
-        (
-          await validateAcpResumeSessionOwnership({
-            ...input,
-            requesterSessionKey: owned.sessionKey,
-            resumeSessionId: "owned",
-          })
-        ).ok,
-      ).toBe(true);
-      expect(
-        (
-          await validateAcpResumeSessionOwnership({
-            ...input,
-            requesterSessionKey: undefined,
-            resumeSessionId: "owned",
-          })
-        ).ok,
-      ).toBe(false);
+      await expectOwnership("owned", true, { requesterSessionKey: owned.sessionKey });
+      await expectOwnership("owned", false, { requesterSessionKey: undefined });
       expect(observe.queries).toEqual([]);
     } finally {
       observe.restore();
     }
 
     const read = entryReader.withSessionEntryReadOnlyInWorker;
-    const changedAgent = vi
-      .spyOn(entryReader, "withSessionEntryReadOnlyInWorker")
-      .mockImplementationOnce((scope, assertCurrent, consume) =>
-        read(scope, assertCurrent, async (snapshot, owner) => {
-          writeAcpSessionMetaForMigration({
-            sessionKey: buildAcpDatabaseSessionKey(owned.sessionKey, "coder"),
-            lifecycleRevision: owned.entry?.lifecycleRevision,
-            meta: { ...owned.meta, agent: "cursor" },
-            env: state.env,
-          });
-          return consume(snapshot, owner);
-        }),
-      );
-    try {
-      expect(
-        (await validateAcpResumeSessionOwnership({ ...input, resumeSessionId: "owned" })).ok,
-      ).toBe(false);
-    } finally {
-      changedAgent.mockRestore();
+    const writeMeta = (source: typeof owned, meta: SessionAcpMeta) =>
       writeAcpSessionMetaForMigration({
-        sessionKey: buildAcpDatabaseSessionKey(owned.sessionKey, "coder"),
-        lifecycleRevision: owned.entry?.lifecycleRevision,
-        meta: owned.meta,
+        sessionKey: buildAcpDatabaseSessionKey(source.sessionKey, "coder"),
+        lifecycleRevision: source.entry?.lifecycleRevision,
+        meta,
         env: state.env,
       });
-    }
-    const changedIdentity = vi
-      .spyOn(entryReader, "withSessionEntryReadOnlyInWorker")
-      .mockImplementationOnce((scope, assertCurrent, consume) =>
-        read(scope, assertCurrent, async (snapshot, owner) => {
-          writeAcpSessionMetaForMigration({
-            sessionKey: buildAcpDatabaseSessionKey(owned.sessionKey, "coder"),
-            lifecycleRevision: owned.entry?.lifecycleRevision,
-            meta: {
-              ...owned.meta,
-              identity: {
-                state: "resolved",
-                source: "ensure",
-                lastUpdatedAt: 200,
-                agentSessionId: "replacement",
-              },
-            },
-            env: state.env,
-          });
-          return consume(snapshot, owner);
-        }),
-      );
+    const changeOwnedMetaDuringRead = (meta: SessionAcpMeta) =>
+      vi
+        .spyOn(entryReader, "withSessionEntryReadOnlyInWorker")
+        .mockImplementationOnce((scope, assertCurrent, consume) =>
+          read(scope, assertCurrent, async (snapshot, owner) => {
+            writeMeta(owned, meta);
+            return consume(snapshot, owner);
+          }),
+        );
+    const changedAgent = changeOwnedMetaDuringRead({ ...owned.meta, agent: "cursor" });
     try {
-      expect(
-        (await validateAcpResumeSessionOwnership({ ...input, resumeSessionId: "owned" })).ok,
-      ).toBe(false);
+      await expectOwnership("owned", false);
+    } finally {
+      changedAgent.mockRestore();
+      writeMeta(owned, owned.meta);
+    }
+    const changedIdentity = changeOwnedMetaDuringRead({
+      ...owned.meta,
+      identity: {
+        state: "resolved",
+        source: "ensure",
+        lastUpdatedAt: 200,
+        agentSessionId: "replacement",
+      },
+    });
+    try {
+      await expectOwnership("owned", false);
     } finally {
       changedIdentity.mockRestore();
     }
@@ -356,12 +323,7 @@ it("resolves resume ownership off-thread, preserving backend, order, and lifecyc
             parentSessionKey: "agent:other:main",
           });
         } else if (mutation === "runtime") {
-          writeAcpSessionMetaForMigration({
-            sessionKey: buildAcpDatabaseSessionKey(source.sessionKey, "coder"),
-            lifecycleRevision: sourceEntry.lifecycleRevision,
-            meta: { ...source.meta, agent: "cursor" },
-            env: state.env,
-          });
+          writeMeta(source, { ...source.meta, agent: "cursor" });
         } else if (mutation === "deleted") {
           expect(
             (
