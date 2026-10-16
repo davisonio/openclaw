@@ -266,6 +266,7 @@ const reviewed = new Map([
   [
     "src/config/sessions/session-accessor.sqlite-branch-rewrite.ts",
     {
+      priority: 99,
       evidence:
         "prepareTranscriptRewriteSync serves session-manager-maintenance.worker.ts and deprecated SessionManager.prepareTranscriptRewrite, exported by plugin-sdk/agent-sessions and shipped in v2026.10.4. The synchronous SDK method remains supported through 2026-12-31; this shared kernel is not worker-only.",
     },
@@ -273,6 +274,7 @@ const reviewed = new Map([
   [
     "src/config/sessions/session-accessor.sqlite-compaction.ts",
     {
+      priority: 99,
       evidence:
         "Gateway sessions.compact uses session-accessor.transcript.ts, which dispatches ordinary trimming to its worker but retains trimTranscriptForManualCompact for nativeSource/hasOpaqueCheck authority. session-mutation-guards.ts preserves opaque requester commit guards; the destructive trim cannot discard that authority contract.",
     },
@@ -280,6 +282,7 @@ const reviewed = new Map([
   [
     "src/config/sessions/session-accessor.sqlite-deletion.ts",
     {
+      priority: 99,
       evidence:
         "The transaction wrapper serves workers/maintenance plus sqlite-transcript-turn.ts's native branch. plugin-sdk/session-transcript-runtime.appendSessionTranscriptMessageByIdentityStrict supplies prepareMessageAfterIdempotencyCheck, which excludes worker execution; that callback contract shipped in v2026.10.4.",
     },
@@ -287,6 +290,7 @@ const reviewed = new Map([
   [
     "src/config/sessions/session-accessor.sqlite-display-position.ts",
     {
+      priority: 99,
       evidence:
         "History workers share this query with plugin-sdk/session-transcript-runtime.readSessionTranscriptCatalogTitle -> readLegacySessionTranscriptCatalogTitle -> readSessionTranscriptHistoryEventPage. The synchronous SDK reader shipped in v2026.10.4 and remains deprecated through 2026-12-31.",
     },
@@ -294,6 +298,7 @@ const reviewed = new Map([
   [
     "src/config/sessions/session-accessor.sqlite-provenance.ts",
     {
+      priority: 99,
       evidence:
         "writeSessionEntry calls prepareSessionEntryWindowRow from workers and retained native initial-entry/transcript persistence. Actor/prepared window facts bypass the query, but released synchronous SessionManager persistence and opaque transcript callbacks still reach the fallback; keep it mixed.",
     },
@@ -301,6 +306,7 @@ const reviewed = new Map([
   [
     "src/config/sessions/session-pending-input-store.ts",
     {
+      priority: 99,
       evidence:
         "Only SessionPendingInputReceipt.complete invokes nativeMutation; completeAsync uses the worker. UserTurnTranscriptRecorder.completeProcessing exposes the same synchronous completion contract. Both SDK APIs shipped in v2026.10.4; retain their native transaction until the compatibility cutover.",
     },
@@ -308,6 +314,7 @@ const reviewed = new Map([
   [
     "src/config/sessions/targets-discovery.native.ts",
     {
+      priority: 99,
       evidence:
         "Worker topology shares discovery with plugin-sdk/session-transcript-hit.loadCombinedSessionStoreForGateway (shipped in v2026.10.4), through combined-store-gateway.native.ts and lineage.native.ts. resolveExistingAgentSessionStoreTargets also serves session-turn-predicate.ts in retained native transcript turns.",
     },
