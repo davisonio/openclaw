@@ -62,6 +62,7 @@ import {
   storeAt,
   storeDirectory,
 } from "./doctor-database-port-context.js";
+import { assertDatabasePortPluginMigrationsComplete } from "./doctor-database-port-migrations.js";
 import {
   assertOriginal,
   loadDatabasePortStateReceipt,
@@ -95,6 +96,13 @@ async function preflight(ctx: Context, options: DatabasePortOptions) {
   const engines = resolveDatabaseFamilyEngines(config);
   const from = engines[ctx.family ?? "state"],
     to = options.to!;
+  await assertDatabasePortPluginMigrationsComplete({
+    config,
+    env: ctx.env,
+    stateDir: ctx.stateDir,
+    to,
+    family: ctx.family,
+  });
   if (!ctx.family || ctx.family === "state") {
     await prepareSharedStatePortSource(ctx, from, to, options.dryRun);
   }
