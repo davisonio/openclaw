@@ -1,8 +1,7 @@
-// Qa Lab tests cover suite planning plugin behavior.
 import { lstat, mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { readQaScenarioById } from "./scenario-catalog.js";
 import { requireFlowScenario } from "./scenario-catalog.test-utils.js";
 import {
@@ -31,6 +30,25 @@ function makePlaywrightQaSuiteTestScenario(id: string): ReturnType<typeof makeQa
   };
 }
 
+const roots: string[] = [];
+async function makeRoot(prefix: string) {
+  const root = await mkdtemp(path.join(os.tmpdir(), prefix));
+  roots.push(root);
+  return root;
+}
+afterEach(async () => {
+  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+type Scenario = ReturnType<typeof makeQaSuiteTestScenario>;
+const channelParams = (scenarios: Scenario[], explicitChannel?: string) => ({
+  defaultChannel: "telegram",
+  scenarios,
+  explicitChannel,
+});
+const resolveChannel = (scenarios: Scenario[], explicitChannel?: string) =>
+  resolveQaSuiteScenarioChannel(channelParams(scenarios, explicitChannel));
+
 describe("qa suite planning helpers", () => {
   it("normalizes blank scenario channels as unpinned", () => {
     expect(
@@ -44,38 +62,24 @@ describe("qa suite planning helpers", () => {
   });
 
   it("keeps programmatic suite output dirs within the repo root", async () => {
-    const repoRoot = await mkdtemp(path.join(os.tmpdir(), "qa-suite-existing-root-"));
-    try {
-      await expect(
-        resolveQaSuiteOutputDir(repoRoot, path.join(repoRoot, ".artifacts", "qa-e2e", "custom")),
-      ).resolves.toBe(path.join(repoRoot, ".artifacts", "qa-e2e", "custom"));
-      await expect(
-        lstat(path.join(repoRoot, ".artifacts", "qa-e2e", "custom")).then((stats) =>
-          stats.isDirectory(),
-        ),
-      ).resolves.toBe(true);
-      await expect(resolveQaSuiteOutputDir(repoRoot, "/tmp/outside")).rejects.toThrow(
-        "QA suite outputDir must stay within the repo root.",
-      );
-    } finally {
-      await rm(repoRoot, { recursive: true, force: true });
-    }
+    const repoRoot = await makeRoot("qa-suite-existing-root-");
+    const outputDir = path.join(repoRoot, ".artifacts", "qa-e2e", "custom");
+    await expect(resolveQaSuiteOutputDir(repoRoot, outputDir)).resolves.toBe(outputDir);
+    expect((await lstat(outputDir)).isDirectory()).toBe(true);
+    await expect(resolveQaSuiteOutputDir(repoRoot, "/tmp/outside")).rejects.toThrow(
+      "QA suite outputDir must stay within the repo root.",
+    );
   });
 
   it("rejects symlinked suite output dirs that escape the repo root", async () => {
-    const repoRoot = await mkdtemp(path.join(os.tmpdir(), "qa-suite-root-"));
-    const outsideRoot = await mkdtemp(path.join(os.tmpdir(), "qa-suite-outside-"));
-    try {
-      await mkdir(path.join(repoRoot, ".artifacts"), { recursive: true });
-      await symlink(outsideRoot, path.join(repoRoot, ".artifacts", "qa-e2e"), "dir");
+    const repoRoot = await makeRoot("qa-suite-root-");
+    const outsideRoot = await makeRoot("qa-suite-outside-");
+    await mkdir(path.join(repoRoot, ".artifacts"), { recursive: true });
+    await symlink(outsideRoot, path.join(repoRoot, ".artifacts", "qa-e2e"), "dir");
 
-      await expect(resolveQaSuiteOutputDir(repoRoot, ".artifacts/qa-e2e/custom")).rejects.toThrow(
-        "QA suite outputDir must not traverse symlinks.",
-      );
-    } finally {
-      await rm(repoRoot, { recursive: true, force: true });
-      await rm(outsideRoot, { recursive: true, force: true });
-    }
+    await expect(resolveQaSuiteOutputDir(repoRoot, ".artifacts/qa-e2e/custom")).rejects.toThrow(
+      "QA suite outputDir must not traverse symlinks.",
+    );
   });
 
   it("preserves ordered independent flow instances for repeated requested IDs", () => {
@@ -124,53 +128,26 @@ describe("qa suite planning helpers", () => {
   });
 
   it("resolves driver channels from scenario execution with explicit and default fallbacks", () => {
+    const plain = makeQaSuiteTestScenario("plain");
+    const slack = makeQaSuiteTestScenario("slack-flow", { channel: "slack" });
+    const telegram = makeQaSuiteTestScenario("telegram-flow", { channel: "telegram" });
+    expect(resolveChannel([plain])).toBe("telegram");
+    expect(resolveChannel([plain, slack])).toBe("slack");
+    expect(resolveChannel([slack], "slack")).toBe("slack");
+    expect(() => resolveChannel([slack], "telegram")).toThrow(
+      "--channel telegram conflicts with selected scenario execution.channel slack.",
+    );
+    expect(() => resolveChannel([slack, telegram])).toThrow(
+      "Selected QA scenarios require multiple channels",
+    );
     expect(
-      resolveQaSuiteScenarioChannel({
-        defaultChannel: "telegram",
-        scenarios: [makeQaSuiteTestScenario("plain")],
-      }),
-    ).toBe("telegram");
-    expect(
-      resolveQaSuiteScenarioChannel({
-        defaultChannel: "telegram",
-        scenarios: [
-          makeQaSuiteTestScenario("plain"),
-          makeQaSuiteTestScenario("slack-flow", { channel: "slack" }),
-        ],
-      }),
-    ).toBe("slack");
-    expect(
-      resolveQaSuiteScenarioChannel({
-        defaultChannel: "telegram",
-        explicitChannel: "slack",
-        scenarios: [makeQaSuiteTestScenario("slack-flow", { channel: "slack" })],
-      }),
-    ).toBe("slack");
-    expect(() =>
-      resolveQaSuiteScenarioChannel({
-        defaultChannel: "telegram",
-        explicitChannel: "telegram",
-        scenarios: [makeQaSuiteTestScenario("slack-flow", { channel: "slack" })],
-      }),
-    ).toThrow("--channel telegram conflicts with selected scenario execution.channel slack.");
-    expect(() =>
-      resolveQaSuiteScenarioChannel({
-        defaultChannel: "telegram",
-        scenarios: [
-          makeQaSuiteTestScenario("slack-flow", { channel: "slack" }),
-          makeQaSuiteTestScenario("telegram-flow", { channel: "telegram" }),
-        ],
-      }),
-    ).toThrow("Selected QA scenarios require multiple channels");
-    expect(
-      resolveQaSuiteScenarioChannels({
-        defaultChannel: "telegram",
-        scenarios: [
-          makeQaSuiteTestScenario("plain"),
+      resolveQaSuiteScenarioChannels(
+        channelParams([
+          plain,
           makeQaSuiteTestScenario("matrix-flow", { channel: "matrix" }),
-          makeQaSuiteTestScenario("slack-flow", { channel: "slack" }),
-        ],
-      }),
+          slack,
+        ]),
+      ),
     ).toEqual(["telegram", "matrix", "slack"]);
   });
 
@@ -236,10 +213,6 @@ describe("qa suite planning helpers", () => {
   });
 
   it("keeps a scenario deletion from resurrecting baseline siblings", () => {
-    // One document cannot express "delete this parent, then recreate part of
-    // it": composing the two would merge the later object into the baseline and
-    // keep the siblings the first scenario removed. Startup replays them in
-    // order instead.
     const scenarios = [
       makeQaSuiteTestScenario("drops-tools", { gatewayConfigPatch: { tools: null } }),
       makeQaSuiteTestScenario("adds-web-search", {

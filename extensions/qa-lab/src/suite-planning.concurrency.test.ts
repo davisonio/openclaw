@@ -1,80 +1,55 @@
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { QA_CHANNEL_DEFAULT_SUITE_CONCURRENCY } from "./qa-channel-transport.js";
 import { mapQaSuiteWithConcurrency, normalizeQaSuiteConcurrency } from "./suite-planning.js";
 
 describe("qa suite concurrency", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
   it("normalizes suite concurrency to a bounded integer", () => {
-    const previous = process.env.OPENCLAW_QA_SUITE_CONCURRENCY;
-    delete process.env.OPENCLAW_QA_SUITE_CONCURRENCY;
-    try {
+    vi.stubEnv("OPENCLAW_QA_SUITE_CONCURRENCY", undefined);
+    expect(normalizeQaSuiteConcurrency(undefined, 10)).toBe(10);
+    expect(normalizeQaSuiteConcurrency(undefined, 80)).toBe(64);
+    expect(normalizeQaSuiteConcurrency(undefined, 80, QA_CHANNEL_DEFAULT_SUITE_CONCURRENCY)).toBe(
+      4,
+    );
+    expect(normalizeQaSuiteConcurrency(2.8, 10)).toBe(2);
+    expect(normalizeQaSuiteConcurrency(20, 3)).toBe(3);
+    expect(normalizeQaSuiteConcurrency(0, 3)).toBe(1);
+
+    vi.stubEnv("OPENCLAW_QA_SUITE_CONCURRENCY", "3");
+    expect(normalizeQaSuiteConcurrency(undefined, 10)).toBe(3);
+
+    vi.stubEnv("OPENCLAW_QA_SUITE_CONCURRENCY", "0");
+    expect(normalizeQaSuiteConcurrency(undefined, 10)).toBe(1);
+
+    for (const value of ["0x10", "1e2", "2.5"]) {
+      vi.stubEnv("OPENCLAW_QA_SUITE_CONCURRENCY", value);
       expect(normalizeQaSuiteConcurrency(undefined, 10)).toBe(10);
-      expect(normalizeQaSuiteConcurrency(undefined, 80)).toBe(64);
-      expect(normalizeQaSuiteConcurrency(undefined, 80, QA_CHANNEL_DEFAULT_SUITE_CONCURRENCY)).toBe(
-        4,
-      );
-      expect(normalizeQaSuiteConcurrency(2.8, 10)).toBe(2);
-      expect(normalizeQaSuiteConcurrency(20, 3)).toBe(3);
-      expect(normalizeQaSuiteConcurrency(0, 3)).toBe(1);
-
-      process.env.OPENCLAW_QA_SUITE_CONCURRENCY = "3";
-      expect(normalizeQaSuiteConcurrency(undefined, 10)).toBe(3);
-
-      process.env.OPENCLAW_QA_SUITE_CONCURRENCY = "0";
-      expect(normalizeQaSuiteConcurrency(undefined, 10)).toBe(1);
-
-      for (const value of ["0x10", "1e2", "2.5"]) {
-        process.env.OPENCLAW_QA_SUITE_CONCURRENCY = value;
-        expect(normalizeQaSuiteConcurrency(undefined, 10)).toBe(10);
-      }
-    } finally {
-      if (previous === undefined) {
-        delete process.env.OPENCLAW_QA_SUITE_CONCURRENCY;
-      } else {
-        process.env.OPENCLAW_QA_SUITE_CONCURRENCY = previous;
-      }
     }
   });
 
   it("maps suite work with bounded concurrency while preserving order", async () => {
     let active = 0;
     let maxActive = 0;
-    let releaseStartedTasks = false;
-    let resolveBothStarted: () => void = () => {};
-    const bothStarted = new Promise<void>((resolve) => {
-      resolveBothStarted = resolve;
-    });
-    const taskReleases: Array<() => void> = [];
-    const releaseQueuedTasks = () => {
-      if (!releaseStartedTasks) {
-        return;
-      }
-      let releaseTask: (() => void) | undefined;
-      while ((releaseTask = taskReleases.shift())) {
-        releaseTask();
-      }
-    };
+    const bothStarted = createDeferred<void>();
+    const release = createDeferred<void>();
 
     const resultPromise = mapQaSuiteWithConcurrency([1, 2, 3, 4], 2, async (item) => {
       active += 1;
       maxActive = Math.max(maxActive, active);
       if (active === 2) {
-        resolveBothStarted();
+        bothStarted.resolve();
       }
-      await new Promise<void>((resolve) => {
-        taskReleases.push(resolve);
-        releaseQueuedTasks();
-      });
+      await release.promise;
       active -= 1;
       return item * 10;
     });
 
-    await bothStarted;
+    await bothStarted.promise;
     expect(maxActive).toBe(2);
-    releaseStartedTasks = true;
-    releaseQueuedTasks();
-    const result = await resultPromise;
-    expect(result).toEqual([10, 20, 30, 40]);
+    release.resolve();
+    expect(await resultPromise).toEqual([10, 20, 30, 40]);
   });
 
   it("stops sequential suite work after the first matching result", async () => {
@@ -97,8 +72,7 @@ describe("qa suite concurrency", () => {
   });
 
   it("drains started workers before propagating an undefined first rejection", async () => {
-    const failure = undefined;
-    const rejectFirst = vi.fn<() => Promise<never>>().mockRejectedValue(failure);
+    const rejectFirst = vi.fn<() => Promise<never>>().mockRejectedValue(undefined);
     const sibling = createDeferred<void>();
     const bothStarted = createDeferred<void>();
     const started: number[] = [];
@@ -129,7 +103,7 @@ describe("qa suite concurrency", () => {
     expect(started).toEqual([1, 2]);
     expect(settled).toBe(false);
     sibling.resolve();
-    expect(await run).toEqual({ rejected: true, error: failure });
+    expect(await run).toEqual({ rejected: true, error: undefined });
     expect(started).toEqual([1, 2]);
   });
 
@@ -166,11 +140,8 @@ describe("qa suite concurrency", () => {
     const sleeps: number[] = [];
     const releaseSleeps: Array<() => void> = [];
     const started: number[] = [];
-    const waitForStarted = async (expected: number[]) => {
-      await vi.waitFor(() => {
-        expect(started).toEqual(expected);
-      });
-    };
+    const waitForStarted = (expected: number[]) =>
+      vi.waitFor(() => expect(started).toEqual(expected));
     const resultPromise = mapQaSuiteWithConcurrency(
       [1, 2, 3, 4],
       3,
@@ -197,8 +168,7 @@ describe("qa suite concurrency", () => {
     releaseSleeps.shift()?.();
     await waitForStarted([1, 2, 3, 4]);
 
-    const result = await resultPromise;
-    expect(result).toEqual([1, 2, 3, 4]);
+    expect(await resultPromise).toEqual([1, 2, 3, 4]);
     expect(sleeps).toEqual([25, 25, 25]);
   });
 });

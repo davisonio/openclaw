@@ -18,9 +18,13 @@ import type { QaTransportAdapter } from "./qa-transport.js";
 import * as scenarioCatalog from "./scenario-catalog.js";
 import { writeQaSuiteArtifacts } from "./suite-artifacts.js";
 import { createQaSuiteEvidenceInvocation } from "./suite-evidence.js";
+import type { QaSuiteSummaryJson } from "./suite-summary.js";
 import { makeQaSuiteTestScenario, recordQaSuiteTestResults } from "./suite-test-helpers.js";
 import type { QaSuiteRunParams, QaSuiteScenarioResult } from "./suite.js";
-import { isQaTestFileScenario } from "./test-file-scenario-runner.js";
+import {
+  isQaTestFileScenario,
+  type QaScenarioCommandExecution,
+} from "./test-file-scenario-runner.js";
 import {
   makeTestFileScenario,
   resolveScriptAttemptOutputDir,
@@ -69,6 +73,50 @@ vi.mock("openclaw/plugin-sdk/security-runtime", async (importOriginal) => {
 import { runQaSuite } from "./suite-launch.runtime.js";
 
 const tempRoots: string[] = [];
+let repoRoot: string;
+
+function runSuite(outputDir: string, params: QaSuiteRunParams) {
+  return runQaSuite({ repoRoot, outputDir, ...params });
+}
+type NativeParams = Parameters<typeof runQaTestFileScenarios>[0];
+type NativeResults = Awaited<ReturnType<typeof runQaTestFileScenarios>>["results"];
+const artifactFileNames = ["qa-suite-report.md", "qa-evidence.json", "qa-suite-summary.json"];
+
+async function passNativeCommand(command: QaScenarioCommandExecution) {
+  await writeNativeVitestReport(command, { passed: 1 });
+  return { exitCode: 0, stdout: "passed", stderr: "" };
+}
+
+async function runNative(params: NativeParams, runCommand = passNativeCommand) {
+  const native = await vi.importActual<typeof import("./test-file-scenario-runner.js")>(
+    "./test-file-scenario-runner.js",
+  );
+  return native.runQaTestFileScenarios({ ...params, runCommand });
+}
+
+function expectFlowCall(params: Partial<QaSuiteRunParams>, index?: number) {
+  const call = expect(runQaFlowSuite);
+  const expected = expect.objectContaining(params);
+  if (index === undefined) {
+    call.toHaveBeenCalledWith(expected);
+  } else {
+    call.toHaveBeenNthCalledWith(index, expected);
+  }
+}
+
+function recordChild(
+  params: QaSuiteRunParams,
+  scenario: ReturnType<typeof makeQaSuiteTestScenario>,
+) {
+  return createQaSuiteEvidenceInvocation(params, {
+    repoRoot: params.repoRoot!,
+    outputDir: params.outputDir!,
+    selectedScenarios: [scenario],
+    providerMode: "mock-openai",
+    primaryModel: "mock-openai/test-model",
+    transportId: "qa-channel",
+  });
+}
 
 async function readEvidence(filePath: string) {
   const evidence = validateQaEvidenceSummaryJson(JSON.parse(await fs.readFile(filePath, "utf8")));
@@ -76,6 +124,10 @@ async function readEvidence(filePath: string) {
     throw new Error("expected aggregate v3 evidence");
   }
   return evidence;
+}
+
+async function readSummary(filePath: string): Promise<QaSuiteSummaryJson> {
+  return JSON.parse(await fs.readFile(filePath, "utf8"));
 }
 
 function createLab(setScenarioRun: QaLabServerHandle["setScenarioRun"]) {
@@ -92,9 +144,9 @@ function createLab(setScenarioRun: QaLabServerHandle["setScenarioRun"]) {
 }
 
 async function makeTempRepo(prefix: string) {
-  const repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
-  tempRoots.push(repoRoot);
-  return repoRoot;
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  tempRoots.push(root);
+  return root;
 }
 
 async function writeEvidence(
@@ -118,12 +170,7 @@ function recordFlowResults(params: QaSuiteRunParams | undefined, results: QaSuit
   return recordQaSuiteTestResults(params, definitions, results);
 }
 
-function recordNativeResults(
-  params: Parameters<typeof import("./test-file-scenario-runner.js").runQaTestFileScenarios>[0],
-  results: Awaited<
-    ReturnType<typeof import("./test-file-scenario-runner.js").runQaTestFileScenarios>
-  >["results"],
-) {
+function recordNativeResults(params: NativeParams, results: NativeResults) {
   const recorded = recordQaSuiteTestResults(
     params,
     params.scenarios,
@@ -185,7 +232,7 @@ function blockNextQaTestFileRun() {
 
 async function runFailFastQaSuite(label: string, overrides: QaSuiteRunParams = {}) {
   return await runQaSuite({
-    repoRoot: await makeTempRepo(`qa-suite-${label}-`),
+    repoRoot,
     outputDir: `.artifacts/qa-e2e/${label}`,
     concurrency: 8,
     failFast: true,
@@ -277,7 +324,8 @@ async function expectArtifactPublicationFailurePreservesPrior(params: {
 }
 
 describe("qa suite runtime launcher", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    repoRoot = await makeTempRepo("qa-suite-runtime-");
     replaceFileAtomicMock.mockClear();
     runQaFlowSuite.mockReset();
     runQaTestFileScenarios.mockReset();
@@ -309,34 +357,28 @@ describe("qa suite runtime launcher", () => {
         watchUrl: "http://127.0.0.1:43124",
       };
     });
-    runQaTestFileScenarios.mockImplementation(
-      async (
-        params: Parameters<
-          typeof import("./test-file-scenario-runner.js").runQaTestFileScenarios
-        >[0],
-      ) => {
-        const scenarios = params.scenarios.filter(isQaTestFileScenario);
-        const [scenario] = scenarios;
-        if (!scenario) {
-          throw new Error("expected scenario");
-        }
-        const evidencePath = path.join(params.outputDir, "qa-evidence.json");
-        const results = scenarios.map((scenarioItem) => ({
-          durationMs: 1,
-          logPath: path.join(params.outputDir, `${scenarioItem.id}.log`),
-          scenario: scenarioItem,
-          status: "pass" as const,
-        }));
-        const recorded = recordNativeResults(params, results);
-        await writeEvidence(evidencePath, recorded.evidence, params.writeEvidenceFile);
-        return {
-          ...recorded,
-          outputDir: params.outputDir,
-          executionKind: scenario.execution.kind,
-          evidencePath,
-        };
-      },
-    );
+    runQaTestFileScenarios.mockImplementation(async (params) => {
+      const scenarios = params.scenarios.filter(isQaTestFileScenario);
+      const [scenario] = scenarios;
+      if (!scenario) {
+        throw new Error("expected scenario");
+      }
+      const evidencePath = path.join(params.outputDir, "qa-evidence.json");
+      const results = scenarios.map((scenarioItem) => ({
+        durationMs: 1,
+        logPath: path.join(params.outputDir, `${scenarioItem.id}.log`),
+        scenario: scenarioItem,
+        status: "pass" as const,
+      }));
+      const recorded = recordNativeResults(params, results);
+      await writeEvidence(evidencePath, recorded.evidence, params.writeEvidenceFile);
+      return {
+        ...recorded,
+        outputDir: params.outputDir,
+        executionKind: scenario.execution.kind,
+        evidencePath,
+      };
+    });
   });
 
   afterEach(async () => {
@@ -348,7 +390,6 @@ describe("qa suite runtime launcher", () => {
   });
 
   it("preserves interleaved repeated requests through the real native invocation boundary", async () => {
-    const repoRoot = await makeTempRepo("qa-aggregate-interleaved-");
     const first = {
       ...makeTestFileScenario("vitest", "test/first.test.ts"),
       id: "first",
@@ -358,19 +399,13 @@ describe("qa suite runtime launcher", () => {
       id: "second",
     };
 
-    const native = await vi.importActual<typeof import("./test-file-scenario-runner.js")>(
-      "./test-file-scenario-runner.js",
-    );
     let calls = 0;
     runQaTestFileScenarios.mockImplementation(
       async (params) =>
-        await native.runQaTestFileScenarios({
-          ...params,
-          runCommand: async (command) => {
-            calls += 1;
-            await writeNativeVitestReport(command, { passed: 1 });
-            return { exitCode: calls === 2 ? 7 : 0, stdout: `native ${calls}\n`, stderr: "" };
-          },
+        await runNative(params, async (command) => {
+          calls += 1;
+          await writeNativeVitestReport(command, { passed: 1 });
+          return { exitCode: calls === 2 ? 7 : 0, stdout: `native ${calls}\n`, stderr: "" };
         }),
     );
     const result = await runQaSuite({
@@ -401,22 +436,10 @@ describe("qa suite runtime launcher", () => {
   });
 
   it("retains open comparison completion before a later child observation in the aggregate", async () => {
-    const repoRoot = await makeTempRepo("qa-aggregate-open-comparison-");
     const flow = makeQaSuiteTestScenario("flow");
     const native = makeTestFileScenario("vitest", "test/native.test.ts");
 
-    const nativeRunner = await vi.importActual<typeof import("./test-file-scenario-runner.js")>(
-      "./test-file-scenario-runner.js",
-    );
-    runQaTestFileScenarios.mockImplementation(async (params) =>
-      nativeRunner.runQaTestFileScenarios({
-        ...params,
-        runCommand: async (command) => {
-          await writeNativeVitestReport(command, { passed: 1 });
-          return { exitCode: 0, stdout: "native passed", stderr: "" };
-        },
-      }),
-    );
+    runQaTestFileScenarios.mockImplementation(runNative);
     const defaultFlow = requireDefaultQaFlowSuiteImplementation();
     let expected: QaEvidenceSummaryV3Json | undefined;
     runQaFlowSuite.mockImplementation(async (params) => {
@@ -477,50 +500,43 @@ describe("qa suite runtime launcher", () => {
   });
 
   it("keeps retained multi-instance script bundles inside repeated outer aggregate instances", async () => {
-    const repoRoot = await makeTempRepo("qa-aggregate-child-bundles-");
     const script = makeTestFileScenario("script", "scripts/producer.mjs");
     const nativeScenario = makeTestFileScenario("vitest", "test/native.test.ts");
 
-    const native = await vi.importActual<typeof import("./test-file-scenario-runner.js")>(
-      "./test-file-scenario-runner.js",
-    );
     const capturedChildren: QaEvidenceSummaryV3Json[] = [];
     runQaTestFileScenarios.mockImplementation(async (params) =>
-      native.runQaTestFileScenarios({
-        ...params,
-        runCommand: async (command) => {
-          if (command.args.includes("--artifact-base")) {
-            const anchor = params.evidenceAnchors?.[0];
-            assert.ok(anchor, "expected supplied native evidence anchor");
-            const child = createQaEvidenceInvocation({
-              scenarios: [script, script],
-              channel: null,
-              launch: anchor.launch,
-            });
-            const id = child.begin(0);
-            child.complete(id, {
-              status: "pass",
-              entries: [
-                {
-                  test: { kind: "script", id: "child", title: "Child" },
-                  coverage: [],
-                  result: { status: "pass" },
-                },
-              ],
-            });
-            child.select(0, id);
-            const snapshot = child.snapshot({ generatedAt: "2026-09-13T00:00:00Z" });
-            capturedChildren.push(snapshot);
-            await fs.writeFile(
-              path.join(resolveScriptAttemptOutputDir(command), script.id, "qa-evidence.json"),
-              JSON.stringify(snapshot),
-              { flag: "wx" },
-            );
-          } else {
-            await writeNativeVitestReport(command, { passed: 1 });
-          }
-          return { exitCode: 0, stdout: "completed", stderr: "" };
-        },
+      runNative(params, async (command) => {
+        if (command.args.includes("--artifact-base")) {
+          const anchor = params.evidenceAnchors?.[0];
+          assert.ok(anchor, "expected supplied native evidence anchor");
+          const child = createQaEvidenceInvocation({
+            scenarios: [script, script],
+            channel: null,
+            launch: anchor.launch,
+          });
+          const id = child.begin(0);
+          child.complete(id, {
+            status: "pass",
+            entries: [
+              {
+                test: { kind: "script", id: "child", title: "Child" },
+                coverage: [],
+                result: { status: "pass" },
+              },
+            ],
+          });
+          child.select(0, id);
+          const snapshot = child.snapshot({ generatedAt: "2026-09-13T00:00:00Z" });
+          capturedChildren.push(snapshot);
+          await fs.writeFile(
+            path.join(resolveScriptAttemptOutputDir(command), script.id, "qa-evidence.json"),
+            JSON.stringify(snapshot),
+            { flag: "wx" },
+          );
+        } else {
+          await writeNativeVitestReport(command, { passed: 1 });
+        }
+        return { exitCode: 0, stdout: "completed", stderr: "" };
       }),
     );
     const result = await runQaSuite({
@@ -553,20 +569,10 @@ describe("qa suite runtime launcher", () => {
   });
 
   it("retains child evidence but rejects a returned result from a foreign observation", async () => {
-    const repoRoot = await makeTempRepo("qa-aggregate-foreign-result-");
     const scenario = makeTestFileScenario("vitest", "test/native.test.ts");
 
-    const native = await vi.importActual<typeof import("./test-file-scenario-runner.js")>(
-      "./test-file-scenario-runner.js",
-    );
     runQaTestFileScenarios.mockImplementation(async (params) => {
-      const result = await native.runQaTestFileScenarios({
-        ...params,
-        runCommand: async (command) => {
-          await writeNativeVitestReport(command, { passed: 1 });
-          return { exitCode: 0, stdout: "passed", stderr: "" };
-        },
-      });
+      const result = await runNative(params);
       result.results[0]!.evidenceOccurrenceId = "foreign-observation";
       return result;
     });
@@ -588,7 +594,6 @@ describe("qa suite runtime launcher", () => {
   });
 
   it("continues actual passing flow observations after infrastructure failure", async () => {
-    const repoRoot = await makeTempRepo("qa-flow-continuation-");
     const outputDir = path.join(repoRoot, "output");
     const scenario = makeQaSuiteTestScenario("channel-chat-baseline");
     const snapshots: QaEvidenceSummaryV3Json[] = [];
@@ -598,14 +603,7 @@ describe("qa suite runtime launcher", () => {
     runQaFlowSuite.mockImplementation(async (params) => {
       assert.ok(params, "expected suite invocation params");
       const result = await original(params);
-      const recording = await createQaSuiteEvidenceInvocation(params, {
-        repoRoot,
-        outputDir,
-        selectedScenarios: [scenario],
-        providerMode: "mock-openai",
-        primaryModel: "mock-openai/test-model",
-        transportId: "qa-channel",
-      });
+      const recording = await recordChild(params, scenario);
       const selected = await recording.record(0, recording.invocation.begin(0), {
         name: scenario.title,
         status: "pass",
@@ -656,7 +654,6 @@ describe("qa suite runtime launcher", () => {
   });
 
   it("retains one default output root when a failed flow attempt retries as skipped", async () => {
-    const repoRoot = await makeTempRepo("qa-flow-default-retry-");
     const scenario = makeQaSuiteTestScenario("channel-chat-baseline");
     const original = requireDefaultQaFlowSuiteImplementation();
     const roots: string[] = [];
@@ -668,14 +665,7 @@ describe("qa suite runtime launcher", () => {
       const result = await original(params);
       const outputDir = params.outputDir!;
       roots.push(outputDir);
-      const recording = await createQaSuiteEvidenceInvocation(params, {
-        repoRoot,
-        outputDir,
-        selectedScenarios: [scenario],
-        providerMode: "mock-openai",
-        primaryModel: "mock-openai/test-model",
-        transportId: "qa-channel",
-      });
+      const recording = await recordChild(params, scenario);
       const selected = await recording.record(0, recording.invocation.begin(0), {
         name: scenario.title,
         status: roots.length === 1 ? "fail" : "skip",
@@ -721,10 +711,7 @@ describe("qa suite runtime launcher", () => {
   });
 
   it("runs runtime-specific channel scenarios in dedicated workers", async () => {
-    const repoRoot = await makeTempRepo("qa-suite-live-runtime-");
-    await runQaSuite({
-      repoRoot,
-      outputDir: ".artifacts/qa-e2e/live-runtime",
+    await runSuite(".artifacts/qa-e2e/live-runtime", {
       channelDriver: "live",
       channelId: "slack",
       concurrency: 4,
@@ -733,24 +720,19 @@ describe("qa suite runtime launcher", () => {
 
     const outputDir = path.join(repoRoot, ".artifacts", "qa-e2e", "live-runtime", "flow");
     expect(runQaFlowSuite).toHaveBeenCalledTimes(2);
-    expect(runQaFlowSuite).toHaveBeenCalledWith(
-      expect.objectContaining({
-        outputDir: path.join(outputDir, "isolated"),
-        forcedRuntime: undefined,
-        scenarioIds: ["slack-canary"],
-      }),
-    );
-    expect(runQaFlowSuite).toHaveBeenCalledWith(
-      expect.objectContaining({
-        outputDir: path.join(outputDir, "runtime-codex-1"),
-        forcedRuntime: "codex",
-        scenarioIds: ["slack-codex-approval-exec-native"],
-      }),
-    );
+    expectFlowCall({
+      outputDir: path.join(outputDir, "isolated"),
+      forcedRuntime: undefined,
+      scenarioIds: ["slack-canary"],
+    });
+    expectFlowCall({
+      outputDir: path.join(outputDir, "runtime-codex-1"),
+      forcedRuntime: "codex",
+      scenarioIds: ["slack-codex-approval-exec-native"],
+    });
   });
 
   it("expands profile scenarios across every eligible pluggable channel", async () => {
-    const repoRoot = await makeTempRepo("qa-suite-pluggable-channels-");
     const defaultFlowImplementation = requireDefaultQaFlowSuiteImplementation();
     runQaFlowSuite.mockImplementation(async (params) => {
       const result = await defaultFlowImplementation(params);
@@ -772,9 +754,7 @@ describe("qa suite runtime launcher", () => {
       },
     ];
 
-    const result = await runQaSuite({
-      repoRoot,
-      outputDir: ".artifacts/qa-e2e/pluggable-channels",
+    const result = await runSuite(".artifacts/qa-e2e/pluggable-channels", {
       providerMode: "mock-openai",
       channelDriver: "live",
       adapterFactories,
@@ -796,14 +776,12 @@ describe("qa suite runtime launcher", () => {
       ["slack", null, "thread-isolation"],
       ["matrix", "matrix-isolated-2", "thread-isolation"],
     ] as const) {
-      expect(runQaFlowSuite).toHaveBeenCalledWith(
-        expect.objectContaining({
-          adapterFactories,
-          channelId,
-          ...(partition === null ? {} : { outputDir: path.join(outputDir, "flow", partition) }),
-          scenarioIds: [scenarioId],
-        }),
-      );
+      expectFlowCall({
+        adapterFactories,
+        channelId,
+        ...(partition === null ? {} : { outputDir: path.join(outputDir, "flow", partition) }),
+        scenarioIds: [scenarioId],
+      });
     }
     expect(result.executionKind).toBe("suite");
     expect(result.result.scenarios.map((scenario) => scenario.name)).toContain(
@@ -830,7 +808,6 @@ describe("qa suite runtime launcher", () => {
   });
 
   it("retains captured child observations through an aggregate retry", async () => {
-    const repoRoot = await makeTempRepo("qa-suite-recorded-partition-");
     const catalog = structuredClone(scenarioCatalog.readQaBootstrapScenarioCatalog());
     for (const scenario of catalog.scenarios) {
       scenario.assertions = [
@@ -872,9 +849,7 @@ describe("qa suite runtime launcher", () => {
       }
       return { ...base, evidence: recording.snapshot(), scenarios: [result] };
     });
-    const result = await runQaSuite({
-      repoRoot,
-      outputDir: ".artifacts/recorded-partitions",
+    const result = await runSuite(".artifacts/recorded-partitions", {
       providerMode: "mock-openai",
       channelDriver: "crabline",
       scenarioIds: ["telegram-help-command", "matrix-restart-resume"],
@@ -907,12 +882,9 @@ describe("qa suite runtime launcher", () => {
   });
 
   it("runs distinct pluggable-driver channels within the global concurrency budget", async () => {
-    const repoRoot = await makeTempRepo("qa-suite-pluggable-channel-concurrency-");
     const maxActive = trackMaxActiveFlowRuns();
 
-    await runQaSuite({
-      repoRoot,
-      outputDir: ".artifacts/qa-e2e/pluggable-channel-concurrency",
+    await runSuite(".artifacts/qa-e2e/pluggable-channel-concurrency", {
       providerMode: "mock-openai",
       channelDriver: "live",
       adapterFactories: [{ id: "portable-driver", matches: vi.fn(), create: vi.fn() }],
@@ -924,7 +896,6 @@ describe("qa suite runtime launcher", () => {
   });
 
   it("runs isolated same-channel adapter instances within the suite budget", async () => {
-    const repoRoot = await makeTempRepo("qa-suite-pluggable-same-channel-concurrency-");
     const maxActive = trackMaxActiveFlowRuns();
 
     const isolatedScenarioId = "matrix-approval-channel-target-both";
@@ -936,9 +907,7 @@ describe("qa suite runtime launcher", () => {
       "matrix-approval-thread-target",
     ];
     const scenarioIds = [isolatedScenarioId, ...sharedScenarioIds];
-    await runQaSuite({
-      repoRoot,
-      outputDir: ".artifacts/qa-e2e/pluggable-same-channel-concurrency",
+    await runSuite(".artifacts/qa-e2e/pluggable-same-channel-concurrency", {
       providerMode: "mock-openai",
       channelDriver: "live",
       adapterFactories: [
@@ -962,7 +931,6 @@ describe("qa suite runtime launcher", () => {
   });
 
   it("partitions mixed Crabline child evidence into one aggregate suite", async () => {
-    const repoRoot = await makeTempRepo("qa-suite-crabline-channels-");
     const defaultFlowImplementation = requireDefaultQaFlowSuiteImplementation();
     runQaFlowSuite.mockImplementation(async (params) => {
       const result = await defaultFlowImplementation(params);
@@ -1003,9 +971,7 @@ describe("qa suite runtime launcher", () => {
       }));
       return result;
     });
-    const result = await runQaSuite({
-      repoRoot,
-      outputDir: ".artifacts/qa-e2e/crabline-channels",
+    const result = await runSuite(".artifacts/qa-e2e/crabline-channels", {
       providerMode: "mock-openai",
       channelDriver: "crabline",
       scenarioIds: ["telegram-help-command", "matrix-restart-resume"],
@@ -1026,18 +992,16 @@ describe("qa suite runtime launcher", () => {
         ["matrix", "matrix-restart-resume"],
       ] as const
     ).entries()) {
-      expect(runQaFlowSuite).toHaveBeenNthCalledWith(
-        index + 1,
-        expect.objectContaining({
+      expectFlowCall(
+        {
           outputDir: path.join(outputDir, "flow", channelId),
           channelId,
           scenarioIds: [scenarioId],
-        }),
+        },
+        index + 1,
       );
     }
-    const summary = JSON.parse(
-      await fs.readFile(path.join(outputDir, "qa-suite-summary.json"), "utf8"),
-    ) as { run?: { channel?: unknown; channelDriver?: unknown; scenarioIds?: unknown } };
+    const summary = await readSummary(path.join(outputDir, "qa-suite-summary.json"));
     expect(summary.run?.channelDriver).toBe("crabline");
     expect(summary.run?.channel).toBeNull();
     expect(summary.run?.scenarioIds).toEqual(["telegram-help-command", "matrix-restart-resume"]);
@@ -1052,7 +1016,6 @@ describe("qa suite runtime launcher", () => {
   });
 
   it("projects a skipped native producer as a skipped unified scenario", async () => {
-    const repoRoot = await makeTempRepo("qa-suite-native-skip-");
     const defaultImplementation = requireDefaultQaTestFileImplementation();
     runQaTestFileScenarios.mockImplementationOnce(async (params) => {
       const result = await defaultImplementation(params);
@@ -1062,17 +1025,13 @@ describe("qa suite runtime launcher", () => {
       return { ...result, ...recordNativeResults(params, result.results) };
     });
 
-    const result = await runQaSuite({
-      repoRoot,
-      outputDir: ".artifacts/qa-e2e/native-skip",
+    const result = await runSuite(".artifacts/qa-e2e/native-skip", {
       scenarioIds: ["control-ui-chat-flow-playwright"],
     });
     expect(result.result.scenarios).toMatchObject([
       { name: "Control UI chat flow Playwright coverage", status: "skip" },
     ]);
-    const summary = JSON.parse(await fs.readFile(result.result.summaryPath, "utf8")) as {
-      counts: { failed: number; skipped: number };
-    };
+    const summary = await readSummary(result.result.summaryPath);
     expect(summary.counts).toMatchObject({ failed: 0, skipped: 1 });
     expect(runPluginCommandWithTimeout).not.toHaveBeenCalled();
   });
@@ -1082,7 +1041,7 @@ describe("qa suite runtime launcher", () => {
     async ({ fileName }) => {
       const outputDir = await makeTempRepo("qa-suite-standard-artifact-atomic-");
       await expectArtifactPublicationFailurePreservesPrior({
-        canonicalFileNames: ["qa-suite-report.md", "qa-evidence.json", "qa-suite-summary.json"],
+        canonicalFileNames: artifactFileNames,
         failedFileName: fileName,
         outputDir,
         publish: async () =>
@@ -1111,7 +1070,6 @@ describe("qa suite runtime launcher", () => {
   );
 
   it("aggregates mixed-kind progress through the parent lab", async () => {
-    const repoRoot = await makeTempRepo("qa-suite-mixed-progress-");
     const scenarioRuns: Array<Parameters<QaLabServerHandle["setScenarioRun"]>[0]> = [];
     const lab = createLab((run) => scenarioRuns.push(run));
     const defaultFlowImplementation = requireDefaultQaFlowSuiteImplementation();
@@ -1192,7 +1150,6 @@ describe("qa suite runtime launcher", () => {
     ["live", "fail-fast"],
     ["crabline", "retry"],
   ] as const)("shares exclusive channel workers (%s, %s)", async (channelDriver, mode) => {
-    const repoRoot = await makeTempRepo("qa-suite-exclusive-");
     const sharedIds = ["shared-a", "shared-b", "shared-c"];
     const isolatedIds = ["isolated-a", "isolated-b"];
     const native = makeTestFileScenario("vitest", "test/native.test.ts");
@@ -1229,9 +1186,7 @@ describe("qa suite runtime launcher", () => {
       }
     });
 
-    const result = await runQaSuite({
-      repoRoot,
-      outputDir: "out",
+    const result = await runSuite("out", {
       scenarioDefinitions,
       scenarioIds,
       channelDriver,
@@ -1303,22 +1258,17 @@ describe("qa suite runtime launcher", () => {
 
     expect(result.executionKind).toBe("suite");
     expect(runQaFlowSuite).toHaveBeenCalledTimes(1);
-    expect(runQaFlowSuite).toHaveBeenCalledWith(
-      expect.objectContaining({
-        concurrency: 1,
-        failFast: true,
-        scenarioIds: ["dm-chat-baseline"],
-      }),
-    );
+    expectFlowCall({
+      concurrency: 1,
+      failFast: true,
+      scenarioIds: ["dm-chat-baseline"],
+    });
     expect(runQaTestFileScenarios).not.toHaveBeenCalled();
     expect(prepareDockerE2eEnvironment).not.toHaveBeenCalled();
     expect(result.result.scenarios).toMatchObject([
       { name: "dm-chat-baseline", status: "fail", details: "first scenario failed" },
     ]);
-    const summary = JSON.parse(await fs.readFile(result.result.summaryPath, "utf8")) as {
-      run?: { concurrency?: number; scenarioIds?: string[] };
-      scenarios?: Array<{ name?: string; status?: string }>;
-    };
+    const summary = await readSummary(result.result.summaryPath);
     expect(summary.run?.concurrency).toBe(1);
     expect(summary.run?.scenarioIds).toEqual([
       "dm-chat-baseline",
@@ -1364,9 +1314,7 @@ describe("qa suite runtime launcher", () => {
         details: "suite partition returned no scenario result",
       },
     ]);
-    const summary = JSON.parse(await fs.readFile(result.result.summaryPath, "utf8")) as {
-      scenarios?: Array<{ details?: string; name?: string; status?: string }>;
-    };
+    const summary = await readSummary(result.result.summaryPath);
     expect(summary.scenarios).toMatchObject([
       {
         name: "DM baseline conversation",
@@ -1396,11 +1344,7 @@ describe("qa suite runtime launcher", () => {
   });
 
   it("leaves nested E2E script runtime preparation to the script owner", async () => {
-    const repoRoot = await makeTempRepo("qa-suite-script-runtime-owner-");
-
-    await runQaSuite({
-      repoRoot,
-      outputDir: ".artifacts/qa-e2e/script-runtime-owner",
+    await runSuite(".artifacts/qa-e2e/script-runtime-owner", {
       scenarioIds: ["managed-gateway-service-lifecycle"],
     });
 
@@ -1418,7 +1362,6 @@ describe("qa suite runtime launcher", () => {
   });
 
   it("settles flow and native work, then runs serial scripts before a bounded parallel tail", async () => {
-    const repoRoot = await makeTempRepo("qa-suite-parallel-scripts-");
     const defaultFlowImplementation = requireDefaultQaFlowSuiteImplementation();
     const defaultTestFileImplementation = requireDefaultQaTestFileImplementation();
     const flow = Promise.withResolvers<void>();
@@ -1464,9 +1407,7 @@ describe("qa suite runtime launcher", () => {
       return await defaultTestFileImplementation(params);
     });
 
-    const runPromise = runQaSuite({
-      repoRoot,
-      outputDir: ".artifacts/qa-e2e/parallel-scripts",
+    const runPromise = runSuite(".artifacts/qa-e2e/parallel-scripts", {
       concurrency: 8,
       scenarioIds: [
         "dm-chat-baseline",
@@ -1506,12 +1447,8 @@ describe("qa suite runtime launcher", () => {
   });
 
   it("carries the actual prepared Docker receipt through aggregate native delegation", async () => {
-    const repoRoot = await makeTempRepo("qa-suite-docker-receipt-");
     const docker = await vi.importActual<typeof import("./test-file-scenario-docker-batch.js")>(
       "./test-file-scenario-docker-batch.js",
-    );
-    const native = await vi.importActual<typeof import("./test-file-scenario-runner.js")>(
-      "./test-file-scenario-runner.js",
     );
     prepareDockerE2eEnvironment.mockImplementationOnce((params) =>
       docker.prepareDockerE2eEnvironment({
@@ -1533,27 +1470,21 @@ describe("qa suite runtime launcher", () => {
           }),
       }),
     );
-    const command = vi.fn(
-      async (params: import("./test-file-scenario-runner.js").QaScenarioCommandExecution) => {
-        const lane = "npm-onboard-channel-agent";
-        expect(params.env.OPENCLAW_DOCKER_ALL_LANES).toBe(lane);
-        await fs.writeFile(
-          path.join(params.env.OPENCLAW_DOCKER_ALL_LOG_DIR!, "summary.json"),
-          JSON.stringify({
-            failures: [],
-            selectedLanes: [lane],
-            lanes: [{ name: lane, status: 0, elapsedSeconds: 1 }],
-          }),
-        );
-        return { exitCode: 0, stdout: "completed", stderr: "" };
-      },
-    );
-    runQaTestFileScenarios.mockImplementationOnce((params) =>
-      native.runQaTestFileScenarios({ ...params, runCommand: command }),
-    );
-    const result = await runQaSuite({
-      repoRoot,
-      outputDir: "out",
+    const command = vi.fn(async (params: QaScenarioCommandExecution) => {
+      const lane = "npm-onboard-channel-agent";
+      expect(params.env.OPENCLAW_DOCKER_ALL_LANES).toBe(lane);
+      await fs.writeFile(
+        path.join(params.env.OPENCLAW_DOCKER_ALL_LOG_DIR!, "summary.json"),
+        JSON.stringify({
+          failures: [],
+          selectedLanes: [lane],
+          lanes: [{ name: lane, status: 0, elapsedSeconds: 1 }],
+        }),
+      );
+      return { exitCode: 0, stdout: "completed", stderr: "" };
+    });
+    runQaTestFileScenarios.mockImplementationOnce((params) => runNative(params, command));
+    const result = await runSuite("out", {
       scenarioIds: ["docker-npm-onboard-channel-agent"],
     });
     expect(prepareDockerE2eEnvironment).toHaveBeenCalledTimes(1);
@@ -1585,7 +1516,6 @@ describe("qa suite runtime launcher", () => {
   });
 
   it("records Docker preparation failure without starting a script partition", async () => {
-    const repoRoot = await makeTempRepo("qa-suite-docker-prep-failure-");
     prepareDockerE2eEnvironment.mockRejectedValueOnce(new Error("candidate pack failed"));
     const result = await runQaSuite({
       repoRoot,
@@ -1605,7 +1535,6 @@ describe("qa suite runtime launcher", () => {
   });
 
   it("reuses the prepared Docker env object when a script partition retries", async () => {
-    const repoRoot = await makeTempRepo("qa-suite-docker-prep-retry-");
     const preparedEnv = Object.freeze({ OPENCLAW_CURRENT_PACKAGE_TGZ: "/tmp/candidate.tgz" });
     const defaultImplementation = requireDefaultQaTestFileImplementation();
     prepareDockerE2eEnvironment.mockResolvedValueOnce(preparedEnv);
@@ -1623,7 +1552,6 @@ describe("qa suite runtime launcher", () => {
   });
 
   it("serializes every fail-fast script and stops before post-failure work", async () => {
-    const repoRoot = await makeTempRepo("qa-suite-fail-fast-scripts-");
     const defaultTestFileImplementation = requireDefaultQaTestFileImplementation();
     const first = Promise.withResolvers<void>();
     const preparedEnv = Object.freeze({ OPENCLAW_CURRENT_PACKAGE_TGZ: "/tmp/candidate.tgz" });
@@ -1657,9 +1585,7 @@ describe("qa suite runtime launcher", () => {
       }
     });
 
-    const runPromise = runQaSuite({
-      repoRoot,
-      outputDir: ".artifacts/qa-e2e/fail-fast-scripts",
+    const runPromise = runSuite(".artifacts/qa-e2e/fail-fast-scripts", {
       concurrency: 8,
       failFast: true,
       scenarioIds: ["remote-log-tailing", "docker-npm-onboard-channel-agent", "gateway-smoke"],
@@ -1681,13 +1607,10 @@ describe("qa suite runtime launcher", () => {
   });
 
   it("starts native suite proof before isolated flow work fills the weighted queue", async () => {
-    const repoRoot = await makeTempRepo("qa-suite-native-before-isolated-");
     const shared = blockNextQaFlowSuite();
     const testFile = blockNextQaTestFileRun();
 
-    const runPromise = runQaSuite({
-      repoRoot,
-      outputDir: ".artifacts/qa-e2e/native-before-isolated",
+    const runPromise = runSuite(".artifacts/qa-e2e/native-before-isolated", {
       concurrency: 2,
       scenarioIds: [
         "dm-chat-baseline",
@@ -1710,13 +1633,8 @@ describe("qa suite runtime launcher", () => {
   });
 
   it("waits for already-started partitions before recording a unified failure", async () => {
-    const repoRoot = await makeTempRepo("qa-suite-reject-settle-");
     const outputDir = path.join(repoRoot, ".artifacts", "qa-e2e", "reject-settle");
-    const priorArtifactPaths = [
-      path.join(outputDir, "qa-suite-summary.json"),
-      path.join(outputDir, "qa-evidence.json"),
-      path.join(outputDir, "qa-suite-report.md"),
-    ];
+    const priorArtifactPaths = artifactFileNames.map((name) => path.join(outputDir, name));
     await fs.mkdir(outputDir, { recursive: true });
     await Promise.all(
       priorArtifactPaths.map((artifactPath) => fs.writeFile(artifactPath, "stale")),
@@ -1729,9 +1647,7 @@ describe("qa suite runtime launcher", () => {
         }),
       }),
     );
-    const runPromise = runQaSuite({
-      repoRoot,
-      outputDir: ".artifacts/qa-e2e/reject-settle",
+    const runPromise = runSuite(".artifacts/qa-e2e/reject-settle", {
       concurrency: 2,
       scenarioIds: ["channel-chat-baseline", "control-ui-chat-flow-playwright"],
     });
@@ -1760,16 +1676,13 @@ describe("qa suite runtime launcher", () => {
         expect.objectContaining({ status: "pass" }),
       ]),
     );
-    const summary = JSON.parse(await fs.readFile(result.result.summaryPath, "utf8")) as {
-      counts: { failed: number; passed: number; total: number };
-    };
+    const summary = await readSummary(result.result.summaryPath);
     expect(summary.counts).toMatchObject({ total: 2, passed: 1, failed: 1 });
     await fs.access(result.result.evidencePath);
     await fs.access(result.result.reportPath);
   });
 
   it("reuses unavailable channel credential evidence across serial partitions", async () => {
-    const repoRoot = await makeTempRepo("qa-suite-credential-unavailable-");
     const poolError = Object.assign(new Error("no WhatsApp credential is available"), {
       code: "POOL_EXHAUSTED",
     });
@@ -1779,9 +1692,7 @@ describe("qa suite runtime launcher", () => {
       }),
     );
 
-    const result = await runQaSuite({
-      repoRoot,
-      outputDir: ".artifacts/qa-e2e/credential-unavailable",
+    const result = await runSuite(".artifacts/qa-e2e/credential-unavailable", {
       providerMode: "mock-openai",
       channelDriver: "live",
       adapterFactories: [{ id: "whatsapp", matches: () => true, create: vi.fn() }],
@@ -1815,10 +1726,7 @@ describe("qa suite runtime launcher", () => {
   });
 
   it("isolates flow scenarios that mutate shared runtime state", async () => {
-    const repoRoot = await makeTempRepo("qa-suite-shared-state-");
-    await runQaSuite({
-      repoRoot,
-      outputDir: ".artifacts/qa-e2e/smoke",
+    await runSuite(".artifacts/qa-e2e/smoke", {
       concurrency: 8,
       scenarioIds: [
         "dm-chat-baseline",
@@ -1831,17 +1739,16 @@ describe("qa suite runtime launcher", () => {
 
     const outputDir = path.join(repoRoot, ".artifacts", "qa-e2e", "smoke");
     expect(runQaFlowSuite).toHaveBeenCalledTimes(2);
-    expect(runQaFlowSuite).toHaveBeenNthCalledWith(
-      1,
-      expect.objectContaining({
+    expectFlowCall(
+      {
         outputDir: path.join(outputDir, "flow", "shared"),
         concurrency: 1,
         scenarioIds: ["dm-chat-baseline"],
-      }),
+      },
+      1,
     );
-    expect(runQaFlowSuite).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({
+    expectFlowCall(
+      {
         outputDir: path.join(outputDir, "flow", "isolated"),
         concurrency: 3,
         workerStartStaggerMs: 1_500,
@@ -1850,7 +1757,8 @@ describe("qa suite runtime launcher", () => {
           "runtime-inventory-drift-check",
           "session-memory-ranking",
         ],
-      }),
+      },
+      2,
     );
   });
 
@@ -1868,14 +1776,11 @@ describe("qa suite runtime launcher", () => {
   });
 
   it("rejects repo-local symlink output directories before running Vitest/Playwright scenarios", async () => {
-    const repoRoot = await makeTempRepo("qa-suite-symlink-root-");
     const outsideRoot = await makeTempRepo("qa-suite-symlink-outside-");
     await fs.symlink(outsideRoot, path.join(repoRoot, "artifacts-link"));
 
     await expect(
-      runQaSuite({
-        repoRoot,
-        outputDir: "artifacts-link/qa-out",
+      runSuite("artifacts-link/qa-out", {
         scenarioIds: ["control-ui-chat-flow-playwright"],
       }),
     ).rejects.toThrow("QA suite outputDir must not traverse symlinks");

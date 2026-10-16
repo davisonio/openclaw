@@ -15,7 +15,7 @@ const fixturePath = fileURLToPath(
 );
 const artifactsRoot = path.join(repoRoot, ".artifacts", "qa-e2e");
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
-const activeChildren = new Set<ChildProcess>();
+let activeRun: ReturnType<typeof startSuiteProcess> | undefined;
 const nodeExecPath = resolveTestNodeExecPath();
 
 const PROCESS_LIFECYCLE_SCENARIO = "channel-chat-baseline";
@@ -90,22 +90,11 @@ function forceStopProcessTree(child: ChildProcess) {
 }
 
 afterEach(async () => {
-  for (const child of activeChildren) {
-    forceStopProcessTree(child);
+  if (activeRun) {
+    forceStopProcessTree(activeRun.child);
+    await activeRun.closed;
+    activeRun = undefined;
   }
-  await Promise.all(
-    [...activeChildren].map(
-      (child) =>
-        new Promise<void>((resolve) => {
-          if (child.exitCode !== null || child.signalCode !== null) {
-            resolve();
-            return;
-          }
-          child.once("close", () => resolve());
-        }),
-    ),
-  );
-  activeChildren.clear();
 });
 
 function startSuiteProcess(outputDir: string, scenarioIds: readonly string[]) {
@@ -114,7 +103,6 @@ function startSuiteProcess(outputDir: string, scenarioIds: readonly string[]) {
     env: buildSuiteProcessEnv(outputDir),
     stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
-  activeChildren.add(child);
   const summaryWritten = Promise.withResolvers<void>();
   child.on("message", (message: unknown) => {
     if (message === "summary-written") {
@@ -139,7 +127,6 @@ function startSuiteProcess(outputDir: string, scenarioIds: readonly string[]) {
     (resolve, reject) => {
       child.once("error", reject);
       child.once("close", (code, signal) => {
-        activeChildren.delete(child);
         resolve({ code, signal });
       });
     },
@@ -183,7 +170,7 @@ describe("qa suite command process lifecycle", () => {
     async ({ signal }) => {
       await fs.mkdir(artifactsRoot, { recursive: true });
       const outputDir = tempDirs.make("suite-process-lifecycle-", artifactsRoot);
-      const run = startSuiteProcess(outputDir, [PROCESS_LIFECYCLE_SCENARIO]);
+      const run = (activeRun = startSuiteProcess(outputDir, [PROCESS_LIFECYCLE_SCENARIO]));
       const startedWaitingAt = Date.now();
       const heartbeat = setInterval(() => {
         const output = run.output();

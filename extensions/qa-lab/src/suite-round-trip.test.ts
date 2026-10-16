@@ -1,10 +1,32 @@
 import { buildQaTarget } from "openclaw/plugin-sdk/qa-channel-protocol";
 import type { QaBusInboundMessageInput } from "openclaw/plugin-sdk/qa-channel-protocol";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createQaBusState } from "./bus-state.js";
-import { runQaSuiteRoundTripProbe } from "./suite-round-trip.js";
+import { runQaSuiteRoundTripProbe, type QaSuiteRoundTripProbe } from "./suite-round-trip.js";
+
+function makeProbe(overrides: Partial<QaSuiteRoundTripProbe> = {}): QaSuiteRoundTripProbe {
+  return {
+    scenarioId: "channel-canary",
+    count: 2,
+    maxFailures: 2,
+    timeoutMs: 1_000,
+    markerPrefix: "QA-RTT",
+    input: { conversation: { id: "room", kind: "group" }, senderId: "driver" },
+    textPrefix: "Reply exactly: ",
+    ...overrides,
+  };
+}
 
 describe("QA suite round-trip probe", () => {
+  let state: ReturnType<typeof createQaBusState>;
+  beforeEach(() => {
+    state = createQaBusState();
+  });
+  afterEach(() => state.reset(true));
+  const fromScenario = { fromScenario: true, senderId: "primary" } as const;
+  const addOutbound = (to: string, text: string, accountId = "sut") =>
+    state.addOutboundMessage({ accountId, to, text });
+
   it.each([
     { id: "telegram-reply-chain-dm", kind: "direct", outboundOnly: false },
     { id: "telegram-command-room", kind: "channel", outboundOnly: false },
@@ -13,11 +35,10 @@ describe("QA suite round-trip probe", () => {
   ] as const)(
     "continues the observed $id route without adopting another participant's reply",
     async (route) => {
-      const state = createQaBusState();
       const conversation = { id: route.id, kind: route.kind };
       const threadId = "threadId" in route ? route.threadId : undefined;
       const target = buildQaTarget({ chatType: route.kind, conversationId: route.id, threadId });
-      state.addOutboundMessage({ accountId: "sut", to: "group:prior-scenario", text: "old" });
+      addOutbound("group:prior-scenario", "old");
       const scenarioStartCursor = state.getSnapshot().cursor;
       if (!route.outboundOnly) {
         state.addInboundMessage({
@@ -29,18 +50,10 @@ describe("QA suite round-trip probe", () => {
           nativeCommand: { name: "status" },
         });
       }
-      const priorReply = state.addOutboundMessage({
-        accountId: "sut",
-        to: target,
-        text: "prior reply",
-      });
-      const deleted = state.addOutboundMessage({
-        accountId: "sut",
-        to: "group:deleted",
-        text: "deleted",
-      });
+      const priorReply = addOutbound(target, "prior reply");
+      const deleted = addOutbound("group:deleted", "deleted");
       state.deleteMessage({ accountId: "sut", messageId: deleted.id });
-      state.addOutboundMessage({ accountId: "foreign", to: "group:foreign", text: "foreign" });
+      addOutbound("group:foreign", "foreign", "foreign");
       const replies: string[] = [];
       const sendInbound = vi.fn(async (input: QaBusInboundMessageInput) => {
         const message = state.addInboundMessage(input);
@@ -66,84 +79,52 @@ describe("QA suite round-trip probe", () => {
         }
         return reply;
       });
-      try {
-        const result = await runQaSuiteRoundTripProbe({
-          probe: {
-            scenarioId: "selected-scenario",
-            count: 2,
-            maxFailures: 1,
-            timeoutMs: 1_000,
-            markerPrefix: "QA-RTT",
-            input: { fromScenario: true, senderId: "primary" },
-            textPrefix: "Reply exactly: ",
-            chainReplies: true,
-          },
-          transport: { accountId: "sut", state, sendInbound, waitForOutbound },
-          scenarioStartCursor,
-        });
-        expect(result).toMatchObject({ passed: 2, failed: 0 });
-        expect(sendInbound.mock.calls.map(([input]) => input)).toEqual([
-          expect.objectContaining({
-            accountId: "sut",
-            conversation,
-            threadId,
-            senderId: "primary",
-          }),
-          expect.objectContaining({
-            accountId: "sut",
-            conversation,
-            threadId,
-            senderId: "primary",
-            replyToId: replies[0],
-          }),
-        ]);
-        const first = sendInbound.mock.calls[0]?.[0];
-        expect(first).not.toHaveProperty("replyToId");
-        expect(first).not.toHaveProperty("nativeCommand");
-        expect(sendInbound.mock.calls.map(([input]) => input.replyToId)).not.toContain(
-          priorReply.id,
-        );
-        expect(waitForOutbound).toHaveBeenCalledWith(
-          expect.objectContaining({ conversation, threadId }),
-        );
-      } finally {
-        state.reset(true);
-      }
+      const result = await runQaSuiteRoundTripProbe({
+        probe: makeProbe({
+          scenarioId: "selected-scenario",
+          maxFailures: 1,
+          input: fromScenario,
+          chainReplies: true,
+        }),
+        transport: { accountId: "sut", state, sendInbound, waitForOutbound },
+        scenarioStartCursor,
+      });
+      expect(result).toMatchObject({ passed: 2, failed: 0 });
+      const expectedInput = { accountId: "sut", conversation, threadId, senderId: "primary" };
+      expect(sendInbound.mock.calls.map(([input]) => input)).toMatchObject([
+        expectedInput,
+        { ...expectedInput, replyToId: replies[0] },
+      ]);
+      const first = sendInbound.mock.calls[0]?.[0];
+      expect(first).not.toHaveProperty("replyToId");
+      expect(first).not.toHaveProperty("nativeCommand");
+      expect(sendInbound.mock.calls.map(([input]) => input.replyToId)).not.toContain(priorReply.id);
+      expect(waitForOutbound).toHaveBeenCalledWith(
+        expect.objectContaining({ conversation, threadId }),
+      );
     },
   );
 
   it("refuses to reuse a previous scenario route when this attempt has no surviving messages", async () => {
-    const state = createQaBusState();
-    state.addOutboundMessage({ accountId: "sut", to: "group:prior", text: "prior" });
+    addOutbound("group:prior", "prior");
     const scenarioStartCursor = state.getSnapshot().cursor;
-    const deleted = state.addOutboundMessage({
-      accountId: "sut",
-      to: "group:selected",
-      text: "removed",
-    });
+    const deleted = addOutbound("group:selected", "removed");
     state.deleteMessage({ accountId: "sut", messageId: deleted.id });
-    state.addOutboundMessage({ accountId: "foreign", to: "group:foreign", text: "foreign" });
+    addOutbound("group:foreign", "foreign", "foreign");
     const sendInbound = vi.fn();
-    try {
-      await expect(
-        runQaSuiteRoundTripProbe({
-          probe: {
-            scenarioId: "selected-scenario",
-            count: 1,
-            maxFailures: 1,
-            timeoutMs: 1_000,
-            markerPrefix: "QA-RTT",
-            input: { fromScenario: true, senderId: "primary" },
-            textPrefix: "Reply exactly: ",
-          },
-          transport: { accountId: "sut", state, sendInbound, waitForOutbound: vi.fn() },
-          scenarioStartCursor,
+    await expect(
+      runQaSuiteRoundTripProbe({
+        probe: makeProbe({
+          scenarioId: "selected-scenario",
+          count: 1,
+          maxFailures: 1,
+          input: fromScenario,
         }),
-      ).rejects.toThrow("no observed conversation: selected-scenario");
-      expect(sendInbound).not.toHaveBeenCalled();
-    } finally {
-      state.reset(true);
-    }
+        transport: { accountId: "sut", state, sendInbound, waitForOutbound: vi.fn() },
+        scenarioStartCursor,
+      }),
+    ).rejects.toThrow("no observed conversation: selected-scenario");
+    expect(sendInbound).not.toHaveBeenCalled();
   });
 
   it("collects requested samples and chains native replies", async () => {
@@ -156,19 +137,7 @@ describe("QA suite round-trip probe", () => {
     });
 
     const result = await runQaSuiteRoundTripProbe({
-      probe: {
-        scenarioId: "channel-canary",
-        count: 2,
-        maxFailures: 2,
-        timeoutMs: 1_000,
-        markerPrefix: "QA-RTT",
-        input: {
-          conversation: { id: "room", kind: "group" },
-          senderId: "driver",
-        },
-        textPrefix: "Reply exactly: ",
-        chainReplies: true,
-      },
+      probe: makeProbe({ chainReplies: true }),
       transport: {
         state: {
           getSnapshot: () => ({ messages }),
@@ -178,9 +147,7 @@ describe("QA suite round-trip probe", () => {
       } as never,
     });
 
-    expect(result.passed).toBe(2);
-    expect(result.failed).toBe(0);
-    expect(result.timing.samples).toBe(2);
+    expect(result).toMatchObject({ passed: 2, failed: 0, timing: { samples: 2 } });
     expect(sendInbound.mock.calls[1]?.[0]).toMatchObject({ replyToId: "out-1" });
   });
 
@@ -188,18 +155,7 @@ describe("QA suite round-trip probe", () => {
     "stops at the failure budget after a %s",
     async (failure) => {
       const result = await runQaSuiteRoundTripProbe({
-        probe: {
-          scenarioId: "channel-canary",
-          count: 3,
-          maxFailures: 1,
-          timeoutMs: 10,
-          markerPrefix: "QA-RTT",
-          input: {
-            conversation: { id: "room", kind: "group" },
-            senderId: "driver",
-          },
-          textPrefix: "Reply exactly: ",
-        },
+        probe: makeProbe({ count: 3, maxFailures: 1, timeoutMs: 10 }),
         transport: {
           state: { getSnapshot: () => ({ messages: [] }) },
           sendInbound: vi.fn(),
