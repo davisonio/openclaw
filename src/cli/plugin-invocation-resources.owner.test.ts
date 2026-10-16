@@ -4,7 +4,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { Command } from "commander";
 import { resolvePluginProviders } from "openclaw/plugin-sdk/provider-catalog-runtime";
 import { afterAll, afterEach, expect, it, vi } from "vitest";
-import { awaitGateBeforeSettlement, withinTest } from "../../test/helpers/promise.js";
+import { awaitGateBeforeSettlement } from "../../test/helpers/promise.js";
 import { getRegisteredAgentHarness, registerAgentHarness } from "../agents/harness/registry.js";
 import type { AgentHarness } from "../agents/harness/types.js";
 import { clearRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
@@ -406,37 +406,14 @@ it("retains CLI SDK providers through their actual local Gateway context", async
   }
 });
 
-it.for(["returned", "cooperating"] as const)(
+it.each(["returned", "cooperating"] as const)(
   "keeps native SDK provider resources through %s cleanup work after the five-second grace",
-  async (mode, context) => {
-    let stage = "fixture";
-    let reported = false;
-    const report = () => {
-      if (reported) return;
-      reported = true;
-      process.stderr.write(
-        "[cleanup-stage] " +
-          JSON.stringify({
-            mode,
-            stage,
-            timers: vi.isFakeTimers() ? vi.getTimerCount() : null,
-            pending: getPendingCliDisposers()
-              .slice(0, 32)
-              .map((name) => name.slice(0, 160)),
-          }) +
-          "\n",
-      );
-    };
-    context.signal.addEventListener("abort", report, { once: true });
-    context.onTestFailed(report);
-    context.onTestFinished(() => context.signal.removeEventListener("abort", report));
+  async (mode) => {
     const fixture = nativeFixture({ sdkProvider: true });
     await withCliProcessScope(() =>
       withCliCommandCleanup(false, async (cleanup) => {
         const resources = getCliPluginInvocationResources()!;
-        stage = "acquire-registry";
         const registry = await resources.acquire(fixture.load);
-        stage = "resolve-provider";
         // Terminal cleanup consumes an admitted handle; it cannot acquire a retired provider.
         const providers = withPluginRuntimeRegistryScope(registry, () =>
           resolvePluginProviders({
@@ -477,19 +454,14 @@ it.for(["returned", "cooperating"] as const)(
         };
         withPluginRegistrationContext(registry, fixture.id, () => registerAgentHarness(harness));
         withPluginRuntimeRegistryScope(registry, () => getRegisteredAgentHarness(harness.id));
-        stage = "start-close";
         vi.useFakeTimers();
         const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
         const closing = closeCliResources(cleanup);
         let release: Promise<void> | undefined;
         try {
-          stage = "wait-entered";
-          await withinTest(entered.promise, context.signal);
-          stage = "advance-grace";
-          await withinTest(vi.advanceTimersByTimeAsync(5_000), context.signal);
-          stage = "await-close";
-          await withinTest(closing, context.signal);
-          stage = "assert-pending";
+          await entered.promise;
+          await vi.advanceTimersByTimeAsync(5_000);
+          await closing;
           if (mode === "returned") {
             expect(getPendingCliDisposers()).toContain("agent-harness/native-cleanup");
             expect(stderr).toHaveBeenCalledWith(expect.stringContaining("native-cleanup"));
@@ -497,29 +469,23 @@ it.for(["returned", "cooperating"] as const)(
             // A completed disposer wrapper is not evidence that its admitted descendant finished.
             expect(getPendingCliDisposers()).not.toContain("agent-harness/native-cleanup");
           }
-          stage = "release-resources";
           release = resources.release();
           await vi.advanceTimersByTimeAsync(0);
-          stage = "assert-live";
           expect(fixture.state.database!.isOpen).toBe(true);
           expect(fixture.state.disposals).toBe(0);
         } finally {
-          stage = "resume-cleanup";
+          // Native worker shutdown joins through setImmediate; fake timers must end first.
+          vi.useRealTimers();
           resume.resolve();
           await Promise.allSettled([closing, descendant]);
-          stage = "await-release";
           await (release ?? resources.release());
-          stage = "assert-disposed";
         }
         await expect(descendant).resolves.toBeUndefined();
         expect(fixture.state.afterCleanup).toEqual({ value: 42 });
         expect(fixture.state.disposals).toBe(1);
         expect(getPendingCliDisposers()).not.toContain("agent-harness/native-cleanup");
-        stage = "callback-complete";
       }),
     );
-    stage = "scope-complete";
-    report();
   },
 );
 
