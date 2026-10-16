@@ -191,3 +191,59 @@ it("retires a pending save without letting its late completion release a reopene
     resolveSave(null);
   }
 });
+
+it("gates saving synchronously and lets a failed save retry the restored worktree choice", async () => {
+  let resolveRepository!: (value: "git") => void;
+  let resolveSave!: (value: string | null) => void;
+  const repository = new Promise<"git">((resolve) => {
+    resolveRepository = resolve;
+  });
+  const pendingSave = new Promise<string | null>((resolve) => {
+    resolveSave = resolve;
+  });
+  const submit = fixture.mockRequest(
+    vi.fn().mockReturnValueOnce(pendingSave).mockResolvedValue(null),
+  );
+  const completed = fixture.track(
+    showSessionGroupDefaultsDialog({
+      group: "Project",
+      defaults: { cwd: "/workspace/project", worktree: true },
+      listDirectory: async () => ({ path: "/workspace", home: "/home/test", entries: [] }),
+      inspectRepository: async () => repository,
+      submit,
+    }),
+  );
+  try {
+    const { modal } = await getRenderedModalDialog(document.body);
+    const form = modal.querySelector("form")!;
+    const save = modal.querySelector<HTMLButtonElement>('button[type="submit"]')!;
+    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    expect(submit).not.toHaveBeenCalled();
+    expect(save.disabled).toBe(true);
+    resolveRepository("git");
+    await waitForSolid(() => {
+      expect(save.disabled).toBe(false);
+      expect(
+        modal.querySelector("#session-group-defaults-mode-trigger")?.getAttribute("data-value"),
+      ).toBe("worktree");
+    });
+    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    const cancel = new Event("modal-cancel", { bubbles: true, cancelable: true });
+    modal.dispatchEvent(cancel);
+    expect(cancel.defaultPrevented).toBe(true);
+    expect(submit).toHaveBeenCalledExactlyOnceWith({ cwd: "/workspace/project", worktree: true });
+    resolveSave("Try saving again");
+    await waitForSolid(() => {
+      expect(save.disabled).toBe(false);
+      expect(modal.querySelector('[role="alert"]')?.textContent).toBe("Try saving again");
+    });
+    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await completed;
+    expect(submit).toHaveBeenCalledTimes(2);
+    expect(submit).toHaveBeenLastCalledWith({ cwd: "/workspace/project", worktree: true });
+  } finally {
+    resolveRepository("git");
+    resolveSave(null);
+  }
+});
