@@ -47,7 +47,9 @@ export function AppearancePicker(props: AppearancePickerProps) {
     props.ref?.((target, roving) =>
       onSettled(() => {
         if (target === "grid" && roving) {
-          for (const button of choices.values()) button.tabIndex = button === custom ? 0 : -1;
+          for (const button of choices.values()) {
+            button.tabIndex = button === custom ? 0 : -1;
+          }
         }
         (target === "grid" ? custom : input)?.focus();
       }),
@@ -141,7 +143,7 @@ export function AppearancePicker(props: AppearancePickerProps) {
               event,
               [...choices.values()]
                 .filter((button) => button.isConnected && !button.disabled)
-                .sort((a, b) =>
+                .toSorted((a, b) =>
                   a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1,
                 ),
             ),
@@ -269,16 +271,13 @@ export function AppearancePicker(props: AppearancePickerProps) {
 
 function handleAppearanceGridKeydown(event: KeyboardEvent, choices: HTMLButtonElement[]) {
   const choice = event.target;
-  if (!(choice instanceof HTMLButtonElement)) {
-    return;
-  }
   const offset =
     event.key === "ArrowLeft" || event.key === "ArrowUp"
       ? -1
       : event.key === "ArrowRight" || event.key === "ArrowDown"
         ? 1
         : undefined;
-  if (offset === undefined || !(event.currentTarget instanceof HTMLElement)) {
+  if (offset === undefined || !(choice instanceof HTMLButtonElement)) {
     return;
   }
   const index = choices.indexOf(choice);
