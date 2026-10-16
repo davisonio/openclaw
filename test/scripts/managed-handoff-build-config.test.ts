@@ -236,6 +236,12 @@ it.each(
           path.join("node_modules/@openclaw/fs-safe/dist", helperName),
         );
         expect(manifest.inputs[helperSource]).toBe(helperHash);
+        const packageManifest = realpathSync(
+          path.join("node_modules/@openclaw/fs-safe/package.json"),
+        );
+        expect(manifest.inputs[packageManifest]).toBe(
+          createHash("sha256").update(readFileSync(packageManifest)).digest("hex"),
+        );
       }
       if (process.platform === "win32") {
         rmSync(path.join(outDir, helperName));

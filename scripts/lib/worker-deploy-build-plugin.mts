@@ -8,6 +8,7 @@ import {
 } from "../../src/shared/worker-bundle-hash.ts";
 import {
   createFsSafeWindowsHelperAssetPlugin,
+  resolveFsSafePackageManifest,
   resolveFsSafeWindowsHelper,
 } from "./fs-safe-windows-helper-asset.mts";
 
@@ -69,6 +70,7 @@ export function resolveWorkerDeployGeneratorInputs(rootDir = process.cwd()) {
     fs.realpathSync(
       path.resolve(rootDir, "node_modules/@silvia-odwyer/photon-node/photon_rs_bg.wasm"),
     ),
+    resolveFsSafePackageManifest(rootDir),
   ] as const;
 }
 
@@ -134,11 +136,12 @@ export function createWorkerDeployBuildPlugin(rootDir = process.cwd()) {
     packageJSON = ${JSON.stringify({ name: packageJson.name, version: packageJson.version })};
     binPath = packageRoot;`;
 
+  const fsSafeAssets = createFsSafeWindowsHelperAssetPlugin(
+    rootDir,
+    `worker/${WORKER_BUNDLE_WINDOWS_SECURITY_HELPER_PATH}`,
+  );
   return {
-    ...createFsSafeWindowsHelperAssetPlugin(
-      rootDir,
-      `worker/${WORKER_BUNDLE_WINDOWS_SECURITY_HELPER_PATH}`,
-    ),
+    ...fsSafeAssets,
     name: WORKER_DEPLOY_BUILD_PLUGIN_NAME,
     generateBundle(
       this: { error(message: string): never },
@@ -165,6 +168,10 @@ export function createWorkerDeployBuildPlugin(rootDir = process.cwd()) {
         : null;
     },
     transform(this: { error(message: string): never }, code: string, id: string) {
+      const fsSafeTransform = fsSafeAssets.transform.call(this, code, id);
+      if (fsSafeTransform !== null) {
+        return fsSafeTransform;
+      }
       let resolvedId: string;
       try {
         resolvedId = fs.realpathSync(path.resolve(id));
