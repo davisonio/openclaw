@@ -57,16 +57,12 @@ const sessionEntry = (overrides: Partial<SessionEntry> = {}): SessionEntry => ({
   updatedAt: 1,
   ...overrides,
 });
-function pendingLogin(
-  code: string,
-  profileId = "openai:codex",
-  title = "OpenAI Codex device code",
-) {
+function pendingLogin(code: string, profile = "openai:codex", title = "OpenAI Codex device code") {
   const finish = createDeferred<void>();
   const loginFlow = vi.fn<TelegramLoginFlow>(async (params) => {
     await params.prompter.deviceCode?.({ title, code });
     await finish.promise;
-    return createLoginResult(profileId);
+    return createLoginResult(profile);
   });
   return { finish, loginFlow };
 }
@@ -277,14 +273,10 @@ describe("registerTelegramNativeCommands /login", () => {
     );
   });
 
-  it.each(["all"] as const)(
-    "delivers both long-provider controls and completes deferred %s consent through a fresh dispatcher",
+  it.each(["all", "cancel"] as const)(
+    "delivers long-provider controls and resolves deferred consent (%s) through a fresh dispatcher",
     exerciseDeferredModelAccess,
   );
-
-  it("cancels saved-login consent and rejects its old choice", async () => {
-    await exerciseDeferredModelAccess("cancel");
-  });
 
   it("rejects group /login codex without sending the device code publicly", async () => {
     const loginFlow = vi.fn<TelegramLoginFlow>(async (params) => {
@@ -305,10 +297,7 @@ describe("registerTelegramNativeCommands /login", () => {
   });
 
   it("rejects /login for authorized senders who are not owners", async () => {
-    const loginFlow = vi.fn<TelegramLoginFlow>(async () => ({
-      ...createLoginResult("openai:codex"),
-      profiles: [],
-    }));
+    const loginFlow = vi.fn<TelegramLoginFlow>();
     const { handler, sendMessage } = await registerLoginCommand({
       cfg: {
         commands: {
@@ -329,22 +318,12 @@ describe("registerTelegramNativeCommands /login", () => {
   });
 
   it("names the active provider when another provider is requested in the same Telegram thread", async () => {
-    const deferred = createDeferred<void>();
-    const loginFlow = vi.fn<TelegramLoginFlow>(async (params) => {
-      await params.prompter.deviceCode?.({
-        title: "OpenAI Codex device code",
-        code: "FIRST-CODE",
-        expiresInMinutes: 15,
-        message: "URL: https://auth.openai.com/codex/device",
-      });
-      await deferred.promise;
-      return createLoginResult("openai:codex");
-    });
+    const { finish, loginFlow } = pendingLogin("FIRST-CODE");
     const { handler, sendMessage } = await registerOwnedLogin(loginFlow);
 
     await handler(ownerContext());
     await handler(ownerContext("openrouter/openrouter-oauth"));
-    deferred.resolve();
+    finish.resolve();
     await vi.waitFor(() => expect(messages(sendMessage)).toContain(completed));
 
     expect(loginFlow).toHaveBeenCalledTimes(1);
@@ -403,10 +382,7 @@ describe("registerTelegramNativeCommands /login", () => {
   it("rejects credential persistence after the command owner is removed", async () => {
     const deferred = createDeferred<void>();
     const commands = { native: true, ownerAllowFrom: ["200"] };
-    const cfg: OpenClawConfig = {
-      commands,
-      agents: { entries: { main: {} } },
-    };
+    const cfg: OpenClawConfig = { commands, agents: { entries: { main: {} } } };
     let currentConfig = cfg;
     const persist = vi.fn();
     const loginFlow = vi.fn<TelegramLoginFlow>(async (opts) => {
@@ -581,19 +557,9 @@ describe("registerTelegramNativeCommands /login", () => {
   });
 
   it.each([
-    {
-      name: "moves a session created during login",
-      code: "NEW-SESSION",
-      profile: "openai:new-owner@example.com",
-      laterProfile: undefined,
-    },
-    {
-      name: "preserves a later user-selected profile",
-      code: "LATER-USER-SELECTION",
-      profile: "openai:login-profile",
-      laterProfile: "openai:later-user-profile",
-    },
-  ])("$name", async ({ code, profile, laterProfile }) => {
+    ["adopts a session created during login", "NEW", "openai:new-owner@example.com", undefined],
+    ["keeps a later user selection", "LATER", "openai:login-profile", "openai:later-user-profile"],
+  ] as const)("%s", async (_name, code, profile, laterProfile) => {
     const { finish, loginFlow } = pendingLogin(code, profile);
     const { handler, sendMessage } = await registerSessionLogin(loginFlow);
     await handler(ownerContext());
@@ -626,19 +592,14 @@ describe("registerTelegramNativeCommands /login", () => {
   });
 
   it.each([
-    {
-      name: "preserves refreshed auth when session persistence fails",
-      writeFailed: true,
-      prior: "openai:old-owner@example.com",
-      profile: "openai:new-owner@example.com",
-    },
-    {
-      name: "revalidates an unchanged profile against a concurrent selection",
-      writeFailed: false,
-      prior: "openai:owner@example.com",
-      profile: "openai:owner@example.com",
-    },
-  ])("$name", async ({ writeFailed, prior, profile }) => {
+    [
+      "write fails after refresh",
+      true,
+      "openai:old-owner@example.com",
+      "openai:new-owner@example.com",
+    ],
+    ["rechecks a concurrent pin", false, "openai:owner@example.com", "openai:owner@example.com"],
+  ] as const)("%s", async (_name, writeFailed, prior, profile) => {
     const previous = sessionEntry({
       authProfileOverride: prior,
       ...(writeFailed ? { modelOverride: "test-model" } : { authProfileOverrideSource: "user" }),
@@ -667,7 +628,6 @@ describe("registerTelegramNativeCommands /login", () => {
         sendMessage,
         'OpenAI login complete. This chat kept its previous account. To use the new sign-in, send `/model "openai/test-model"@"openai:new-owner@example.com" -s`.',
       );
-      expectSent(sendMessage, expect.stringContaining("kept its previous account"));
       expect(sendMessage).not.toHaveBeenCalledWith(100, completed, expect.any(Object));
     } else {
       expectKept(sendMessage);

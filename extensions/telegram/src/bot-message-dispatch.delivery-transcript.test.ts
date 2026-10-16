@@ -42,6 +42,29 @@ import type * as TelegramSendEdit from "./send-edit.js";
 
 const assistant = (text: string) =>
   makeAgentAssistantMessage({ content: [{ type: "text", text }] });
+const identity = { agentId: "default", sessionKey: "agent:default:telegram:direct:123" };
+const sessionScope = (root: string, sessionId: string) => ({
+  ...identity,
+  sessionId,
+  storePath: path.join(root, "sessions.json"),
+});
+const user = (content: string) => ({ role: "user" as const, content, timestamp: Date.now() });
+async function transcriptFixture(sessionId: string) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "telegram-transcript-"));
+  const scope = sessionScope(root, sessionId);
+  const entry = { sessionId, updatedAt: Date.now() };
+  const transcript = await vi.importActual<typeof SessionTranscriptRuntime>(
+    "openclaw/plugin-sdk/session-transcript-runtime",
+  );
+  readLatestAssistantTextByIdentity.mockImplementation(
+    transcript.readLatestAssistantTextByIdentity,
+  );
+  const cleanup = async () => {
+    await closeQaRuntimeStores(root);
+    await fs.rm(root, { recursive: true, force: true });
+  };
+  return { root, scope, entry, transcript, cleanup };
+}
 function recoveryDraft() {
   const context = createContext();
   context.ctxPayload.SessionKey = "agent:default:telegram:direct:123";
@@ -62,21 +85,12 @@ describeTelegramDispatch("dispatchTelegramMessage transcript delivery", () => {
   it.each(["ordinary", "command"] as const)(
     "stores accepted %s finals without competing mirrors",
     async (kind) => {
-      const root = await fs.mkdtemp(path.join(os.tmpdir(), "telegram-dispatch-transcript-"));
-      const scope = {
-        agentId: "default",
-        sessionId: "dispatch-transcript",
-        sessionKey: "agent:default:telegram:direct:123",
-        storePath: path.join(root, "sessions.json"),
-      };
+      const { root, scope, transcript, cleanup } = await transcriptFixture("dispatch-transcript");
       const otherScope = {
         ...scope,
         sessionId: "unrelated-session",
         sessionKey: "agent:default:telegram:direct:999",
       };
-      const transcript = await vi.importActual<typeof SessionTranscriptRuntime>(
-        "openclaw/plugin-sdk/session-transcript-runtime",
-      );
       const store = await vi.importActual<typeof SessionStoreRuntime>(
         "openclaw/plugin-sdk/session-store-runtime",
       );
@@ -93,9 +107,6 @@ describeTelegramDispatch("dispatchTelegramMessage transcript delivery", () => {
         pendingMirrors.push(pending);
         return pending;
       });
-      readLatestAssistantTextByIdentity.mockImplementation(
-        transcript.readLatestAssistantTextByIdentity,
-      );
       editMessageTelegram.mockImplementation(actualEdit.editMessageTelegram);
       let answer: TelegramDraftStream | undefined;
       createTelegramDraftStream.mockImplementation((params) => {
@@ -121,16 +132,14 @@ describeTelegramDispatch("dispatchTelegramMessage transcript delivery", () => {
         visible.delete(messageId);
         return true;
       });
-      let restoreClock: (() => void) | undefined;
+      const clock = vi.spyOn(Date, "now");
       const sourceMessageIds: string[] = [];
       try {
         for (const session of [scope, otherScope]) {
           const entry = { sessionId: session.sessionId, updatedAt: Date.now() };
           await patchSessionEntry({ ...session, fallbackEntry: entry, update: () => entry });
         }
-        const timestamp = Date.now();
-        const clock = vi.spyOn(Date, "now").mockReturnValue(timestamp);
-        restoreClock = () => clock.mockRestore();
+        clock.mockReturnValue(Date.now());
         dispatchReplyWithBufferedBlockDispatcher.mockImplementation(async (params) => {
           const { dispatcherOptions, replyOptions } = params;
           await replyOptions?.onPartialReply?.({ text: "Final answer" });
@@ -144,12 +153,9 @@ describeTelegramDispatch("dispatchTelegramMessage transcript delivery", () => {
           const runId = `run-${sourceMessageIds.length}`;
           replyOptions?.onPreparedAgentRunStart?.({ runId, transcriptStart: null });
           const manager = SessionManager.open(scope, root);
-          const sourceAssistant = {
-            ...assistant("Final answer"),
-            __openclaw: { runId },
-          };
+          const sourceAssistant = { ...assistant("Final answer"), __openclaw: { runId } };
           sourceMessageIds.push(manager.appendMessage(sourceAssistant));
-          manager.appendMessage({ role: "user", content: "Queued input", timestamp: Date.now() });
+          manager.appendMessage(user("Queued input"));
           await dispatcherOptions.deliver({ text: "Final answer" }, { kind: "final" });
           await dispatcherOptions.deliver(
             { text: "Tool output must not become a final mirror" },
@@ -158,29 +164,19 @@ describeTelegramDispatch("dispatchTelegramMessage transcript delivery", () => {
           return { queuedFinal: true, counts: { block: 0, final: 1, tool: 1 } };
         });
         for (const inboundId of [456, 457]) {
-          SessionManager.open(scope, root).appendMessage({
-            role: "user",
-            content: "Repeat the answer",
-            timestamp: Date.now(),
-          });
+          SessionManager.open(scope, root).appendMessage(user("Repeat the answer"));
           answer = undefined;
           await dispatchWithContext({
-            ...(kind === "command"
-              ? {
-                  cfg: {
-                    session: { store: scope.storePath },
-                    agents: { entries: { default: {} } },
-                  },
-                }
-              : {}),
+            cfg:
+              kind === "command"
+                ? { session: { store: scope.storePath }, agents: { entries: { default: {} } } }
+                : undefined,
             context: createContext({
-              chatId: chat.id,
-              isGroup: false,
               msg: { chat, message_id: inboundId } as TelegramMessageContext["msg"],
               threadSpec: { scope: "none", id: undefined },
               replyThreadId: undefined,
               ctxPayload: {
-                SessionKey: scope.sessionKey,
+                SessionKey: identity.sessionKey,
                 MessageSid: String(inboundId),
                 ChatType: "direct",
                 ...(kind === "command"
@@ -246,22 +242,14 @@ describeTelegramDispatch("dispatchTelegramMessage transcript delivery", () => {
           sessionKeyForInternalHooks: scope.sessionKey,
         });
       } finally {
-        restoreClock?.();
+        clock.mockRestore();
         await Promise.all(pendingMirrors);
-        await closeQaRuntimeStores(root);
-        await fs.rm(root, { recursive: true, force: true });
+        await cleanup();
       }
     },
   );
   it("recovers persisted delivery facts without replacing the current-message target", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "telegram-persisted-recovery-"));
-    const scope = {
-      agentId: "default",
-      sessionId: "persisted-recovery",
-      sessionKey: "agent:default:telegram:direct:123",
-      storePath: path.join(root, "sessions.json"),
-    };
-    const entry = { sessionId: scope.sessionId, updatedAt: Date.now() };
+    const { root, scope, entry, cleanup } = await transcriptFixture("persisted-recovery");
     const prefix = "The persisted answer continues after this sufficiently long stable opening";
     const fullText = `${prefix} paragraph with the remaining explanation and its voice attachment.`;
     const aliasRecord = {
@@ -276,12 +264,6 @@ describeTelegramDispatch("dispatchTelegramMessage transcript delivery", () => {
         patchSessionEntry({ ...scope, fallbackEntry: entry, update: () => entry }),
       );
       const manager = SessionManager.open(scope, root);
-      const transcript = await vi.importActual<typeof SessionTranscriptRuntime>(
-        "openclaw/plugin-sdk/session-transcript-runtime",
-      );
-      readLatestAssistantTextByIdentity.mockImplementation(
-        transcript.readLatestAssistantTextByIdentity,
-      );
       const { context, answerDraftStream } = recoveryDraft();
       deliverInboundReplyWithMessageSendContext.mockResolvedValue(visibleDelivery());
       dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
@@ -333,8 +315,7 @@ describeTelegramDispatch("dispatchTelegramMessage transcript delivery", () => {
       expect(answerDraftStream.update).not.toHaveBeenCalledWith(fullText);
     } finally {
       await drainSessionDiskBudgetWorkers();
-      await closeQaRuntimeStores(root);
-      await fs.rm(root, { recursive: true, force: true });
+      await cleanup();
     }
   });
 

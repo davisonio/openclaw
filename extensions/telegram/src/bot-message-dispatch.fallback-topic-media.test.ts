@@ -17,9 +17,11 @@ const statusTable = (rowHeaderColumnIndex?: number) => ({
   rows: [["Gateway", "running"]],
   ...(rowHeaderColumnIndex === undefined ? {} : { rowHeaderColumnIndex }),
 });
-const droppedButtons = (...labels: string[]) => ({
+const buttons = (label: string, url?: string) => ({
   type: "buttons" as const,
-  buttons: labels.map((label) => ({ label, value: "x".repeat(65) })),
+  buttons: [
+    url ? { label, action: { type: "web-app" as const, url } } : { label, value: "x".repeat(65) },
+  ],
 });
 async function dispatchPresentationFinal(payload: ReplyPayload, context = createContext()) {
   const { answerDraftStream } = setupDraftStreams({ answerMessageId: 2001 });
@@ -77,8 +79,8 @@ describeTelegramDispatch("dispatchTelegramMessage presentation and fallback poli
   it("keeps dropped labels: unset mixed", async () => {
     const finalUpdate = await dispatchPresentationFinal({
       text: "Status summary\n\n- Legacy\n- Presentation",
-      presentation: { blocks: [statusTable(), droppedButtons("Presentation")] },
-      interactive: { blocks: [droppedButtons("Legacy")] },
+      presentation: { blocks: [statusTable(), buttons("Presentation")] },
+      interactive: { blocks: [buttons("Legacy")] },
     });
     expect(finalUpdate).toContain("Status summary");
     expectPresentation(finalUpdate, ["Presentation", "Legacy"]);
@@ -89,23 +91,13 @@ describeTelegramDispatch("dispatchTelegramMessage presentation and fallback poli
         text: "Gateway status as plain text",
         presentationTextMode: "fallback",
         presentation: {
-          blocks: [
-            statusTable(0),
-            {
-              type: "buttons",
-              buttons: [
-                { label: "Launch", action: { type: "web-app", url: "https://example.com/app" } },
-              ],
-            },
-          ],
+          blocks: [statusTable(0), buttons("Launch", "https://example.com/app")],
         },
       },
       createContext({
         chatId: -1001234,
         isGroup: true,
-        msg: {
-          chat: { id: -1001234, type: "supergroup" },
-        } as TelegramMessageContext["msg"],
+        msg: { chat: { id: -1001234, type: "supergroup" } } as TelegramMessageContext["msg"],
         threadSpec: { id: 777, scope: "forum" },
       }),
     );
@@ -121,13 +113,11 @@ describeTelegramDispatch("dispatchTelegramMessage presentation and fallback poli
         sendPolicyDenied: true,
       };
     });
-
     await dispatchWithContext({
       cfg: { messages: { groupChat: { visibleReplies: "automatic" } } },
       context: createMessageToolOnlyGroupContext(),
       streamMode: "off",
     });
-
     expect(deliverReplies).not.toHaveBeenCalled();
   });
   it("does not send visible error fallbacks for room events", async () => {
@@ -155,7 +145,6 @@ describeTelegramDispatch("dispatchTelegramMessage presentation and fallback poli
       }),
       streamMode: "partial",
     });
-
     expect(deliverReplies).not.toHaveBeenCalled();
   });
 });

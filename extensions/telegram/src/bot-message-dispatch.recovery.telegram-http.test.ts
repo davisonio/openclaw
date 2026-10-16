@@ -101,17 +101,17 @@ describe("Telegram transcript-backed answer recovery through HTTP", () => {
     let modelRuns = 0,
       preparations = 0,
       attempts = 0;
-    installHook((event) => {
-      if (event.kind !== "final") {
+    installHook(({ kind, payload }) => {
+      if (kind !== "final") {
         return;
       }
       preparations += 1;
-      const channelData = event.payload.channelData;
+      const channelData = payload.channelData;
       const telegram = channelData?.telegram;
       if (controls) {
         return {
           payload: {
-            ...event.payload,
+            ...payload,
             channelData: {
               ...channelData,
               ...controls,
@@ -174,9 +174,9 @@ describe("Telegram transcript-backed answer recovery through HTTP", () => {
       replyToChannel: "telegram",
       currentMessageId: String(context.msg.message_id),
     });
-    installHook((event) =>
-      event.kind === "final" && event.payload.text === recoveredAnswer
-        ? { payload: { ...event.payload, text: shortened } }
+    installHook(({ kind, payload }) =>
+      kind === "final" && payload.text === recoveredAnswer
+        ? { payload: { ...payload, text: shortened } }
         : undefined,
     );
     await dispatch(
@@ -186,10 +186,7 @@ describe("Telegram transcript-backed answer recovery through HTTP", () => {
         manager.appendMessage(assistant("[[reply_to_current]]" + recoveredAnswer));
         manager.flushPendingPersistence();
       },
-      {
-        replyToMode: "first",
-        finalReply: replyPayloads,
-      },
+      { replyToMode: "first", finalReply: replyPayloads },
     );
     expect(sends().map((call) => call.fields.text)).toEqual([first, recoveredAnswer]);
     expect(sends().map((call) => replyId(call.fields))).toEqual([context.msg.message_id, null]);
@@ -262,16 +259,16 @@ describe("Telegram transcript-backed answer recovery through HTTP", () => {
     await Promise.all(
       sources.map((source, index) => fs.writeFile(source, `Document ${["A", "B", "C"][index]}\n`)),
     );
-    installHook((event) => {
-      if (event.kind === "block") {
-        if (event.payload.text === recoveredAnswer) {
+    installHook(({ kind, payload }) => {
+      if (kind === "block") {
+        if (payload.text === recoveredAnswer) {
           return { cancel: true };
         }
-        const media = collectReplyMediaEntries(event.payload);
+        const media = collectReplyMediaEntries(payload);
         const selected = [media[1]!, media[0]!];
         return {
           payload: {
-            ...event.payload,
+            ...payload,
             mediaUrl: undefined,
             mediaUrls: selected.map(({ url }) => url),
             attachments: selected.map(({ attachment }) => attachment ?? {}),
@@ -280,7 +277,7 @@ describe("Telegram transcript-backed answer recovery through HTTP", () => {
       }
       return {
         payload: {
-          ...event.payload,
+          ...payload,
           text: shortened,
           replyToId: undefined,
           replyToCurrent: undefined,

@@ -120,10 +120,7 @@ describe("registered native command routing through the message pipeline", () =>
         bindings: [{ agentId: "main", match: { channel: "telegram", accountId: "default" } }],
       },
     );
-    await bot.handleUpdate({
-      update_id: 1001,
-      message: topicMessage("/reset"),
-    });
+    await bot.handleUpdate({ update_id: 1001, message: topicMessage("/reset") });
     expect(harness.replySpy.mock.calls[0]?.[0]).toMatchObject({
       CommandSource: "native",
       SessionKey: "agent:topic-agent:telegram:group:-42001:topic:42",

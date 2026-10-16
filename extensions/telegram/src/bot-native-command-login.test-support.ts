@@ -10,10 +10,7 @@ import { readConfigFileSnapshotForWrite } from "openclaw/plugin-sdk/config-mutat
 import type { ModelsAuthLoginFlowResult } from "openclaw/plugin-sdk/provider-auth-login-flow-runtime";
 import { clearRuntimeConfigSnapshot } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
-import type {
-  getSessionEntryAsync,
-  prepareSessionEntryPatch,
-} from "openclaw/plugin-sdk/session-store-runtime";
+import type * as SessionStore from "openclaw/plugin-sdk/session-store-runtime";
 import { withTempHome } from "openclaw/plugin-sdk/test-env";
 import { expect, type Mock, vi } from "vitest";
 import { registerTelegramNativeCommands } from "./bot-native-commands.js";
@@ -59,35 +56,28 @@ export function createLoginResult(
 }
 
 export function createOwnerLoginConfig(): OpenClawConfig {
-  return {
-    commands: { native: true, ownerAllowFrom: ["200"] },
-    agents: { entries: { main: {} } },
-  };
+  return { commands: { native: true, ownerAllowFrom: ["200"] }, agents: { entries: { main: {} } } };
 }
 
 export async function prepareTelegramLoginSessionStore(
   directory: string,
   mocks: {
-    getSessionEntry: Mock<typeof getSessionEntryAsync>;
+    getSessionEntry: Mock<typeof SessionStore.getSessionEntryAsync>;
     resolveStorePath: ReturnType<typeof vi.fn>;
-    prepareSessionEntryPatch: Mock<typeof prepareSessionEntryPatch>;
+    prepareSessionEntryPatch: Mock<typeof SessionStore.prepareSessionEntryPatch>;
   },
 ) {
   const store = await vi.importActual<typeof import("openclaw/plugin-sdk/session-store-runtime")>(
     "openclaw/plugin-sdk/session-store-runtime",
   );
-  const scope = {
-    agentId: "main",
-    sessionKey: "agent:main:main",
-    storePath: path.join(directory, "sessions.sqlite"),
-  };
+  const storePath = path.join(directory, "sessions.sqlite");
+  const scope = { agentId: "main", sessionKey: "agent:main:main", storePath };
   await store.upsertSessionEntry({
     ...scope,
     entry: { sessionId: "telegram-login", updatedAt: 1, authProfileOverride: "openai:prior" },
   });
-  mocks.getSessionEntry.mockImplementation(
-    (requested: Parameters<typeof store.getSessionEntryAsync>[0]) =>
-      store.getSessionEntryAsync({ ...requested, storePath: scope.storePath }),
+  mocks.getSessionEntry.mockImplementation((requested) =>
+    store.getSessionEntryAsync({ ...requested, storePath: scope.storePath }),
   );
   mocks.resolveStorePath.mockReturnValue(scope.storePath);
   mocks.prepareSessionEntryPatch.mockImplementation(store.prepareSessionEntryPatch);
@@ -103,27 +93,24 @@ export async function registerLoginCommand(params: {
   runtime?: RuntimeEnv;
   getRuntimeConfig?: () => OpenClawConfig;
 }) {
-  const botHarness = createCommandBot();
+  const fixture = createCommandBot();
   const accountId = params.accountId ?? `login-test-${++loginAccountIndex}`;
+  const agents = params.cfg.agents;
   const cfg = {
     ...params.cfg,
-    agents: {
-      ...params.cfg.agents,
-      defaults: { model: "openai/gpt-5.4", ...params.cfg.agents?.defaults },
-    },
+    agents: { ...agents, defaults: { model: defaultModel, ...agents?.defaults } },
   };
+  const signal = params.abortSignal;
   const nativeParams = createNativeCommandTestParams(cfg, {
     accountId,
-    bot: botHarness.bot,
+    bot: fixture.bot,
     allowFrom: params.allowFrom ?? ["200"],
-    ...(params.abortSignal
-      ? { opts: { token: "token", accountAbortSignal: params.abortSignal } }
-      : {}),
+    ...(signal ? { opts: { token: "token", accountAbortSignal: signal } } : {}),
     ...(params.runtime ? { runtime: params.runtime } : {}),
   });
   const sendMessageTelegram = vi.fn<typeof import("./send.js").sendMessageTelegram>(
     async (_to, text) => {
-      const result = await botHarness.bot.api.sendMessage(100, text, {});
+      const result = await fixture.bot.api.sendMessage(100, text, {});
       return { messageId: String(result.message_id), chatId: "100" };
     },
   );
@@ -136,15 +123,9 @@ export async function registerLoginCommand(params: {
     createEmptyPluginRegistry(),
     () => registerTelegramNativeCommands(nativeParams),
   );
-  const handler = botHarness.commandHandlers.get("login");
+  const handler = fixture.commandHandlers.get("login");
   assert(handler, "expected login command handler to be registered");
-  return {
-    ...botHarness,
-    accountId,
-    handler,
-    nativeCommandCallbackDispatcher,
-    sendMessageTelegram,
-  };
+  return { ...fixture, accountId, handler, nativeCommandCallbackDispatcher, sendMessageTelegram };
 }
 
 export async function exerciseDeferredModelAccess(choice: "all" | "cancel") {
@@ -220,57 +201,39 @@ async function exerciseModelAccess(home: string, choice: "all" | "cancel") {
       return markup && "inline_keyboard" in markup ? markup.inline_keyboard.flat() : [];
     });
   await first.handler(createPrivateCommandContext({ match: fixtureId, userId: 200 }));
-  const methods = deliveredButtons(vi.mocked(first.bot.api).sendMessage.mock.calls);
+  const methods = deliveredButtons(first.sendMessage.mock.calls);
   expect(methods).toHaveLength(2);
-  expect(methods).toEqual(
-    expect.arrayContaining([
-      expect.objectContaining({
-        text: "Fixture device login",
-        callback_data: "tgcmd:/login ux-catalog-fixture/device",
-      }),
-      expect.objectContaining({
-        text: "Fixture alternate device login",
-        callback_data: "tgcmd:/login ux-catalog-fixture/device-alternate",
-      }),
-    ]),
-  );
+  for (const [text, method] of [
+    ["Fixture device login", "device"],
+    ["Fixture alternate device login", "device-alternate"],
+  ]) {
+    const expected = { text, callback_data: `tgcmd:/login ux-catalog-fixture/${method}` };
+    expect(methods).toContainEqual(expect.objectContaining(expected));
+  }
   expect(loginFlow).not.toHaveBeenCalled();
   first.sendMessage.mockClear();
   deliverReplies.mockClear();
-  await first.handler(
-    createPrivateCommandContext({ match: "ux-catalog-fixture/device", userId: 200 }),
-  );
+  await first.handler(createPrivateCommandContext({ match: `${fixtureId}/device`, userId: 200 }));
   await vi.waitFor(() => expect(deliverReplies).toHaveBeenCalledOnce());
-  await expect(deliverReplies.mock.results[0]?.value).resolves.toMatchObject({
-    delivered: true,
-  });
-  const buttons = deliveredButtons(vi.mocked(first.bot.api).sendMessage.mock.calls);
+  await expect(deliverReplies.mock.results[0]?.value).resolves.toMatchObject({ delivered: true });
+  const buttons = deliveredButtons(first.sendMessage.mock.calls);
   expect(buttons.map((button) => button.text)).toEqual(modelButtons);
   const decodeButton = (button: (typeof buttons)[number]) => {
     assert("callback_data" in button, "expected a native command callback");
     expect(Buffer.byteLength(button.callback_data, "utf8")).toBeLessThanOrEqual(64);
+    expect(button.callback_data).toContain(" ux-catalog-fixture");
     return parseTelegramNativeCommandCallbackData(button.callback_data);
   };
-  const commands = buttons.map((button) => {
-    if ("callback_data" in button) {
-      expect(button.callback_data).toContain(" ux-catalog-fixture");
-    }
-    return decodeButton(button);
-  });
+  const commands = buttons.map(decodeButton);
   const commandText = commands[0];
   assert(commandText, "expected a delivered model-access command");
   expect(await readPolicy()).toEqual([defaultModel]);
-  const fresh = await registerLoginCommand({
-    cfg,
-    loginFlow,
-    runtime,
-    accountId: first.accountId,
-  });
+  const fresh = await registerLoginCommand({ cfg, loginFlow, runtime, accountId: first.accountId });
   const dispatch = fresh.nativeCommandCallbackDispatcher;
   assert(dispatch, "expected native callback dispatcher");
   const expectedModels = choice === "all" ? [defaultModel, `${fixtureId}/*`] : [defaultModel];
   let callbackId = 0;
-  const click = (chatId: number) =>
+  const click = (id: number) =>
     dispatch({
       commandText,
       botUser: telegramBotInfoForTest,
@@ -278,11 +241,7 @@ async function exerciseModelAccess(home: string, choice: "all" | "cancel") {
         id: `model-access-${++callbackId}`,
         chat_instance: "private-chat",
         from: { id: 200, is_bot: false, first_name: "Owner" },
-        message: {
-          message_id: 101,
-          date: 1,
-          chat: { id: chatId, type: "private", first_name: "Owner" },
-        },
+        message: { message_id: 101, date: 1, chat: { id, type: "private", first_name: "Owner" } },
       },
     });
   await click(101);
@@ -308,9 +267,7 @@ async function exerciseModelAccess(home: string, choice: "all" | "cancel") {
   await click(100);
   expect(await readPolicy()).toEqual(expectedModels);
   expect(deliverReplies.mock.calls).toHaveLength(deliveriesBeforeRecovery + 1);
-  const recoveryMessages = vi
-    .mocked(fresh.bot.api)
-    .sendMessage.mock.calls.slice(sendsBeforeRecovery);
+  const recoveryMessages = fresh.sendMessage.mock.calls.slice(sendsBeforeRecovery);
   expect(recoveryMessages.map(([, text]) => text).join("\n")).toContain(
     "Choose model access using your current restrictions. You do not need to sign in again.",
   );

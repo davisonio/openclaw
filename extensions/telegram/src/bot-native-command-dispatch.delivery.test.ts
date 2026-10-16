@@ -1,10 +1,11 @@
+import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import type * as AgentRuntime from "openclaw/plugin-sdk/agent-runtime";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import type { OpenClawConfig, TelegramAccountConfig } from "openclaw/plugin-sdk/config-contracts";
 import { PLUGIN_COMMAND_DISPATCH } from "openclaw/plugin-sdk/plugin-command-runtime";
 import type {
   OpenClawPluginCommandDefinition,
@@ -77,9 +78,7 @@ type MenuPayload = {
 
 function sentMenu(): MenuPayload {
   const call = apiCalls.mock.calls.find(([method]) => method === "sendMessage");
-  if (!call) {
-    throw new Error("No command response reached the Bot API");
-  }
+  assert(call, "No command response reached the Bot API");
   return call[1] as MenuPayload;
 }
 
@@ -184,14 +183,9 @@ describe("Telegram typed command delivery", () => {
       message: { role: "assistant", content: "Earlier answer", timestamp: 1 },
     });
     harness.replySpy.mockResolvedValue({ text: "Thinking level set to low.", replyToId: "30102" });
-    const bot = await createBot(true, true, cfg);
-    await bot.handleUpdate({
-      update_id: 3002,
-      message: {
-        ...commandMessage("/think low"),
-        message_id: 30102,
-        ...quotedReply("Earlier answer"),
-      },
+    await dispatchCommand(cfg, "/think low", 3002, {
+      message_id: 30102,
+      ...quotedReply("Earlier answer"),
     });
     expectSend({
       text: "Thinking level set to low.",
@@ -258,8 +252,7 @@ describe("Telegram native argument menus", () => {
       sessionKey,
       entry: { sessionId: "configured-native", updatedAt: 1 },
     });
-    const bot = await createBot(true, true, cfg, true);
-    await bot.handleUpdate({ update_id: 3100, message: commandMessage("/think") });
+    await dispatchCommand(cfg, "/think", 3100, {}, true);
     const latest = await readLatestAssistantTextByIdentity({
       agentId: "main",
       sessionKey,
@@ -347,11 +340,7 @@ describe("Telegram registered plugin delivery", () => {
         const contentType = request.headers["content-type"] ?? "";
         const payload: Record<string, unknown> = contentType.includes("multipart/form-data")
           ? Object.fromEntries(
-              await new Request("http://localhost", {
-                method: "POST",
-                headers: { "content-type": contentType },
-                body,
-              }).formData(),
+              await new Response(body, { headers: { "content-type": contentType } }).formData(),
             )
           : JSON.parse(body.toString("utf8"));
         const method = request.url?.split("/").at(-1) ?? "";
@@ -427,9 +416,9 @@ describe("Telegram registered plugin delivery", () => {
     }
   });
 
-  function pluginConfig(): OpenClawConfig {
+  function pluginConfig(telegram: TelegramAccountConfig = {}): OpenClawConfig {
     const cfg = commandConfig();
-    cfg.channels!.telegram!.apiRoot = apiRoot;
+    Object.assign(cfg.channels!.telegram!, { apiRoot }, telegram);
     return cfg;
   }
 
@@ -469,8 +458,7 @@ describe("Telegram registered plugin delivery", () => {
 
   it.each([false, true])("settles a progress edit once (rejected: %s)", async (rejected) => {
     rejectEdit = rejected;
-    const cfg = pluginConfig();
-    cfg.channels!.telegram!.silentErrorReplies = rejected;
+    const cfg = pluginConfig({ silentErrorReplies: rejected });
     const sent = vi.fn();
     addTestHook({ registry, pluginId: "delivery-test", hookName: "message_sent", handler: sent });
     initializeGlobalHookRunner(registry);
@@ -556,8 +544,7 @@ describe("Telegram registered plugin delivery", () => {
   it.each(["presentation", "reaction"] as const)(
     "cleans progress before delivering non-editable %s results",
     async (kind) => {
-      const cfg = pluginConfig();
-      cfg.channels!.telegram!.richMessages = kind === "presentation";
+      const cfg = pluginConfig({ richMessages: kind === "presentation" });
       const result: PluginCommandResult =
         kind === "reaction"
           ? { channelData: { telegram: { reaction: { emoji: "\u{1f44d}" } } } }
@@ -673,9 +660,10 @@ describe("Telegram registered plugin delivery", () => {
   });
 
   it("lets a plugin read the persisted forum transcript despite a stale legacy file", async () => {
-    const cfg = pluginConfig();
-    cfg.channels!.telegram!.groupAllowFrom = [String(from.id)];
-    cfg.channels!.telegram!.groups = { "*": { requireMention: false } };
+    const cfg = pluginConfig({
+      groupAllowFrom: [String(from.id)],
+      groups: { "*": { requireMention: false } },
+    });
     const sessionKey = `agent:main:telegram:group:${groupChat.id}:topic:77`;
     for (const [key, id, text] of [
       ["agent:main:main", "plugin-forum-wrong-session", "Wrong conversation"],
