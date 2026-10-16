@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -22,6 +21,7 @@ import {
   UpdateRecoveryRequiredError,
 } from "../../infra/update-run-recovery.js";
 import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
+import { snapshotUpdateFixtureTree } from "./update-command-filesystem-snapshot.test-support.js";
 import { collectServiceInspectionFailureFacts } from "./update-command-result.js";
 import { admitUpdateCommandRun } from "./update-command-run.js";
 import { stubNodeRuntime } from "./update-command-runtime-recovery.test-support.js";
@@ -52,6 +52,13 @@ it.each([
     const home = dirs.make("update-loaded-admission-");
     const callerState = path.join(home, ".openclaw-caller");
     const serviceState = path.join(home, ".openclaw-service");
+    const profileEnv = (profile: "caller" | "service", state: string) => ({
+      OPENCLAW_PROFILE: profile,
+      OPENCLAW_STATE_DIR: state,
+      OPENCLAW_CONFIG_PATH: path.join(state, "openclaw.json"),
+    });
+    const callerOverrides = profileEnv("caller", callerState);
+    const serviceOverrides = profileEnv("service", serviceState);
     const root = path.join(home, "package");
     const foreignRoot = path.join(home, "foreign");
     for (const packageRoot of [root, foreignRoot]) {
@@ -76,15 +83,10 @@ it.each([
     vi.stubEnv("HOME", home);
     vi.stubEnv("DBUS_SESSION_BUS_ADDRESS", `unix:path=${path.join(home, "bus")}`);
     vi.spyOn(daemonExec, "execFileUtf8").mockImplementation(systemdManagerVersionProbe);
-    vi.stubEnv("OPENCLAW_PROFILE", "caller");
-    vi.stubEnv("OPENCLAW_STATE_DIR", callerState);
-    vi.stubEnv("OPENCLAW_CONFIG_PATH", path.join(callerState, "openclaw.json"));
-    const serviceEnv = {
-      ...process.env,
-      OPENCLAW_PROFILE: "service",
-      OPENCLAW_STATE_DIR: serviceState,
-      OPENCLAW_CONFIG_PATH: path.join(serviceState, "openclaw.json"),
-    };
+    for (const [key, value] of Object.entries(callerOverrides)) {
+      vi.stubEnv(key, value);
+    }
+    const serviceEnv = { ...process.env, ...serviceOverrides };
     let pending: ReturnType<typeof createRetainedUpdateRecovery> | undefined;
     if (scenario === "owned-pending") {
       const runId = createUpdateRun({ trigger: "cli" }, { env: serviceEnv }).runId;
@@ -103,24 +105,7 @@ it.each([
         `[Service]\nExecStart=${process.execPath} ${root}/dist/entry.js gateway\n`,
       );
     }
-    const snapshot = () =>
-      fs
-        .readdirSync(home, { recursive: true })
-        .map(String)
-        .toSorted()
-        .map((name) => {
-          const filename = path.join(home, name);
-          const stat = fs.statSync(filename);
-          return [
-            name,
-            stat.ino,
-            stat.mtimeMs,
-            stat.mode,
-            stat.isFile()
-              ? createHash("sha256").update(fs.readFileSync(filename)).digest("hex")
-              : null,
-          ];
-        });
+    const snapshot = () => snapshotUpdateFixtureTree(home);
     const before = snapshot();
     const nativeFailure = new Error("inspection-secret-canary");
     const rootFailure = new Error("installation classification failed");
@@ -135,11 +120,11 @@ it.each([
             path.join(scenario === "stale-install" ? foreignRoot : root, "dist", "entry.js"),
             "gateway",
           ];
-    const response = (values: { type: string; data: unknown }[]) => ({
+    const response = (...values: [type: string, data: unknown][]) => ({
       code: 0,
       termination: "exit" as const,
       stderr: "",
-      stdout: values.map((value) => JSON.stringify(value)).join("\n"),
+      stdout: values.map(([type, data]) => JSON.stringify({ type, data })).join("\n"),
     });
     const bus = vi.spyOn(systemdExec, "execBusctlUser").mockImplementation(async (_env, args) => {
       if (scenario === "timeout") {
@@ -162,34 +147,27 @@ it.each([
         };
       }
       if (args.includes("GetUnit") || args.includes("LoadUnit")) {
-        return response([{ type: "o", data: ["/org/freedesktop/systemd1/unit/gateway"] }]);
+        return response(["o", ["/org/freedesktop/systemd1/unit/gateway"]]);
       }
       if (args.includes("FragmentPath")) {
-        return response([
-          { type: "s", data: sourcePath },
-          { type: "as", data: [] },
-          { type: "b", data: false },
-          { type: "s", data: "loaded" },
-          { type: "s", data: "enabled" },
-          { type: "s", data: "active" },
-          { type: "b", data: true },
-          { type: "b", data: false },
-        ]);
+        return response(
+          ["s", sourcePath],
+          ["as", []],
+          ["b", false],
+          ["s", "loaded"],
+          ["s", "enabled"],
+          ["s", "active"],
+          ["b", true],
+          ["b", false],
+        );
       }
-      return response([
-        { type: "a(sasbttttuii)", data: [[command[0], command, false, 0, 0, 0, 0, 0, 0, 0]] },
-        { type: "s", data: "" },
-        {
-          type: "as",
-          data: Object.entries(serviceEnv)
-            .filter(([key]) =>
-              ["OPENCLAW_PROFILE", "OPENCLAW_STATE_DIR", "OPENCLAW_CONFIG_PATH"].includes(key),
-            )
-            .map(([key, value]) => `${key}=${value}`),
-        },
-        { type: "a(sb)", data: [] },
-        { type: "as", data: [] },
-      ]);
+      return response(
+        ["a(sasbttttuii)", [[command[0], command, false, 0, 0, 0, 0, 0, 0, 0]]],
+        ["s", ""],
+        ["as", Object.entries(serviceOverrides).map(([key, value]) => `${key}=${value}`)],
+        ["a(sb)", []],
+        ["as", []],
+      );
     });
     if (scenario === "native-rejection") {
       bus.mockRejectedValue(nativeFailure);
@@ -203,13 +181,14 @@ it.each([
       ...service,
       readCommand: (...args) => readSystemdServiceExecStart(...args),
     });
-    if (scenario === "owned" || scenario === "stale-install" || scenario === "absent") {
+    const expectAdmitted = async (usesServiceState: boolean) => {
       const run = await admitUpdateCommandRun({ opts: {}, root });
-      const usesServiceState = scenario !== "absent";
-      const expectedState = usesServiceState ? serviceState : callerState;
-      expect(run.env.OPENCLAW_STATE_DIR).toBe(expectedState);
-      expect(run.env.OPENCLAW_PROFILE).toBe(usesServiceState ? "service" : "caller");
+      expect(run.env).toMatchObject(usesServiceState ? serviceOverrides : callerOverrides);
       expect(getUpdateRun(run.runId, { env: run.env })?.status).toBe("running");
+    };
+    if (scenario === "owned" || scenario === "stale-install" || scenario === "absent") {
+      const usesServiceState = scenario !== "absent";
+      await expectAdmitted(usesServiceState);
       expect(fs.existsSync(path.join(usesServiceState ? callerState : serviceState, "state"))).toBe(
         false,
       );
@@ -232,11 +211,7 @@ it.each([
         rootRedirect: null,
         serviceUnitTarget: "no service entrypoint found",
       });
-      const run = await admitUpdateCommandRun({ opts: {}, root });
-      expect(run.env.OPENCLAW_STATE_DIR).toBe(callerState);
-      expect(run.env.OPENCLAW_CONFIG_PATH).toBe(path.join(callerState, "openclaw.json"));
-      expect(run.env.OPENCLAW_PROFILE).toBe("caller");
-      expect(getUpdateRun(run.runId, { env: run.env })?.status).toBe("running");
+      await expectAdmitted(false);
       expect(fs.existsSync(serviceState)).toBe(false);
 
       const inspected = await maybeStopManagedServiceBeforeMutableUpdate({
@@ -250,17 +225,19 @@ it.each([
         kind: "unavailable",
         message: expect.stringContaining("Gateway service inspection is unavailable"),
       });
+      expect([
+        inspected.blockMessage,
+        inspected.serviceMutationAllowed,
+        inspected.stopped,
+        inspected.serviceEnv,
+        inspected.serviceDefinitionEnv,
+        inspected.serviceNodeRunner,
+      ]).toEqual([undefined, false, false, undefined, undefined, undefined]);
       const advisory = inspected.serviceMutationSkipMessage;
       expect(advisory).toContain("automatic service restart was skipped");
       expect(advisory).toContain("Restart the Gateway you launched manually after the update");
       expect(advisory).toContain("recorded service definition was left unchanged");
       expect(advisory).toContain("openclaw gateway status --deep");
-      expect(inspected.blockMessage).toBeUndefined();
-      expect(inspected.serviceMutationAllowed).toBe(false);
-      expect(inspected.stopped).toBe(false);
-      expect(inspected.serviceEnv === undefined).toBe(true);
-      expect(inspected.serviceDefinitionEnv === undefined).toBe(true);
-      expect(inspected.serviceNodeRunner).toBeUndefined();
       const facts = collectServiceInspectionFailureFacts(inspected.serviceUpdateVerdict);
       expect(facts).toEqual([
         expect.objectContaining({
@@ -283,15 +260,8 @@ it.each([
         ),
       ).toEqual(before);
     }
-    for (const mutation of [
-      service.stage,
-      service.install,
-      service.uninstall,
-      service.start,
-      service.stop,
-      service.restart,
-    ]) {
-      expect(mutation).not.toHaveBeenCalled();
+    for (const method of ["stage", "install", "uninstall", "start", "stop", "restart"] as const) {
+      expect(service[method]).not.toHaveBeenCalled();
     }
     if (scenario === "root-probe-error") {
       expect(bus).not.toHaveBeenCalled();

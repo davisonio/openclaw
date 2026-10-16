@@ -85,16 +85,12 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 function revoke(root: string) {
-  const db = new DatabaseSync(path.join(control, "managed-update-handoffs.sqlite"));
-  try {
-    expect(
-      db
-        .prepare("UPDATE managed_update_handoffs SET owner = ? WHERE install_root = ?")
-        .run("replacement", root).changes,
-    ).toBe(1);
-  } finally {
-    db.close();
-  }
+  using db = new DatabaseSync(path.join(control, "managed-update-handoffs.sqlite"));
+  expect(
+    db
+      .prepare("UPDATE managed_update_handoffs SET owner = ? WHERE install_root = ?")
+      .run("replacement", root).changes,
+  ).toBe(1);
 }
 function request(run: NonNullable<UpdateCommandOptions["run"]>, root = a) {
   return {
@@ -106,15 +102,28 @@ function request(run: NonNullable<UpdateCommandOptions["run"]>, root = a) {
     revalidate: async () => undefined,
   };
 }
-function owned(
-  operation: (run: NonNullable<UpdateCommandOptions["run"]>) => Promise<void>,
+function owned<T>(
+  operation: (run: NonNullable<UpdateCommandOptions["run"]>) => Promise<T>,
   retained = true,
 ) {
   const run: NonNullable<UpdateCommandOptions["run"]> = { runId: randomUUID(), env };
   return withUpdateCommandExecutor(run.runId, async (executor) => {
     run.executorFence = await executor.enter(b, retained ? { serviceRoot: a } : undefined);
-    await operation(run);
+    return await operation(run);
   });
+}
+function expectOwners(kind: "busy" | "absent") {
+  const store = createManagedHandoffLeaseStore();
+  for (const root of [a, b]) {
+    if (kind === "busy") {
+      expect(store.acquire(root, randomUUID(), { kind: "update" }).kind).toBe(kind);
+    } else {
+      expect(store.read(root)).toEqual({ kind });
+    }
+  }
+}
+function restartOwned() {
+  return owned((run) => commands.restartRetainedUpdateGatewayService(request(run)));
 }
 
 describe.skipIf(process.platform === "win32")("retained POSIX native restart", () => {
@@ -199,53 +208,44 @@ describe.skipIf(process.platform === "win32")("retained POSIX native restart", (
             });
           const running = owned(async (run) => {
             const onGatewayStartAttempted = vi.fn();
-            await expect(
-              commands.restartRetainedUpdateGatewayService({
+            expect(
+              await commands.restartRetainedUpdateGatewayService({
                 ...request(run),
                 onGatewayStartAttempted,
                 signal,
               }),
-            ).resolves.toEqual({
-              outcome: "completed",
-            });
+            ).toEqual({ outcome: "completed" });
             expect(onGatewayStartAttempted).toHaveBeenCalledOnce();
           }).then(() => {
             complete = true;
           });
           work = running;
-          const exercise = async () => {
-            try {
-              await withinTest(Promise.race([started.promise, running]), signal);
-              expect(pid).toBeGreaterThan(0);
-              expect(pid).not.toBe(process.pid);
-              expect(complete).toBe(false);
-              const store = createManagedHandoffLeaseStore();
-              for (const root of [a, b]) {
-                expect(store.acquire(root, randomUUID(), { kind: "update" }).kind).toBe("busy");
-              }
-              expect(store.read(c)).toEqual({ kind: "absent" });
-              releaseChild();
-              await running;
-            } finally {
-              releaseChild();
-              await running.catch(() => undefined);
-            }
+          const observe = async () => {
+            await withinTest(Promise.race([started.promise, running]), signal);
+            expect(pid).toBeGreaterThan(0);
+            expect(pid).not.toBe(process.pid);
+            expect(complete).toBe(false);
+            expectOwners("busy");
+            expect(createManagedHandoffLeaseStore().read(c)).toEqual({ kind: "absent" });
           };
-          if (outcome === "readiness failure") {
-            await expect(exercise()).rejects.toBe(readinessError);
-          } else {
-            await exercise();
+          try {
+            if (outcome === "readiness failure") {
+              await expect(observe()).rejects.toBe(readinessError);
+            } else {
+              await observe();
+            }
+          } finally {
+            releaseChild();
+            await running.catch(() => undefined);
           }
+          await running;
           expect(pid).toBeGreaterThan(0);
           expect(complete).toBe(true);
           expect(native.mock.calls.map((call) => call[1][0])).toEqual(["reset-failed", "restart"]);
           expect(fs.readFileSync(definition, "utf8")).toBe(
             "original Node A and service definition",
           );
-          const store = createManagedHandoffLeaseStore();
-          for (const root of [a, b]) {
-            expect(store.read(root)).toEqual({ kind: "absent" });
-          }
+          expectOwners("absent");
         },
         async () => {
           releaseChild();
@@ -325,12 +325,9 @@ describe.skipIf(process.platform === "win32")("retained POSIX native restart", (
     await expect(work).rejects.toThrow(
       /executor|ownership|cancelled fixture|changed original service|unavailable|scope/,
     );
-    if (afterReset) {
-      expect(native).toHaveBeenCalledOnce();
-      expect(native.mock.calls[0]?.[1][0]).toBe("reset-failed");
-    } else {
+    expect(native.mock.calls.map((call) => call[1][0])).toEqual(afterReset ? ["reset-failed"] : []);
+    if (!afterReset) {
       expect(futureConfig.assertFutureConfigActionAllowed).toHaveBeenCalledOnce();
-      expect(native).not.toHaveBeenCalled();
     }
     expect(onGatewayStartAttempted).not.toHaveBeenCalled();
   });
@@ -369,14 +366,10 @@ describe.skipIf(process.platform === "win32")("retained POSIX native restart", (
       code: 1,
       stderr: "native failed",
     });
-    await expect(
-      owned(async (run) => {
-        await commands.restartRetainedUpdateGatewayService(request(run));
-      }),
-    ).rejects.toThrow("native failed");
+    await expect(restartOwned()).rejects.toThrow("native failed");
   });
 
-  it("does not release native operation lock while a nested native borrower is pending", async () => {
+  it("holds the native lock until its nested borrower settles", async () => {
     const release = createDeferred();
     const entered = createDeferred();
     let borrower: Promise<void> | undefined;
@@ -392,20 +385,14 @@ describe.skipIf(process.platform === "win32")("retained POSIX native restart", (
       return success;
     });
     let done = false;
-    const work = owned(async (run) => {
-      await commands.restartRetainedUpdateGatewayService(request(run));
-    }).then(() => {
+    const work = restartOwned().then(() => {
       done = true;
     });
     try {
       await Promise.race([entered.promise, work]);
       await Promise.resolve();
       expect(done).toBe(false);
-      for (const root of [a, b]) {
-        expect(
-          createManagedHandoffLeaseStore().acquire(root, randomUUID(), { kind: "update" }).kind,
-        ).toBe("busy");
-      }
+      expectOwners("busy");
       release.resolve();
       await work;
       await borrower;

@@ -42,6 +42,22 @@ export async function readRollbackFixtureSchemaVersions(
   return readUpdateStateSchemaVersionsInProcess({ ...input, env: input.env ?? process.env });
 }
 
+export async function readRollbackFixtureState(
+  stateDir: string,
+  env: NodeJS.ProcessEnv = { OPENCLAW_STATE_DIR: stateDir },
+) {
+  const configSnapshot = await createConfigIO({
+    env,
+    pluginValidation: "skip",
+  }).readConfigFileSnapshot();
+  const schemaVersions = await readRollbackFixtureSchemaVersions({
+    stateDir,
+    config: configSnapshot.sourceConfigBeforeMigrations ?? configSnapshot.sourceConfig,
+    env,
+  });
+  return { configSnapshot, schemaVersions };
+}
+
 export function writeDoctorRollbackConfig(stateDir: string, change: string) {
   const configPath = path.join(stateDir, "openclaw.json");
   const includePath = path.join(stateDir, "logging.json");
@@ -142,7 +158,6 @@ async function writeWithRefreshFailure(
   originalRaw: string,
 ): Promise<Error> {
   const configPath = writeOptions.baseSnapshot.path;
-  let doctorError: Error | undefined;
   setRuntimeConfigSnapshotRefreshHandler({
     preflight: () => undefined,
     refresh: () => {
@@ -154,25 +169,20 @@ async function writeWithRefreshFailure(
     },
   });
   try {
-    await writeConfigFile(nextConfig, writeOptions);
-  } catch (error) {
+    const error = await writeConfigFile(nextConfig, writeOptions).catch((cause: unknown) => cause);
+    expect(error).toMatchObject({
+      name: "ConfigWritePostCommitError",
+      configPath,
+      rollbackStatus: "restored",
+    });
+    expect(fs.readFileSync(configPath, "utf8")).toBe(originalRaw);
     if (!(error instanceof Error)) {
-      throw error;
+      throw new Error("Doctor config write completed without the expected refresh failure");
     }
-    doctorError = error;
+    return error;
   } finally {
     setRuntimeConfigSnapshotRefreshHandler(null);
   }
-  if (!doctorError) {
-    throw new Error("Doctor config write completed without the expected refresh failure");
-  }
-  expect(doctorError).toMatchObject({
-    name: "ConfigWritePostCommitError",
-    configPath,
-    rollbackStatus: "restored",
-  });
-  expect(fs.readFileSync(configPath, "utf8")).toBe(originalRaw);
-  return doctorError;
 }
 
 export async function expectActiveRollbackIdentity(params: {
@@ -192,12 +202,7 @@ export async function expectActiveRollbackIdentity(params: {
   const rollbackSucceeded = failure !== "partial-restore";
   const activePackageRoot = rollbackSucceeded ? previousRoot : null;
   const env = { OPENCLAW_STATE_DIR: stateDir };
-  const configSnapshot = await createConfigIO({
-    env,
-    pluginValidation: "skip",
-  }).readConfigFileSnapshot();
-  const config = configSnapshot.sourceConfigBeforeMigrations ?? configSnapshot.sourceConfig;
-  const schemaVersions = await readRollbackFixtureSchemaVersions({ stateDir, config, env });
+  const { configSnapshot, schemaVersions } = await readRollbackFixtureState(stateDir, env);
   const result: UpdateRunResult = {
     status: "error",
     mode: "npm",
@@ -264,19 +269,14 @@ export async function expectActiveRollbackIdentity(params: {
     after: rollbackSucceeded ? result.before : undefined,
     reason: rollbackSucceeded ? result.reason : "source-rollback-failed",
     rollbackOutcome: { status: rollbackSucceeded ? "succeeded" : "failed" },
-    steps: [
-      expect.objectContaining({
-        name: "rollback",
-        exitCode: rollbackSucceeded ? 0 : 1,
-      }),
-    ],
+    steps: [{ name: "rollback", exitCode: rollbackSucceeded ? 0 : 1 }],
     ...(rollbackSucceeded
       ? { recovery: { serviceRestartSafe: true, packageRollbackVerified: true } }
       : {}),
   });
   expect(outcome.rolledBack).toBe(false);
   expect(restart).toHaveBeenCalledTimes(rollbackSucceeded ? 1 : 0);
-  if (rollbackSucceeded) {
+  if (failure !== "partial-restore") {
     const report = await prepareUpdateFailureReport(
       {
         attemptId: "rollback-health-verdict",
@@ -287,14 +287,12 @@ export async function expectActiveRollbackIdentity(params: {
       },
       { env, stateDir },
     );
-    const health =
-      failure === "restart-unhealthy"
-        ? "failed (channel-errors)"
-        : failure === "restart-timeout"
-          ? "unverified (gateway-readiness-pending)"
-          : failure === "restart-refused"
-            ? "unverified (restart-failed)"
-            : "unverified (gateway-verification-incomplete)";
+    const health = {
+      "restart-unhealthy": "failed (channel-errors)",
+      "restart-timeout": "unverified (gateway-readiness-pending)",
+      "restart-refused": "unverified (restart-failed)",
+      "restart-threw": "unverified (gateway-verification-incomplete)",
+    }[failure];
     expect(report.body).toContain(
       `Recovery outcome: package rollback verified (2026.9.1); Gateway health ${health}. Run \`openclaw gateway status --deep\``,
     );
@@ -309,16 +307,8 @@ export function registerRollbackReportTests(
     async (outcome) => {
       const { candidateRoot, previousRoot, stateDir } = getFixture();
       const env = { OPENCLAW_STATE_DIR: stateDir };
-      const configSnapshot = await createConfigIO({
-        env,
-        pluginValidation: "skip",
-      }).readConfigFileSnapshot();
       const run = { runId: createUpdateRun({ trigger: "cli" }, { env }).runId, env };
-      const schemaVersions = await readRollbackFixtureSchemaVersions({
-        stateDir,
-        config: configSnapshot.sourceConfigBeforeMigrations ?? configSnapshot.sourceConfig,
-        env,
-      });
+      const { configSnapshot, schemaVersions } = await readRollbackFixtureState(stateDir, env);
       const message =
         outcome === "advisory"
           ? "Restored detached HEAD; branch main still points to the activated commit."
@@ -367,30 +357,29 @@ export function registerRollbackReportTests(
       const json = vi.spyOn(defaultRuntime, "writeJson").mockImplementation(() => {});
       const log = vi.spyOn(defaultRuntime, "log").mockImplementation(() => {});
       await printResult(result, { json: true, run });
-      expect(json).toHaveBeenCalledWith(
-        expect.objectContaining({
-          ...(outcome === "thrown"
-            ? {}
-            : {
-                steps: expect.arrayContaining([
-                  {
-                    ...restored,
-                    ...(outcome === "failed"
-                      ? { failureFacts: [{ check: "update", code: "source-rollback-failed" }] }
-                      : {}),
-                  },
-                ]),
-              }),
-          run: expect.objectContaining({
-            steps: expect.arrayContaining([
-              expect.objectContaining({
-                step: outcome === "advisory" ? "warning:git-runtime-rollback" : "package rollback",
-                detail: message,
-              }),
-            ]),
-          }),
-        }),
-      );
+      const printed = json.mock.calls[0]?.[0];
+      if (outcome !== "thrown") {
+        expect(printed).toMatchObject({
+          steps: expect.arrayContaining([
+            {
+              ...restored,
+              ...(outcome === "failed"
+                ? { failureFacts: [{ check: "update", code: "source-rollback-failed" }] }
+                : {}),
+            },
+          ]),
+        });
+      }
+      expect(printed).toMatchObject({
+        run: {
+          steps: expect.arrayContaining([
+            expect.objectContaining({
+              step: outcome === "advisory" ? "warning:git-runtime-rollback" : "package rollback",
+              detail: message,
+            }),
+          ]),
+        },
+      });
       await printResult(result, { run });
       expect(log).toHaveBeenCalledWith(expect.stringContaining(message));
     },

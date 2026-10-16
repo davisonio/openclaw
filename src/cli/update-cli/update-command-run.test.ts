@@ -1,11 +1,12 @@
 import { spawn } from "node:child_process";
 import * as crypto from "node:crypto";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import { withTriageTerminal } from "../../commands/triage.test-support.js";
 import { cronOwnerHardeningEntrypoints } from "../../cron/owner-hardening-runtime.test-support.js";
 import { collectNestedErrorCandidates } from "../../infra/error-graph-internal.js";
 import { resolveRuntimeWorkerUrl } from "../../infra/runtime-worker-url.js";
@@ -19,6 +20,7 @@ import {
   UpdateRecoveryRequiredError,
 } from "../../infra/update-run-recovery.js";
 import { renderUpdateRunReport } from "../../infra/update-run-report.js";
+import type { UpdateRunResult } from "../../infra/update-runner-types.js";
 import * as updateFailureTriage from "../../infra/update-triage.js";
 import { defaultRuntime, ExitError } from "../../runtime.js";
 import * as existingStateWrite from "../../state/openclaw-state-db-existing-write.js";
@@ -26,6 +28,7 @@ import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db
 import { closeStateDatabaseForTest } from "../../test-utils/database-cleanup.js";
 import { confirmUpdateDowngrade } from "./shared.js";
 import { updateExecutorNativeEntrypoints } from "./update-command-executor-native-runtime.test-support.js";
+import { snapshotUpdateFixtureTree } from "./update-command-filesystem-snapshot.test-support.js";
 import { failUpdateCommandRun } from "./update-command-result.js";
 import {
   registerUpdateRunReceiptTests,
@@ -62,6 +65,15 @@ const sourceImportArgs = resolveRuntimeWorkerUrl(
 
 const dirs = useAutoCleanupTempDirTracker(afterEach);
 
+function createRun(prefix: string, extraEnv: NodeJS.ProcessEnv = {}) {
+  const env = { OPENCLAW_STATE_DIR: dirs.make(prefix), ...extraEnv };
+  return { runId: createUpdateRun({ trigger: "cli" }, { env }).runId, env };
+}
+
+function updateResult(overrides: Partial<UpdateRunResult>): UpdateRunResult {
+  return { status: "error", mode: "npm", durationMs: 1, steps: [], ...overrides };
+}
+
 afterEach(async () => {
   await closeStateDatabaseForTest();
   vi.unstubAllEnvs();
@@ -69,8 +81,8 @@ afterEach(async () => {
 });
 
 it("persists fingerprint warnings before closing a rolled-back run", async () => {
-  const env = { OPENCLAW_STATE_DIR: dirs.make("rollback-fingerprint-warning-") };
-  const run = { runId: createUpdateRun({ trigger: "cli" }, { env }).runId, env };
+  const run = createRun("rollback-fingerprint-warning-");
+  const { env } = run;
   const warnings = [
     "baseline package fingerprint incomplete after 30 s; rollback will be verified by the retained package copy",
     "Package fingerprint verification unavailable; rollback verified by the retained package copy's directory identity and version.",
@@ -78,9 +90,7 @@ it("persists fingerprint warnings before closing a rolled-back run", async () =>
   vi.spyOn(defaultRuntime, "writeJson").mockImplementation(() => {});
   const result = await publishUpdateCommandTerminalResult(
     { opts: { json: true, run }, ownedManagedUpdateEnv: env },
-    {
-      status: "error",
-      mode: "npm",
+    updateResult({
       reason: "doctor-failed",
       before: { version: "1.0.0" },
       after: { version: "1.0.0" },
@@ -102,7 +112,7 @@ it("persists fingerprint warnings before closing a rolled-back run", async () =>
           warnings,
         },
       ],
-    },
+    }),
     { rolledBack: true, downtimeMs: 25 },
   );
   expect(result).toMatchObject({ status: "error", reason: "doctor-failed" });
@@ -126,22 +136,18 @@ registerUpdateRunReceiptTests(dirs);
 
 it("keeps restored-generation completion with its helper across CLI unwind", () => {
   vi.stubEnv("OPENCLAW_UPDATE_RUN_HANDOFF", "1");
-  const env = { OPENCLAW_STATE_DIR: dirs.make("update-rollback-owner-") };
-  const run = { runId: createUpdateRun({ trigger: "cli" }, { env }).runId, env };
-  const result = {
-    status: "error" as const,
-    mode: "npm" as const,
-    durationMs: 1,
-    steps: [],
+  const run = createRun("update-rollback-owner-");
+  const { env } = run;
+  const result = updateResult({
     reason: "restart-unhealthy",
     before: { version: "2026.9.1" },
     after: { version: "2026.9.1" },
     recovery: {
-      serviceRestartSafe: true as const,
-      packageRollbackVerified: true as const,
+      serviceRestartSafe: true,
+      packageRollbackVerified: true,
       version: "2026.9.1",
     },
-  };
+  });
   completeUpdateCommandRun(result, run);
   completeUpdateCommandRun(result, run);
   expect(getUpdateRun(run.runId, { env })).toMatchObject({
@@ -167,24 +173,7 @@ function pendingRecovery() {
     { env },
   );
   closeOpenClawStateDatabaseForTest();
-  const snapshot = () =>
-    fs
-      .readdirSync(root, { recursive: true })
-      .map(String)
-      .toSorted()
-      .map((name) => {
-        const filename = path.join(root, name);
-        const stat = fs.statSync(filename);
-        return {
-          name,
-          ino: stat.ino,
-          mtime: stat.mtimeMs,
-          mode: stat.mode,
-          sha256: stat.isFile()
-            ? createHash("sha256").update(fs.readFileSync(filename)).digest("hex")
-            : null,
-        };
-      });
+  const snapshot = () => snapshotUpdateFixtureTree(root);
   return { root, run, record, snapshot };
 }
 
@@ -227,12 +216,7 @@ it.each(["displaced", "replacement", "both", "unreadable"] as const)(
 it("does not complete an operationally pending update from diagnostic success", () => {
   const { run, record, snapshot } = pendingRecovery();
   const before = snapshot();
-  const result = {
-    status: "ok" as const,
-    mode: "npm" as const,
-    durationMs: 1,
-    steps: [],
-  };
+  const result = updateResult({ status: "ok" });
   const completed = completeUpdateCommandRun(result, run);
   expect(completed).toMatchObject({ status: "error", reason: "update-recovery-pending" });
   failUpdateCommandRun(new Error("outer unwind"), run);
@@ -242,9 +226,8 @@ it("does not complete an operationally pending update from diagnostic success", 
 });
 
 it("prints an unexpected JSON update failure after settlement even if diagnostics cannot be written", async () => {
-  const json = true;
-  const env = { OPENCLAW_STATE_DIR: dirs.make("update-unexpected-failure-") };
-  const run = { runId: createUpdateRun({ trigger: "cli" }, { env }).runId, env };
+  const run = createRun("update-unexpected-failure-");
+  const { env } = run;
   const primaryFailure = new Error("Candidate validation unexpectedly stopped.");
   const warn = vi.spyOn(defaultRuntime, "error").mockImplementation(() => {});
   vi.spyOn(existingStateWrite, "runExistingOpenClawStateWriteTransaction").mockImplementationOnce(
@@ -254,11 +237,7 @@ it("prints an unexpected JSON update failure after settlement even if diagnostic
   );
   const reportPath = path.join(env.OPENCLAW_STATE_DIR, "update-reports", `${run.runId}.md`);
   let savedAtPublication: string | undefined;
-  const log = vi.spyOn(defaultRuntime, "log").mockImplementation((value) => {
-    if (String(value).includes("OpenClaw update failed")) {
-      savedAtPublication = fs.readFileSync(reportPath, "utf8");
-    }
-  });
+  const log = vi.spyOn(defaultRuntime, "log").mockImplementation(() => {});
   const output = vi.spyOn(defaultRuntime, "writeJson").mockImplementation(() => {
     savedAtPublication = fs.readFileSync(reportPath, "utf8");
   });
@@ -266,16 +245,20 @@ it("prints an unexpected JSON update failure after settlement even if diagnostic
   const outcome = await withUpdateCommandTerminalResult(
     (registerRun) => {
       registerRun(run);
-      return withUpdateCommandRecoveryUnwind({ json, run }, { triageTarget: { env } }, async () => {
-        throw primaryFailure;
-      }).finally(() => {
+      return withUpdateCommandRecoveryUnwind(
+        { json: true, run },
+        { triageTarget: { env } },
+        async () => {
+          throw primaryFailure;
+        },
+      ).finally(() => {
         beforeSettlement = {
           status: getUpdateRun(run.runId, { env })?.status,
           output: log.mock.calls.length + output.mock.calls.length,
         };
       });
     },
-    { json },
+    { json: true },
   ).catch((error: unknown) => error);
   expect(outcome).toMatchObject({
     name: "UpdateCommandFailure",
@@ -309,13 +292,10 @@ it("prints an unexpected JSON update failure after settlement even if diagnostic
 
 it("saves the complete error diagnostics before printing the Markdown path", async () => {
   const secret = "sk-synthetic-terminal-" + "x".repeat(48);
-  const env = {
-    OPENCLAW_STATE_DIR: dirs.make("update-terminal-report-"),
-    OPENAI_API_KEY: secret,
-  };
-  const run = { runId: createUpdateRun({ trigger: "cli" }, { env }).runId, env };
+  const run = createRun("update-terminal-report-", { OPENAI_API_KEY: secret });
+  const { env } = run;
   const reportPath = path.join(env.OPENCLAW_STATE_DIR, "update-reports", `${run.runId}.md`);
-  let savedAtPublication: { markdown: string; failure?: string; inventory?: string } | undefined;
+  let savedAtPublication: { markdown: string; failure: string; inventory: string } | undefined;
   const log = vi.spyOn(defaultRuntime, "log").mockImplementation((value) => {
     if (String(value) === `Report: ${reportPath}`) {
       const markdown = fs.readFileSync(reportPath, "utf8");
@@ -345,11 +325,8 @@ it("saves the complete error diagnostics before printing the Markdown path", asy
   vi.mocked(crypto.randomUUID).mockReturnValue("00000000-0000-4000-8000-123456789012");
   await publishUpdateCommandTerminalResult(
     { opts: { run } },
-    {
-      status: "error",
-      mode: "npm",
+    updateResult({
       reason: "doctor-failed",
-      durationMs: 1,
       steps: [
         {
           name: "candidate doctor lint",
@@ -360,7 +337,7 @@ it("saves the complete error diagnostics before printing the Markdown path", asy
           doctorLintFindings,
         },
       ],
-    },
+    }),
     { rolledBack: false },
   );
   expect(log.mock.calls.flat().join("\n")).toContain(`Report: ${reportPath}`);
@@ -540,8 +517,8 @@ it.skipIf(process.platform === "win32").each([
           status: "skipped",
           phase: "finished",
           reason: "interrupted",
+          finishedAtMs: expect.any(Number),
         });
-        expect(record?.finishedAtMs).toEqual(expect.any(Number));
         expect(record?.steps.some((step) => step.status === "in_progress")).toBe(false);
       } else {
         expect(record).toEqual(message.expected);
@@ -579,20 +556,18 @@ it("removes preview signal ownership on exceptional unwind", async () => {
 it.each([false, true])(
   "preserves reported downgrade decisions through cleanup and triage (json=%s)",
   async (json) => {
-    const env = { OPENCLAW_STATE_DIR: dirs.make("update-reported-exit-") };
-    const run = { runId: createUpdateRun({ trigger: "cli" }, { env }).runId, env };
+    const run = createRun("update-reported-exit-");
+    const { env } = run;
     const opts = { json, yes: true, run };
     const triage = vi.fn(async () => ({ status: "cancelled" as const }));
     vi.spyOn(updateFailureTriage, "prepareUpdateFailureTriage").mockResolvedValue(triage);
     vi.spyOn(defaultRuntime, "writeJson").mockImplementation(() => {});
     vi.spyOn(defaultRuntime, "log").mockImplementation(() => {});
     vi.spyOn(defaultRuntime, "error").mockImplementation(() => {});
-    const stdinTty = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
-    Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
     const cleaned: string[] = [];
     let reported: unknown;
     let recorded: ReturnType<typeof getUpdateRun> | undefined;
-    try {
+    await withTriageTerminal(true, async () => {
       const outcome = withUpdateFailureTriage(opts, { env }, () =>
         withUpdateCommandTerminalResult(async (registerRun) => {
           registerRun(run);
@@ -641,13 +616,7 @@ it.each([false, true])(
       });
       expect(triage).not.toHaveBeenCalled();
       expect(defaultRuntime.writeJson).not.toHaveBeenCalled();
-    } finally {
-      if (stdinTty) {
-        Object.defineProperty(process.stdin, "isTTY", stdinTty);
-      } else {
-        Reflect.deleteProperty(process.stdin, "isTTY");
-      }
-    }
+    });
   },
 );
 

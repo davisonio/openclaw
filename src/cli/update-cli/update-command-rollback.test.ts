@@ -54,6 +54,7 @@ import * as packageModule from "./update-command-package.js";
 import { rollbackFailedUpdate } from "./update-command-rollback.js";
 import {
   expectActiveRollbackIdentity,
+  readRollbackFixtureState,
   readRollbackFixtureSchemaVersions,
   registerRollbackReportTests,
   writeDoctorRollbackConfig,
@@ -72,17 +73,10 @@ afterEach(async () => {
   vi.restoreAllMocks();
   dirs.cleanup();
 });
-async function readPreviousConfig(env: NodeJS.ProcessEnv) {
-  return createConfigIO({ env, pluginValidation: "skip" }).readConfigFileSnapshot();
-}
 function setVersion(file: string, version: number) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const db = new DatabaseSync(file);
-  try {
-    db.exec(`PRAGMA user_version = ${version}`);
-  } finally {
-    db.close();
-  }
+  using db = new DatabaseSync(file);
+  db.exec(`PRAGMA user_version = ${version}`);
 }
 
 function failedCandidate(overrides: Partial<UpdateRunResult> = {}): UpdateRunResult {
@@ -130,6 +124,18 @@ function schemaCase(
   service = "stopped",
 ) {
   return { change, restored, previousVerified, service };
+}
+
+type RollbackInput = Parameters<typeof rollbackFailedUpdate>[0];
+function runRollback(input: Pick<RollbackInput, "configSnapshot"> & Partial<RollbackInput>) {
+  return rollbackFailedUpdate({
+    definitionRecovery: {},
+    previousRoot,
+    result: failedCandidate(),
+    opts: { json: true },
+    timeoutMs: 1_000,
+    ...input,
+  });
 }
 
 describe("verified package rollback", () => {
@@ -204,14 +210,11 @@ describe("verified package rollback", () => {
     "records refused project rollback without an additional stop (during stop=%s)",
     async (duringStop) => {
       const env = { OPENCLAW_STATE_DIR: serviceStateDir };
-      const configSnapshot = await readPreviousConfig(env);
-      const config = configSnapshot.sourceConfigBeforeMigrations ?? configSnapshot.sourceConfig;
       const run = { runId: createUpdateRun({ trigger: "cli" }, { env }).runId, env };
-      const schemaVersions = await readRollbackFixtureSchemaVersions({
-        stateDir: env.OPENCLAW_STATE_DIR,
-        config,
+      const { configSnapshot, schemaVersions } = await readRollbackFixtureState(
+        serviceStateDir,
         env,
-      });
+      );
       const rollback = vi.fn(async () => ({
         name: "global install rollback",
         activePackageRoot: candidateRoot,
@@ -223,14 +226,11 @@ describe("verified package rollback", () => {
         stderrTail: detail,
       }));
       const detail = "Global project changed since staging: sibling";
-      const outcome = await rollbackFailedUpdate({
-        definitionRecovery: {},
+      const outcome = await runRollback({
         result: failedCandidate({ mode: "pnpm", before: undefined, after: undefined }),
-        previousRoot,
         schemaVersions,
         configSnapshot,
         opts: { json: true, run },
-        timeoutMs: 1_000,
         preManagedServiceStop: stoppedService(),
         packageTransaction: {
           backupRoot: "/backup",
@@ -274,9 +274,7 @@ describe("verified package rollback", () => {
   it("retains Windows suspension through unhealthy rollback after activation", async () => {
     const stateDir = serviceStateDir;
     const env = { OPENCLAW_STATE_DIR: stateDir, OPENCLAW_WINDOWS_TASK_NAME: "rollback-fixture" };
-    const configSnapshot = await readPreviousConfig(env);
-    const config = configSnapshot.sourceConfigBeforeMigrations ?? configSnapshot.sourceConfig;
-    const schemaVersions = await readRollbackFixtureSchemaVersions({ stateDir, config, env });
+    const { configSnapshot, schemaVersions } = await readRollbackFixtureState(stateDir, env);
     let enabled = true;
     const actions: string[] = [];
     mocks.execSchtasks.mockImplementation(async (args) => {
@@ -333,10 +331,8 @@ describe("verified package rollback", () => {
       return "restart-health-failed";
     });
     try {
-      const outcome = await rollbackFailedUpdate({
-        definitionRecovery: {},
+      const outcome = await runRollback({
         result: failedCandidate({ reason: "doctor-failed" }),
-        previousRoot,
         schemaVersions,
         previousVerified: true,
         packageTransaction: {
@@ -345,9 +341,7 @@ describe("verified package rollback", () => {
           rollback: async () => restoredStep("package rollback"),
         },
         configSnapshot,
-        opts: { json: true },
         preManagedServiceStop: { ...service, windowsTaskAutoStartRecovery: original },
-        timeoutMs: 1_000,
       });
       expect(enabled).toBe(true);
       expect(outcome.rolledBack).toBe(false);
@@ -432,15 +426,11 @@ describe("verified package rollback", () => {
       if (change === "new-shared-deferred") {
         expect(schemaVersions.find((entry) => entry.path === shared)?.userVersion).toBeNull();
         setVersion(shared, 7);
-        const database = new DatabaseSync(shared);
-        try {
-          database.exec(`
+        using database = new DatabaseSync(shared);
+        database.exec(`
             CREATE TABLE config_machine_state (state_key TEXT PRIMARY KEY, value_json TEXT, updated_at_ms INTEGER);
             INSERT INTO config_machine_state VALUES ('state.schema.contentVersion', '8', 0);
           `);
-        } finally {
-          database.close();
-        }
       }
       if (change.startsWith("new-agent")) {
         setVersion(agent, change === "new-agent-foreign" ? 4 : 3);
@@ -644,10 +634,8 @@ describe("verified package rollback", () => {
       }
       let outcome: Awaited<ReturnType<typeof rollbackFailedUpdate>>;
       try {
-        outcome = await rollbackFailedUpdate({
-          definitionRecovery: {},
+        outcome = await runRollback({
           result,
-          previousRoot,
           nodeRunner: process.execPath,
           configSnapshot,
           activationConfig,
@@ -676,7 +664,6 @@ describe("verified package rollback", () => {
                     refreshDefinition: true,
                   },
                 }),
-          timeoutMs: 1_000,
         });
       } finally {
         await finishWriter?.();
@@ -796,9 +783,7 @@ describe("verified package rollback", () => {
     const original = '{"gateway":{"mode":"local","port":19101}}\n';
     const candidate = '{"gateway":{"mode":"local","port":19102}}\n';
     fs.writeFileSync(configPath, original);
-    const configSnapshot = await readPreviousConfig(env);
-    const config = configSnapshot.sourceConfigBeforeMigrations ?? configSnapshot.sourceConfig;
-    const schemaVersions = await readRollbackFixtureSchemaVersions({ stateDir, config, env });
+    const { configSnapshot, schemaVersions } = await readRollbackFixtureState(stateDir, env);
     fs.writeFileSync(configPath, candidate);
     if (process.platform !== "win32") {
       fs.chmodSync(stateDir, 0o2770);
@@ -808,20 +793,15 @@ describe("verified package rollback", () => {
       stale: 60_000,
     };
     let foreignWrite = false;
-    const outcome = await rollbackFailedUpdate({
-      definitionRecovery: {},
-      result: failedCandidate(),
-      previousRoot,
+    const outcome = await runRollback({
       configSnapshot,
       schemaVersions,
-      timeoutMs: 1000,
       activationConfig: {
         path: configPath,
         raw: original,
         hash: hashConfigRaw(candidate),
         doctorOwned: true,
       },
-      opts: { json: true },
       preManagedServiceStop: stoppedService({
         running: false,
         stopped: false,
@@ -882,16 +862,13 @@ describe("verified package rollback", () => {
         interrupted: () => false,
       },
     };
-    const outcome = await rollbackFailedUpdate({
-      definitionRecovery: {},
+    const outcome = await runRollback({
       result: failedCandidate({ before: undefined, after: undefined }),
-      previousRoot,
       rollbackBlockedReason: "state-migrated-no-rollback",
-      configSnapshot: await readPreviousConfig({
-        OPENCLAW_STATE_DIR: dirs.make("rollback-blocked-config-"),
-      }),
-      opts: { json: true },
-      timeoutMs: 1_000,
+      configSnapshot: await createConfigIO({
+        env: { OPENCLAW_STATE_DIR: dirs.make("rollback-blocked-config-") },
+        pluginValidation: "skip",
+      }).readConfigFileSnapshot(),
       preManagedServiceStop: stoppedService({
         serviceEnv: { OPENCLAW_STATE_DIR: dirs.make("rollback-finalization-") },
         windowsTaskAutoStartRecovery: stopped.windowsTaskAutoStartRecovery,
