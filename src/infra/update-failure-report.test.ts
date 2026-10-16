@@ -929,7 +929,9 @@ describe("update failure report", () => {
       const issueUrl = "https://github.com/openclaw/openclaw/issues/123";
       const createIssue = mockCreatedIssue(issueUrl);
       const finalizeReceipt = vi
-        .fn(finalizeUpdateFailureReportReceipt)
+        .fn((...args: Parameters<typeof finalizeUpdateFailureReportReceipt>) =>
+          finalizeUpdateFailureReportReceipt(...args),
+        )
         .mockImplementationOnce(async () => fail());
 
       const first = await submit({
