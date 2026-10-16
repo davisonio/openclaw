@@ -463,7 +463,8 @@
     "!dist/plugin-sdk/compiled-subprocess-testing.d.ts",
     "!dist/plugin-sdk/compiled-subprocess-testing.js",
     "!dist/plugin-sdk/memory-host-search.d.ts",
-    "!dist/plugin-sdk/codex-client-version-runtime.d.ts"
+    "!dist/plugin-sdk/codex-client-version-runtime.d.ts",
+    "!dist/plugin-sdk/provider-auth-markers.d.ts"
   ],
   "type": "module",
   "main": "dist/index.js",
@@ -1456,6 +1457,9 @@
     "./plugin-sdk/provider-auth": {
       "types": "./dist/plugin-sdk/provider-auth.d.ts",
       "default": "./dist/plugin-sdk/provider-auth.js"
+    },
+    "./plugin-sdk/provider-auth-markers": {
+      "default": "./dist/plugin-sdk/provider-auth-markers.js"
     },
     "./plugin-sdk/provider-auth-aliases": {
       "default": "./dist/plugin-sdk/provider-auth-aliases.js"
