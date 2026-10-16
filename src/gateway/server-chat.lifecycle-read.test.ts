@@ -1,6 +1,7 @@
 import { expect, it, vi } from "vitest";
 import { awaitGateBeforeSettlement, createDeferred } from "../../test/helpers/promise.js";
 import { observeHostDataSql } from "../../test/helpers/sqlite-statement-execution-counter.js";
+import { setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import {
   loadExactSessionEntryReadOnly,
   replaceSessionEntry,
@@ -109,6 +110,7 @@ it("reads lifecycle recovery in workers and retains tool/text order through clos
 
 it("reads queued recovery state once after the preceding event settles", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async ({ env }) => {
+    setRuntimeConfigSnapshot(config);
     const target = { agentId: "main", sessionKey, env };
     replaceSessionEntrySync(target, { sessionId: "worker-lifecycle-session", updatedAt: 1 });
     const entered = createDeferred();
