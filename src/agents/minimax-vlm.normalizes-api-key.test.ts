@@ -1,4 +1,3 @@
-// Covers MiniMax VLM auth/header normalization and provider-specific routing.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isMinimaxVlmModel, minimaxUnderstandImage } from "./minimax-vlm.js";
 
@@ -21,15 +20,18 @@ describe("minimaxUnderstandImage apiKey normalization", () => {
     content: "ok",
   });
 
-  function guardedOk(headers?: Record<string, string>) {
+  function guarded(
+    response = new Response(okJson, { headers: { "Content-Type": "application/json" } }),
+  ) {
     return {
-      response: new Response(okJson, {
-        status: 200,
-        headers: { "Content-Type": "application/json", ...headers },
-      }),
+      response,
       release: vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
       finalUrl: "https://api.minimax.io/v1/coding_plan/vlm",
     };
+  }
+
+  function mockResponse(body: BodyInit, init: ResponseInit) {
+    fetchWithSsrFGuardMock.mockResolvedValueOnce(guarded(new Response(body, init)));
   }
 
   afterEach(() => {
@@ -51,66 +53,46 @@ describe("minimaxUnderstandImage apiKey normalization", () => {
     });
   }
 
-  async function runNormalizationCase(apiKey: string) {
-    // Headers must be Latin-1 and line-break free; normalize user/API-key
-    // input before constructing the Authorization header.
-    fetchWithSsrFGuardMock.mockResolvedValueOnce(guardedOk());
-
-    const text = await understandImage({
-      apiKey,
-      apiHost: "https://api.minimax.io",
-    });
-
-    expect(text).toBe("ok");
+  async function requestOptions(input: Parameters<typeof understandImage>[0]) {
+    fetchWithSsrFGuardMock.mockResolvedValueOnce(guarded());
+    await expect(understandImage(input)).resolves.toBe("ok");
     expect(fetchWithSsrFGuardMock).toHaveBeenCalledOnce();
-    const opts = fetchWithSsrFGuardMock.mock.calls[0]?.[0];
-    const auth = new Headers(opts?.init?.headers).get("Authorization");
-    expect(auth).toBe("Bearer minimax-test-key");
+    return fetchWithSsrFGuardMock.mock.calls[0]?.[0];
+  }
+
+  async function requestError(input: Parameters<typeof understandImage>[0] = {}) {
+    const error = await understandImage({ apiHost: "https://api.minimax.io", ...input }).catch(
+      (caught: unknown) => caught,
+    );
+    if (!(error instanceof Error)) {
+      throw new Error("expected MiniMax VLM request to throw an Error");
+    }
+    return error.message;
   }
 
   it("strips embedded CR/LF before sending Authorization header", async () => {
-    await runNormalizationCase("minimax-test-\r\nkey");
+    const opts = await requestOptions({
+      apiKey: "minimax-test-\r\nkey",
+      apiHost: "https://api.minimax.io",
+    });
+    expect(new Headers(opts?.init?.headers).get("Authorization")).toBe("Bearer minimax-test-key");
   });
 
   it("keeps trusted MINIMAX_API_HOST env fallback for VLM routing", async () => {
     process.env.MINIMAX_API_HOST = "https://api.minimaxi.com";
-    fetchWithSsrFGuardMock.mockResolvedValueOnce(guardedOk());
-
-    await expect(understandImage({})).resolves.toBe("ok");
-
-    expect(fetchWithSsrFGuardMock).toHaveBeenCalledOnce();
-    const opts = fetchWithSsrFGuardMock.mock.calls[0]?.[0];
+    const opts = await requestOptions({});
     expect(opts?.url).toBe("https://api.minimaxi.com/v1/coding_plan/vlm");
   });
 
   it.each(["minimax-portal-cn"])("routes %s to the CN VLM host by default", async (provider) => {
-    fetchWithSsrFGuardMock.mockResolvedValueOnce(guardedOk());
-
-    await expect(
-      understandImage({
-        provider,
-      }),
-    ).resolves.toBe("ok");
-
-    expect(fetchWithSsrFGuardMock).toHaveBeenCalledOnce();
-    const opts = fetchWithSsrFGuardMock.mock.calls[0]?.[0];
+    const opts = await requestOptions({ provider });
     expect(opts?.url).toBe("https://api.minimaxi.com/v1/coding_plan/vlm");
   });
 
   it.each(["minimax-portal-cn"])(
     "keeps %s on the CN VLM host when the configured host is malformed",
     async (provider) => {
-      fetchWithSsrFGuardMock.mockResolvedValueOnce(guardedOk());
-
-      await expect(
-        understandImage({
-          provider,
-          apiHost: "https://[",
-        }),
-      ).resolves.toBe("ok");
-
-      expect(fetchWithSsrFGuardMock).toHaveBeenCalledOnce();
-      const opts = fetchWithSsrFGuardMock.mock.calls[0]?.[0];
+      const opts = await requestOptions({ provider, apiHost: "https://[" });
       expect(opts?.url).toBe("https://api.minimaxi.com/v1/coding_plan/vlm");
     },
   );
@@ -155,9 +137,7 @@ describe("minimaxUnderstandImage apiKey normalization", () => {
         policy: undefined,
       },
     ])("$name", async ({ input, policy }) => {
-      fetchWithSsrFGuardMock.mockResolvedValueOnce(guardedOk());
-      await expect(understandImage(input)).resolves.toBe("ok");
-      const opts = fetchWithSsrFGuardMock.mock.calls.at(-1)?.[0];
+      const opts = await requestOptions(input);
       if (policy === undefined) {
         expect(opts?.policy).toBeUndefined();
       } else {
@@ -175,18 +155,10 @@ describe("minimaxUnderstandImage apiKey normalization", () => {
     });
 
     it("carries model request proxy policy into the guarded fetch", async () => {
-      fetchWithSsrFGuardMock.mockResolvedValueOnce(guardedOk());
-
-      await expect(
-        understandImage({
-          apiHost: "https://custom-minimax.example.com",
-          request: {
-            proxy: { mode: "explicit-proxy", url: "https://proxy.example.com" },
-          },
-        }),
-      ).resolves.toBe("ok");
-
-      const opts = fetchWithSsrFGuardMock.mock.calls.at(-1)?.[0];
+      const opts = await requestOptions({
+        apiHost: "https://custom-minimax.example.com",
+        request: { proxy: { mode: "explicit-proxy", url: "https://proxy.example.com" } },
+      });
       expect(opts?.dispatcherPolicy).toEqual({
         mode: "explicit-proxy",
         proxyUrl: "https://proxy.example.com",
@@ -198,8 +170,6 @@ describe("minimaxUnderstandImage apiKey normalization", () => {
   });
 
   it("bounds large provider error response bodies", async () => {
-    // Provider error bodies can be large. Read enough for diagnostics, then
-    // cancel the stream so failures stay bounded.
     let canceled = false;
     const body = new ReadableStream<Uint8Array>({
       start(controller) {
@@ -209,27 +179,16 @@ describe("minimaxUnderstandImage apiKey normalization", () => {
         canceled = true;
       },
     });
-    fetchWithSsrFGuardMock.mockResolvedValueOnce({
-      response: new Response(body, {
-        status: 500,
-        statusText: "Internal Server Error",
-        headers: { "Trace-Id": "trace-123" },
-      }),
-      release: vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
-      finalUrl: "https://api.minimax.io/v1/coding_plan/vlm",
+    mockResponse(body, {
+      status: 500,
+      statusText: "Internal Server Error",
+      headers: { "Trace-Id": "trace-123" },
     });
-
-    const error = await understandImage({
-      apiHost: "https://api.minimax.io",
-    }).catch((caught: unknown) => caught);
-
-    if (!(error instanceof Error)) {
-      throw new Error("expected MiniMax VLM request to throw an Error");
-    }
-    expect(error.message).toContain("MiniMax VLM request failed");
-    expect(error.message).toContain("Trace-Id: trace-123");
-    expect(error.message).not.toContain("tail-marker");
-    expect(error.message.length).toBeLessThan(520);
+    const message = await requestError();
+    expect(message).toContain("MiniMax VLM request failed");
+    expect(message).toContain("Trace-Id: trace-123");
+    expect(message).not.toContain("tail-marker");
+    expect(message.length).toBeLessThan(520);
     expect(canceled).toBe(true);
   });
 
@@ -245,23 +204,11 @@ describe("minimaxUnderstandImage apiKey normalization", () => {
         canceled = true;
       },
     });
-    fetchWithSsrFGuardMock.mockResolvedValueOnce({
-      response: new Response(body, {
-        status: 200,
-        headers: { "Content-Type": "application/json", "Trace-Id": "trace-success" },
-      }),
-      release: vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
-      finalUrl: "https://api.minimax.io/v1/coding_plan/vlm",
+    mockResponse(body, {
+      status: 200,
+      headers: { "Content-Type": "application/json", "Trace-Id": "trace-success" },
     });
-
-    const error = await understandImage({
-      apiHost: "https://api.minimax.io",
-    }).catch((caught: unknown) => caught);
-
-    if (!(error instanceof Error)) {
-      throw new Error("expected MiniMax VLM request to reject oversized successful JSON");
-    }
-    expect(error.message).toBe(
+    expect(await requestError()).toBe(
       "MiniMax VLM response [Trace-Id=trace-success]: JSON response exceeds 16777216 bytes",
     );
     // WHATWG streams may pre-pull one chunk beyond the bytes consumed by the reader.
@@ -306,24 +253,13 @@ describe("minimaxUnderstandImage apiKey normalization", () => {
       async (request: { init?: { headers?: HeadersInit } }) => {
         const authorization = new Headers(request.init?.headers).get("Authorization");
         expect(authorization).toBe(`Bearer ${needle}`);
-        return {
-          response: response(authorization ?? ""),
-          release: vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
-          finalUrl: "https://api.minimax.io/v1/coding_plan/vlm",
-        };
+        return guarded(response(authorization ?? ""));
       },
     );
 
-    const error = await understandImage({
-      apiKey: needle,
-      apiHost: "https://api.minimax.io",
-    }).catch((caught: unknown) => caught);
-
-    if (!(error instanceof Error)) {
-      throw new Error("expected MiniMax VLM request to throw an Error");
-    }
-    expect(error.message).not.toContain(needle);
-    expect(error.message).toContain("***");
+    const message = await requestError({ apiKey: needle });
+    expect(message).not.toContain(needle);
+    expect(message).toContain("***");
   });
 });
 

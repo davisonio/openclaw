@@ -223,12 +223,13 @@ function createModelConfig(overrides: Partial<ModelProviderConfig["models"][numb
 
 function expectAuthFields(
   auth: Awaited<ReturnType<typeof resolveAuth>>,
-  expected: { apiKey: string; mode: "api-key" | "oauth"; source?: string },
+  apiKey: string,
+  source?: string,
+  mode: "api-key" | "oauth" = "api-key",
 ) {
-  expect(auth.apiKey).toBe(expected.apiKey);
-  expect(auth.mode).toBe(expected.mode);
-  if (expected.source !== undefined) {
-    expect(auth.source).toBe(expected.source);
+  expect({ apiKey: auth.apiKey, mode: auth.mode }).toEqual({ apiKey, mode });
+  if (source !== undefined) {
+    expect(auth.source).toBe(source);
   }
 }
 
@@ -239,11 +240,11 @@ function expectSecret(value: string | undefined, expected: string) {
 
 function expectSecretSentinelAuth(
   auth: Awaited<ReturnType<typeof resolveAuth>>,
-  expected: { value: string; source: string; mode: "api-key" | "oauth" },
+  value: string,
+  source: string,
 ) {
-  expectSecret(auth.apiKey, expected.value);
-  expect(auth.source).toBe(expected.source);
-  expect(auth.mode).toBe(expected.mode);
+  expectSecret(auth.apiKey, value);
+  expect({ source: auth.source, mode: auth.mode }).toEqual({ source, mode: "api-key" });
 }
 
 describe("resolveModelAuthMode", () => {
@@ -335,8 +336,7 @@ describe("resolveUsableCustomProviderApiKey", () => {
         store: authStore({}),
       });
 
-      expect(looksLikeSecretSentinel(resolved.apiKey ?? "")).toBe(true);
-      expect(resolveSecretSentinel(resolved.apiKey ?? "")).toBe("sk-secretref-env-first");
+      expectSecret(resolved.apiKey, "sk-secretref-env-first");
     });
   });
 
@@ -485,11 +485,7 @@ describe("resolveApiKeyForProviderCore", () => {
       agentDir,
     });
 
-    expectSecretSentinelAuth(resolved, {
-      value: "test-profile-api-key",
-      source: `profile:${profileId}`,
-      mode: "api-key",
-    });
+    expectSecretSentinelAuth(resolved, "test-profile-api-key", `profile:${profileId}`);
   });
 
   it("prefers the active runtime snapshot for SecretRef-backed plugin fallback auth", async () => {
@@ -508,11 +504,11 @@ describe("resolveApiKeyForProviderCore", () => {
       }),
     );
 
-    expectSecretSentinelAuth(resolved, {
-      value: "plugin-web-runtime-key",
-      source: "plugins.entries.plugin-web.config.apiKey",
-      mode: "api-key",
-    });
+    expectSecretSentinelAuth(
+      resolved,
+      "plugin-web-runtime-key",
+      "plugins.entries.plugin-web.config.apiKey",
+    );
   });
 
   it.each<{ name: string; apiKey: ModelProviderConfig["apiKey"]; runtimeKey?: string }>([
@@ -534,11 +530,7 @@ describe("resolveApiKeyForProviderCore", () => {
         store: authStore({}),
       });
 
-      expectSecretSentinelAuth(resolved, {
-        value: runtimeKey,
-        source: "models.providers.cliproxyapi",
-        mode: "api-key",
-      });
+      expectSecretSentinelAuth(resolved, runtimeKey, "models.providers.cliproxyapi");
       await expect(
         hasAuth({
           provider: "cliproxyapi",
@@ -566,11 +558,7 @@ describe("resolveApiKeyForProviderCore", () => {
       store: authStore({}),
     });
 
-    expectSecretSentinelAuth(resolved, {
-      value: "sk-runtime-clone",
-      source: "models.providers.cliproxyapi",
-      mode: "api-key",
-    });
+    expectSecretSentinelAuth(resolved, "sk-runtime-clone", "models.providers.cliproxyapi");
 
     const preferred = await resolveAuth({
       provider: "cliproxyapi",
@@ -582,11 +570,7 @@ describe("resolveApiKeyForProviderCore", () => {
         "cliproxyapi:preferred": keyCredential("cliproxyapi", "sk-preferred-profile"),
       }),
     });
-    expectAuthFields(preferred, {
-      apiKey: "sk-preferred-profile",
-      source: "profile:cliproxyapi:preferred",
-      mode: "api-key",
-    });
+    expectAuthFields(preferred, "sk-preferred-profile", "profile:cliproxyapi:preferred");
   });
 
   // Both managed-key paths must enforce the cooldown recorded by the failure writer.
@@ -672,11 +656,7 @@ describe("resolveApiKeyForProviderCore", () => {
       }),
     });
 
-    expectAuthFields(auth, {
-      apiKey: "sk-real",
-      source: "profile:custom-auth:real",
-      mode: "api-key",
-    });
+    expectAuthFields(auth, "sk-real", "profile:custom-auth:real");
   });
 
   it("prefers explicit api-key provider config over ambient auth profiles", async () => {
@@ -694,11 +674,7 @@ describe("resolveApiKeyForProviderCore", () => {
       }),
     });
 
-    expectAuthFields(resolved, {
-      apiKey: "sk-config-live",
-      source: "models.json",
-      mode: "api-key",
-    });
+    expectAuthFields(resolved, "sk-config-live", "models.json");
   });
 
   it("preserves explicit subscription modes for literal provider credentials", async () => {
@@ -758,11 +734,7 @@ describe("resolveApiKeyForProviderCore", () => {
       }),
     });
 
-    expectSecretSentinelAuth(resolved, {
-      value: "sk-runtime-cliproxy",
-      source: "models.providers.cliproxyapi",
-      mode: "api-key",
-    });
+    expectSecretSentinelAuth(resolved, "sk-runtime-cliproxy", "models.providers.cliproxyapi");
   });
 
   it("prefers non-secret local env markers over ambient profiles", async () => {
@@ -775,10 +747,7 @@ describe("resolveApiKeyForProviderCore", () => {
       }),
     );
 
-    expectAuthFields(resolved, {
-      apiKey: "ollama-local",
-      mode: "api-key",
-    });
+    expectAuthFields(resolved, "ollama-local");
     expect(resolved.source).toContain("OLLAMA_API_KEY");
   });
 });
@@ -813,11 +782,7 @@ describe("resolveApiKeyForProviderCore – synthetic local auth for custom provi
       store: authStore({}),
     });
 
-    expectAuthFields(auth, {
-      apiKey: "ollama-local",
-      source: "models.json (local marker)",
-      mode: "api-key",
-    });
+    expectAuthFields(auth, "ollama-local", "models.json (local marker)");
   });
 
   it("resolves synthetic auth when model overrides api to ollama within a non-ollama provider", async () => {
@@ -847,11 +812,7 @@ describe("resolveApiKeyForProviderCore – synthetic local auth for custom provi
       store: authStore({}),
     });
 
-    expectAuthFields(auth, {
-      apiKey: "ollama-local",
-      source: "models.providers.my-router (synthetic local key)",
-      mode: "api-key",
-    });
+    expectAuthFields(auth, "ollama-local", "models.providers.my-router (synthetic local key)");
   });
 
   it.each([0, 1])(
@@ -871,11 +832,7 @@ describe("resolveApiKeyForProviderCore – synthetic local auth for custom provi
         allowAuthProfileFallback: false,
       });
 
-      expectAuthFields(auth, {
-        apiKey: CUSTOM_LOCAL_AUTH_MARKER,
-        source: "models.json (local marker)",
-        mode: "api-key",
-      });
+      expectAuthFields(auth, CUSTOM_LOCAL_AUTH_MARKER, "models.json (local marker)");
     },
   );
 

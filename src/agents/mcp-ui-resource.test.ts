@@ -1,24 +1,27 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionMcpRuntime } from "./agent-bundle-mcp-types.js";
 import {
-  getMcpAppModelContext,
+  getMcpAppModelContext as getContext,
   subscribeMcpAppModelContext,
-  updateMcpAppModelContext,
+  updateMcpAppModelContext as updateContext,
 } from "./mcp-app-model-context.js";
 import { buildMcpAppSandboxPath, resolveMcpAppSandboxPort } from "./mcp-app-sandbox.js";
 import {
   acquireMcpAppViewRequest,
-  leaseMcpAppModelContextForSessionTurn,
+  leaseMcpAppModelContextForSessionTurn as leaseContext,
   fetchMcpAppView,
-  getMcpAppViewLease,
-  getMcpAppViewLeaseForSession,
+  getMcpAppViewLease as getView,
+  getMcpAppViewLeaseForSession as getSessionView,
 } from "./mcp-ui-resource.js";
 import { testing as mcpUiResourceTesting } from "./mcp-ui-resource.test-support.js";
 
 const MCP_APP_RESOURCE_MIME_TYPE = "text/html;profile=mcp-app";
 const MCP_APP_RESOURCE_MAX_BYTES = 2 * 1024 * 1024;
 
-function runtime(readResource: SessionMcpRuntime["readResource"]): SessionMcpRuntime {
+function runtime(
+  readResource: SessionMcpRuntime["readResource"] = async () => html(),
+  overrides: Partial<SessionMcpRuntime> = {},
+): SessionMcpRuntime {
   return {
     sessionId: "session-1",
     sessionKey: "agent:main:main",
@@ -35,6 +38,7 @@ function runtime(readResource: SessionMcpRuntime["readResource"]): SessionMcpRun
     callTool: vi.fn(),
     readResource,
     dispose: async () => {},
+    ...overrides,
   };
 }
 
@@ -51,8 +55,17 @@ function fetchView(params: Pick<ViewParams, "runtime"> & Partial<Omit<ViewParams
   });
 }
 
-function html(text = "<html>demo</html>") {
-  return { contents: [{ uri: "ui://demo/app", mimeType: MCP_APP_RESOURCE_MIME_TYPE, text }] };
+function html(text = "<html>demo</html>", _meta?: Record<string, unknown>) {
+  return {
+    contents: [{ uri: "ui://demo/app", mimeType: MCP_APP_RESOURCE_MIME_TYPE, text, _meta }],
+  };
+}
+
+async function createView(params: Partial<ViewParams> = {}) {
+  const active = params.runtime ?? runtime();
+  const descriptor = await fetchView({ ...params, runtime: active });
+  const viewId = descriptor!.viewId;
+  return { active, viewId, view: getView(viewId, active)! };
 }
 
 describe("MCP App UI resources", () => {
@@ -71,77 +84,55 @@ describe("MCP App UI resources", () => {
   ] as const)(
     "selects an advertised initial display mode ($expected)",
     async ({ preferred, requested, available, expected }) => {
-      const active = runtime(async () => ({
-        contents: [
-          {
-            uri: "ui://demo/app",
-            mimeType: MCP_APP_RESOURCE_MIME_TYPE,
-            text: "<p>app</p>",
-            _meta: {
-              "openai/ui": { preferredDisplayMode: preferred, availableDisplayModes: available },
-            },
-          },
-        ],
-      }));
-      const view = await fetchView({ runtime: active, displayMode: requested });
-      expect(getMcpAppViewLease(view!.viewId, active)?.displayMode).toBe(expected);
+      const { view } = await createView({
+        runtime: runtime(async () =>
+          html("<p>app</p>", {
+            "openai/ui": { preferredDisplayMode: preferred, availableDisplayModes: available },
+          }),
+        ),
+        displayMode: requested,
+      });
+      expect(view.displayMode).toBe(expected);
     },
   );
 
   it("leases next-turn context only for exact live session and requester identities across native facades", async () => {
-    const native = runtime(async () => html());
-    const first = await fetchView({
-      runtime: native,
-      requesterId: "alice",
-      allowedAppToolNames: new Set(),
-    });
-    const second = await fetchView({
-      runtime: native,
-      requesterId: "bob",
-      allowedAppToolNames: new Set(),
-    });
-    const alice = getMcpAppViewLease(first!.viewId, native)!;
-    const bob = getMcpAppViewLease(second!.viewId, native)!;
-    updateMcpAppModelContext(native, alice, { content: [{ type: "text", text: "alice-private" }] });
-    updateMcpAppModelContext(native, bob, { content: [{ type: "text", text: "bob-private" }] });
+    const native = runtime();
+    const params = { runtime: native, allowedAppToolNames: new Set<string>() };
+    const { view: alice } = await createView({ ...params, requesterId: "alice" });
+    const { view: bob } = await createView({ ...params, requesterId: "bob" });
+    updateContext(native, alice, { content: [{ type: "text", text: "alice-private" }] });
+    updateContext(native, bob, { content: [{ type: "text", text: "bob-private" }] });
     const target = {
       sessionKey: native.sessionKey,
       sessionId: native.sessionId,
       requesterId: "alice",
     };
-    expect(
-      await leaseMcpAppModelContextForSessionTurn({ ...target, sessionId: "replacement" }),
-    ).toBeUndefined();
-    expect(
-      await leaseMcpAppModelContextForSessionTurn({ ...target, sessionKey: "agent:main:other" }),
-    ).toBeUndefined();
-    expect(
-      await leaseMcpAppModelContextForSessionTurn({ ...target, requesterId: "mallory" }),
-    ).toBeUndefined();
-    const lease = await leaseMcpAppModelContextForSessionTurn(target);
+    expect(await leaseContext({ ...target, sessionId: "replacement" })).toBeUndefined();
+    expect(await leaseContext({ ...target, sessionKey: "agent:main:other" })).toBeUndefined();
+    expect(await leaseContext({ ...target, requesterId: "mallory" })).toBeUndefined();
+    const lease = await leaseContext(target);
     expect(lease?.project(0).context.text).toContain("alice-private");
     expect(lease?.project(0).context.text).not.toContain("bob-private");
     lease?.commit();
-    expect(getMcpAppModelContext(native, alice)).toBeNull();
-    expect(getMcpAppModelContext(native, bob)).not.toBeNull();
+    expect(getContext(native, alice)).toBeNull();
+    expect(getContext(native, bob)).not.toBeNull();
   });
 
   it("does not infer a Gateway profile from transport requester scope", async () => {
-    const sessionRuntime = runtime(async () => html());
-    sessionRuntime.requesterScope = {
-      requesterSenderId: "channel-user",
-      messageChannel: "discord",
-    };
-    const descriptor = await fetchView({ runtime: sessionRuntime });
-    const view = getMcpAppViewLease(descriptor!.viewId, sessionRuntime)!;
+    const { active, view } = await createView({
+      runtime: runtime(undefined, {
+        requesterScope: { requesterSenderId: "channel-user", messageChannel: "discord" },
+      }),
+    });
     expect(view.requesterId).toBeUndefined();
     view.allowedAppToolNames = new Set();
-    updateMcpAppModelContext(sessionRuntime, view, {
+    updateContext(active, view, {
       content: [{ type: "text", text: "shared selection" }],
     });
-    const context = await leaseMcpAppModelContextForSessionTurn({
-      sessionId: sessionRuntime.sessionId,
-      sessionKey: sessionRuntime.sessionKey,
+    const context = await leaseContext({
+      sessionId: active.sessionId,
+      sessionKey: active.sessionKey,
       requesterId: "verified-profile",
     });
     expect(context?.project(0).context.text).toContain("shared selection");
@@ -149,66 +140,50 @@ describe("MCP App UI resources", () => {
   });
 
   it("leases HTML and tool data only in memory", async () => {
-    const sessionRuntime = runtime(async () => ({
-      contents: [
-        {
-          uri: "ui://demo/app",
-          mimeType: MCP_APP_RESOURCE_MIME_TYPE,
-          text: "<html>demo</html>",
-          _meta: {
-            ui: {
-              csp: { connectDomains: ["https://api.example.com"] },
-              permissions: { geolocation: {} },
-            },
-          },
-        },
-      ],
-    }));
     const authorizeAppInteraction = vi.fn(async () => true);
-    const result = await fetchView({
-      runtime: sessionRuntime,
+    const { active, viewId, view } = await createView({
+      runtime: runtime(async () =>
+        html(undefined, {
+          ui: {
+            csp: { connectDomains: ["https://api.example.com"] },
+            permissions: { geolocation: {} },
+          },
+        }),
+      ),
       toolInput: { city: "Paris" },
       toolResult: { content: [{ type: "text", text: "ok" }] },
       authorizeAppInteraction,
     });
 
-    expect(result?.viewId).toMatch(/^mcp-app-/u);
-    expect(getMcpAppViewLease(result?.viewId ?? "", sessionRuntime)).toMatchObject({
+    expect(viewId).toMatch(/^mcp-app-/u);
+    expect(view).toMatchObject({
       html: "<html>demo</html>",
       toolInput: { city: "Paris" },
       permissions: { geolocation: {} },
       authorizeAppInteraction,
     });
     expect(
-      getMcpAppViewLease(
-        result?.viewId ?? "",
+      getView(
+        viewId,
         runtime(async () => ({ contents: [] })),
       ),
     ).toBeUndefined();
-    expect(
-      getMcpAppViewLeaseForSession(result?.viewId ?? "", "agent:main:main", "main"),
-    ).toMatchObject({
+    expect(getSessionView(viewId, "agent:main:main", "main")).toMatchObject({
       html: "<html>demo</html>",
-      runtime: sessionRuntime,
+      runtime: active,
       agentId: "main",
     });
-    expect(
-      getMcpAppViewLeaseForSession(result?.viewId ?? "", "agent:other:main", "other"),
-    ).toBeUndefined();
+    expect(getSessionView(viewId, "agent:other:main", "other")).toBeUndefined();
   });
 
   it("isolates live views by agent when bare session keys collide", async () => {
-    const sessionRuntime = runtime(async () => html("<html>ops</html>"));
-    sessionRuntime.sessionKey = "global";
-    const result = await fetchView({
-      runtime: sessionRuntime,
+    const { viewId } = await createView({
+      runtime: runtime(async () => html("<html>ops</html>"), { sessionKey: "global" }),
       agentId: "ops",
     });
 
-    expect(getMcpAppViewLeaseForSession(result?.viewId ?? "", "global", "ops")).toBeDefined();
-    expect(
-      getMcpAppViewLeaseForSession(result?.viewId ?? "", "global", "research"),
-    ).toBeUndefined();
+    expect(getSessionView(viewId, "global", "ops")).toBeDefined();
+    expect(getSessionView(viewId, "global", "research")).toBeUndefined();
   });
 
   it("keeps valid Apps when optional listing metadata fails", async () => {
@@ -218,9 +193,7 @@ describe("MCP App UI resources", () => {
       throw new Error("resources/list unavailable");
     });
 
-    const result = await fetchView({
-      runtime: sessionRuntime,
-    });
+    const result = await fetchView({ runtime: sessionRuntime });
 
     expect(result?.viewId).toMatch(/^mcp-app-/u);
     expect(readResource).toHaveBeenCalledWith("demo", "ui://demo/app", {
@@ -233,16 +206,8 @@ describe("MCP App UI resources", () => {
 
   it("rejects oversized and incorrectly typed resources", async () => {
     for (const content of [
-      {
-        uri: "ui://demo/app",
-        mimeType: "text/html",
-        text: "<html></html>",
-      },
-      {
-        uri: "ui://demo/app",
-        mimeType: MCP_APP_RESOURCE_MIME_TYPE,
-        text: "x".repeat(MCP_APP_RESOURCE_MAX_BYTES + 1),
-      },
+      { ...html("<html></html>").contents[0], mimeType: "text/html" },
+      html("x".repeat(MCP_APP_RESOURCE_MAX_BYTES + 1)).contents[0],
     ]) {
       const result = await fetchView({
         runtime: runtime(async () => ({ contents: [content] })),
@@ -267,27 +232,18 @@ describe("MCP App UI resources", () => {
   });
 
   it("normalizes CSP before retaining the view", async () => {
-    const sessionRuntime = runtime(async () => ({
-      contents: [
-        {
-          uri: "ui://demo/app",
-          mimeType: MCP_APP_RESOURCE_MIME_TYPE,
-          text: "<!doctype html><script>globalThis.ready = true</script>",
-          _meta: {
-            ui: {
-              csp: {
-                connectDomains: ["https://api.example.com", "javascript:alert(1)"],
-                resourceDomains: ["https://cdn.example.com"],
-              },
+    const { view } = await createView({
+      runtime: runtime(async () =>
+        html("<!doctype html><script>globalThis.ready = true</script>", {
+          ui: {
+            csp: {
+              connectDomains: ["https://api.example.com", "javascript:alert(1)"],
+              resourceDomains: ["https://cdn.example.com"],
             },
           },
-        },
-      ],
-    }));
-    const result = await fetchView({
-      runtime: sessionRuntime,
+        }),
+      ),
     });
-    const view = getMcpAppViewLease(result?.viewId ?? "", sessionRuntime);
     expect(view?.csp).toEqual({
       connectDomains: ["https://api.example.com"],
       resourceDomains: ["https://cdn.example.com"],
@@ -298,27 +254,25 @@ describe("MCP App UI resources", () => {
 
   it("deletes sensitive view data when the lease expires without later activity", async () => {
     vi.useFakeTimers();
-    const sessionRuntime = runtime(async () => html("<html>secret</html>"));
-    const result = await fetchView({
-      runtime: sessionRuntime,
+    const { active, viewId, view } = await createView({
+      runtime: runtime(async () => html("<html>secret</html>")),
       toolInput: { token: "secret" },
     });
-    const view = getMcpAppViewLease(result?.viewId ?? "", sessionRuntime);
     expect(view).toBeDefined();
     const changed = vi.fn();
     view!.disposeCallbacks = new Set([subscribeMcpAppModelContext(view!, changed)]);
-    updateMcpAppModelContext(sessionRuntime, view!, {
+    updateContext(active, view!, {
       content: [{ type: "text", text: "ephemeral context" }],
     });
-    expect(getMcpAppModelContext(sessionRuntime, view!)).not.toBeNull();
+    expect(getContext(active, view!)).not.toBeNull();
 
     await vi.advanceTimersByTimeAsync(10 * 60_000);
 
-    expect(getMcpAppViewLease(result?.viewId ?? "", sessionRuntime)).toBeUndefined();
-    expect(getMcpAppModelContext(sessionRuntime, view!)).toBeNull();
+    expect(getView(viewId, active)).toBeUndefined();
+    expect(getContext(active, view!)).toBeNull();
     expect(changed).toHaveBeenLastCalledWith(null);
-    expect(sessionRuntime.acquireLease).toHaveBeenCalledOnce();
-    const release = vi.mocked(sessionRuntime.acquireLease!).mock.results[0]?.value;
+    expect(active.acquireLease).toHaveBeenCalledOnce();
+    const release = vi.mocked(active.acquireLease!).mock.results[0]?.value;
     expect(release).toHaveBeenCalledOnce();
   });
 
@@ -358,7 +312,7 @@ describe("MCP App UI resources", () => {
 
   it("replaces a reconstructed view id without leaking the previous runtime lease", async () => {
     const releases = [vi.fn(), vi.fn()];
-    const sessionRuntime = runtime(async () => html());
+    const sessionRuntime = runtime();
     sessionRuntime.acquireLease = vi
       .fn()
       .mockReturnValueOnce(releases[0])
@@ -374,7 +328,7 @@ describe("MCP App UI resources", () => {
 
     expect(releases[0]).toHaveBeenCalledOnce();
     expect(releases[1]).not.toHaveBeenCalled();
-    expect(getMcpAppViewLease("mcp-app-restored", sessionRuntime)?.toolInput).toEqual({
+    expect(getView("mcp-app-restored", sessionRuntime)?.toolInput).toEqual({
       version: 2,
     });
   });

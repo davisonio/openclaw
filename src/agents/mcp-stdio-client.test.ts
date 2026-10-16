@@ -1,4 +1,4 @@
-import { PassThrough, type Writable } from "node:stream";
+import { PassThrough } from "node:stream";
 import { ReadBuffer } from "@modelcontextprotocol/sdk/shared/stdio.js";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -27,7 +27,6 @@ function createFixture(protocolVersion = "2025-06-18") {
   const requested = createDeferred<string | number>();
   const stdin = new PassThrough();
   const stdout = new PassThrough();
-  const stderr = new PassThrough();
   const messages: JSONRPCMessage[] = [];
   const buffer = new ReadBuffer();
   stdin.on("data", (chunk: Buffer) => {
@@ -64,12 +63,7 @@ function createFixture(protocolVersion = "2025-06-18") {
     }),
     dispose: vi.fn(),
   } satisfies OwnedStdioProcess;
-  spawnMock.mockImplementation(async ({ stderrDestination }: { stderrDestination?: Writable }) => {
-    if (stderrDestination) {
-      stderr.pipe(stderrDestination, { end: false });
-    }
-    return child;
-  });
+  spawnMock.mockResolvedValue(child);
   closeMock.mockImplementation(async (process: OwnedStdioProcess) => {
     await process.wait();
     await process.waitForExtinction?.();
@@ -79,7 +73,6 @@ function createFixture(protocolVersion = "2025-06-18") {
     extinction.resolve();
     stdin.destroy();
     stdout.destroy();
-    stderr.destroy();
   });
   const client = createMcpStdioClient({
     command: "fixture-mcp-proxy",
@@ -95,7 +88,20 @@ function createFixture(protocolVersion = "2025-06-18") {
     },
   });
   clients.push(client);
-  return { client, child, stdin, stdout, messages, requested: requested.promise };
+  return {
+    client,
+    child,
+    stdin,
+    stdout,
+    requested: requested.promise,
+    sent: (method: string) =>
+      messages.some((message) => "method" in message && message.method === method),
+  };
+}
+
+function expectRetired({ client, child }: ReturnType<typeof createFixture>) {
+  expect(client.isAvailable()).toBe(false);
+  expect(child.kill).toHaveBeenCalledExactlyOnceWith("SIGTERM");
 }
 
 afterEach(async () => {
@@ -142,21 +148,18 @@ describe("createMcpStdioClient", () => {
   });
 
   it("classifies an incompatible initialize version as a fatal protocol error", async () => {
-    const { client, child, messages } = createFixture("2024-11-05");
+    const fixture = createFixture("2024-11-05");
+    const { client, sent } = fixture;
     await expect(client.request("tools/call", {}, { timeoutMs: 1000 })).rejects.toThrow(
       "protocol: proxy returned an incompatible protocol version",
     );
-    expect(client.isAvailable()).toBe(false);
-    expect(child.kill).toHaveBeenCalledExactlyOnceWith("SIGTERM");
-    expect(
-      messages.some(
-        (message) => "method" in message && message.method === "notifications/initialized",
-      ),
-    ).toBe(false);
+    expectRetired(fixture);
+    expect(sent("notifications/initialized")).toBe(false);
   });
 
   it("retires an SDK request timeout without writing a cancellation notification", async () => {
-    const { client, child, messages, requested } = createFixture();
+    const fixture = createFixture();
+    const { client, sent, requested } = fixture;
     await vi.waitFor(() => expect(client.isAvailable()).toBe(true));
     vi.useFakeTimers();
     const pending = client.request("tools/call", {}, { timeoutMs: 100 });
@@ -166,17 +169,13 @@ describe("createMcpStdioClient", () => {
     await requested;
     await vi.advanceTimersByTimeAsync(100);
     await rejected;
-    expect(client.isAvailable()).toBe(false);
-    expect(child.kill).toHaveBeenCalledExactlyOnceWith("SIGTERM");
-    expect(
-      messages.some(
-        (message) => "method" in message && message.method === "notifications/cancelled",
-      ),
-    ).toBe(false);
+    expectRetired(fixture);
+    expect(sent("notifications/cancelled")).toBe(false);
   });
 
   it("classifies a failed stdin write as fatal unavailability", async () => {
-    const { client, child, stdin } = createFixture();
+    const fixture = createFixture();
+    const { client, stdin } = fixture;
     await vi.waitFor(() => expect(client.isAvailable()).toBe(true));
     const failure = new Error("write EPIPE");
     vi.spyOn(stdin, "write").mockImplementation(
@@ -194,7 +193,6 @@ describe("createMcpStdioClient", () => {
       message: "unavailable: proxy write failed",
       cause: failure,
     });
-    expect(client.isAvailable()).toBe(false);
-    expect(child.kill).toHaveBeenCalledExactlyOnceWith("SIGTERM");
+    expectRetired(fixture);
   });
 });
