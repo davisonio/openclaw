@@ -106,7 +106,7 @@ describe("cross-region Home composer ownership", () => {
     current.chatQueue = [];
     const persistence = new ChatComposerPersistence(() => current);
     const controller = createChatState<ChatPageHost>({
-      requestUpdate: () => {},
+      invalidate: () => {},
       updateComplete: Promise.resolve(true),
     });
     current.canRestoreComposer = () => persistence.active;

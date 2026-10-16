@@ -163,7 +163,7 @@ describe("chat pane first-turn attachment lifecycle", () => {
     });
 
     try {
-      expect(() => getPaneTestRuntime(pane).connectedCallback()).toThrow(stopAfterAttach);
+      expect(() => getPaneTestRuntime(pane).start()).toThrow(stopAfterAttach);
       expect(attachedState?.client).toBe(client);
       expect(attachedState?.chatMessages).toEqual([
         expect.objectContaining({
@@ -222,7 +222,7 @@ describe("chat pane initial panel layout", () => {
         expect(pane.state.sidebarFocusPanelId).toBe(preference === "absent" ? "" : "detail");
       };
       try {
-        expect(() => getPaneTestRuntime(pane).connectedCallback()).toThrow(stopAfterAttach);
+        expect(() => getPaneTestRuntime(pane).start()).toThrow(stopAfterAttach);
         expectOwnLayout();
         pane.applyGatewaySnapshot({ ...context.gateway.snapshot, phase: "reconnecting" });
         expectOwnLayout();

@@ -84,7 +84,7 @@ function mountPane(
   vi.spyOn(pane.chatState, "attach").mockImplementation(() => {
     throw attached;
   });
-  expect(() => getPaneTestRuntime(pane).connectedCallback()).toThrow(attached);
+  expect(() => getPaneTestRuntime(pane).start()).toThrow(attached);
   const state = pane.state;
   const liveResult = {
     messages: liveMessages,

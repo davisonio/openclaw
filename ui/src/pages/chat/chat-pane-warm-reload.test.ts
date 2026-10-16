@@ -161,7 +161,7 @@ describe("chat pane warm reload", () => {
       let view: ReturnType<typeof mountChatThread> | undefined;
 
       try {
-        expect(() => getPaneTestRuntime(pane).connectedCallback()).toThrow(attached);
+        expect(() => getPaneTestRuntime(pane).start()).toThrow(attached);
         await loadChatHistory(pane.state, { startup: true });
         await read.mock.results[0]?.value;
         expect(pane.state.chatMessages).toEqual(priorProjection ? [] : messages);

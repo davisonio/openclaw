@@ -2,14 +2,23 @@ import { render as renderSolid } from "@solidjs/web";
 import { createComponent } from "solid-js";
 import { vi } from "vitest";
 import type { ApplicationContext } from "../../app/context.ts";
-import { ChatPaneBase } from "./chat-pane-base.ts";
 import type { ChatPaneRuntime } from "./chat-pane-render.ts";
 import { ChatPaneRuntimeView } from "./chat-pane-runtime-view.tsx";
+import { ChatPaneStateOwner } from "./chat-pane-state-owner.ts";
+import type { ChatPaneProps } from "./chat-pane.tsx";
 
 export type PaneRuntimeConstructor<R extends ChatPaneRuntime> = new (
   element: HTMLElement,
   context: ApplicationContext,
 ) => R;
+
+export type PaneTestLifecycle = {
+  requestUpdate(): void;
+  prepareRender(): void;
+  commitRender(): void;
+  connectedCallback(): void;
+  disconnectedCallback(): void;
+};
 
 const paneTestRuntimes = new WeakMap<HTMLElement, ChatPaneRuntime>();
 
@@ -18,7 +27,7 @@ export function createPaneTestHost<R extends ChatPaneRuntime>(
   tag: string,
   Runtime: PaneRuntimeConstructor<R>,
   createContext: () => ApplicationContext,
-): R & HTMLElement {
+): R & HTMLElement & PaneTestLifecycle {
   if (!customElements.get(tag)) {
     customElements.define(
       tag,
@@ -44,7 +53,7 @@ export function createPaneTestHost<R extends ChatPaneRuntime>(
             this.dispose();
             this.dispose = undefined;
           } else {
-            this.runtime.disconnectedCallback();
+            this.runtime.dispose();
           }
         }
       },
@@ -54,10 +63,68 @@ export function createPaneTestHost<R extends ChatPaneRuntime>(
   const runtime = paneTestRuntimes.get(element)!;
   const bound = new WeakMap<object, unknown>();
   const lifecycle = new Set(["connectedCallback", "disconnectedCallback"]);
+  // Direct fixture assignments stand in for the bridge's explicit invalidation.
+  const inputs = new Set<string>([
+    "mcpAppLaunch",
+    "paneId",
+    "paneLabel",
+    "presentationId",
+    "chatMessagesBySession",
+    "sessionSnapshotStore",
+    "sessionKey",
+    "routeLoadingSkeleton",
+    "agentId",
+    "inputRegion",
+    "compact",
+    "onBackToSubagents",
+    "workContext",
+    "draft",
+    "focusComposer",
+    "dashboardExpanded",
+    "routeFace",
+    "onFaceChange",
+    "onFocusPane",
+    "onSessionDeleted",
+    "narrow",
+    "mergedChrome",
+    "navDrawerOpen",
+    "onboarding",
+    "onOpenSplitView",
+    "onSplitDown",
+    "onSplitRight",
+    "onClosePane",
+    "boardProvider",
+  ] satisfies (keyof ChatPaneProps)[]);
+  const runtimeKey = (key: string | symbol) => (key === "requestUpdate" ? "invalidate" : key);
   const owner = (key: PropertyKey) =>
     !lifecycle.has(String(key)) && (key in runtime || !(key in element)) ? runtime : element;
   const pane = new Proxy(element, {
     get(_target, key) {
+      if (key === "willUpdate") {
+        return (changes: Map<PropertyKey, unknown>) =>
+          runtime.synchronizeInputs({
+            sessionKey: changes.has("sessionKey"),
+            inputRegion: changes.has("inputRegion"),
+            draft: changes.has("draft"),
+          });
+      }
+      if (key === "updated") {
+        return (changes?: Map<PropertyKey, unknown>) =>
+          runtime.afterRender(changes?.has("focusComposer") ?? false);
+      }
+      if (key === "prepareRender") {
+        return () => {
+          runtime.chatState.prepareRender();
+          runtime.synchronizeInputs({});
+        };
+      }
+      if (key === "commitRender") {
+        return () => {
+          runtime.afterRender(false);
+          runtime.chatState.commitRender();
+        };
+      }
+      key = runtimeKey(key);
       const source = owner(key);
       const value: unknown = Reflect.get(source, key);
       if (typeof value !== "function" || vi.isMockFunction(value)) {
@@ -69,15 +136,25 @@ export function createPaneTestHost<R extends ChatPaneRuntime>(
       return bound.get(value);
     },
     set(_target, key, value) {
-      return Reflect.set(owner(key), key, value);
+      key = runtimeKey(key);
+      const source = owner(key);
+      const previous = Reflect.get(source, key);
+      const applied = Reflect.set(source, key, value);
+      if (applied && inputs.has(String(key)) && !Object.is(previous, value)) {
+        runtime.invalidate();
+      }
+      return applied;
     },
     defineProperty(_target, key, descriptor) {
+      key = runtimeKey(key);
       return Reflect.defineProperty(owner(key), key, descriptor);
     },
     deleteProperty(_target, key) {
+      key = runtimeKey(key);
       return Reflect.deleteProperty(owner(key), key);
     },
     getOwnPropertyDescriptor(_target, key) {
+      key = runtimeKey(key);
       const source = owner(key);
       for (let current: object | null = source; current; current = Object.getPrototypeOf(current)) {
         const descriptor = Object.getOwnPropertyDescriptor(current, key);
@@ -88,11 +165,12 @@ export function createPaneTestHost<R extends ChatPaneRuntime>(
       return undefined;
     },
     has(_target, key) {
+      key = runtimeKey(key);
       return key in runtime || key in element;
     },
   });
   // SAFETY: This test adapter forwards controller members and native DOM access to their owners.
-  return pane as R & HTMLElement;
+  return pane as R & HTMLElement & PaneTestLifecycle;
 }
 
 export function getPaneTestRuntime(pane: { element: HTMLElement }): ChatPaneRuntime {
@@ -102,8 +180,8 @@ export function getPaneTestRuntime(pane: { element: HTMLElement }): ChatPaneRunt
 /** Render-cadence tests use the real view with only its base connection lifecycle. */
 export function connectPaneTestView(pane: { element: HTMLElement }) {
   const runtime = getPaneTestRuntime(pane);
-  runtime.connectedCallback = () => ChatPaneBase.prototype.connectedCallback.call(runtime);
-  runtime.disconnectedCallback = () => ChatPaneBase.prototype.disconnectedCallback.call(runtime);
+  runtime.start = () => ChatPaneStateOwner.prototype.start.call(runtime);
+  runtime.dispose = () => ChatPaneStateOwner.prototype.dispose.call(runtime);
   const connect: unknown = Reflect.get(pane.element, "connectedCallback");
   if (typeof connect === "function") {
     connect.call(pane.element);
