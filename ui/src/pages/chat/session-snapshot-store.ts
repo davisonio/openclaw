@@ -1,3 +1,4 @@
+import { readSessionMessageSequence } from "@openclaw/gateway-client/browser";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
@@ -13,6 +14,7 @@ import {
 } from "./session-cache.ts";
 import {
   MAX_CACHED_CHAT_WEIGHT,
+  capSnapshotPagination,
   type ChatCacheObserver,
   type ChatMessageCache,
   type ChatSessionSnapshot,
@@ -40,7 +42,8 @@ import {
   consumePrewarmedChatSnapshot,
   discardPrewarmedChatSnapshot,
 } from "./session-snapshot-prewarm.ts";
-const CHAT_SNAPSHOT_PROJECTION_VERSION = 2;
+const CHAT_SNAPSHOT_PROJECTION_VERSION = 3;
+const CHAT_SNAPSHOT_MESSAGE_LIMIT = 80;
 const CHAT_SNAPSHOT_WRITE_DELAY_MS = 500;
 const CHAT_SNAPSHOT_IDLE_TIMEOUT_MS = 1000;
 
@@ -152,10 +155,38 @@ function createSnapshotRecord(
   let snapshot: ChatSessionSnapshot;
   let weight: number;
   try {
+    let projected = pending.snapshot;
+    const messages = projected.messages;
+    let start = Math.max(0, messages.length - CHAT_SNAPSHOT_MESSAGE_LIMIT);
+    // A history entry can project multiple rows; retain its whole sequence group.
+    while (start > 0) {
+      const seq = readSessionMessageSequence(messages[start]);
+      if (seq === null || seq !== readSessionMessageSequence(messages[start - 1])) {
+        break;
+      }
+      start--;
+    }
+    if (start > 0) {
+      const pagination = capSnapshotPagination(projected.pagination, messages, start);
+      if (!pagination) {
+        return null;
+      }
+      projected = { ...projected, messages: messages.slice(start), pagination };
+    }
     // Pairing credentials stay in the live projection, never the browser's disk cache.
-    const json = JSON.stringify(pending.snapshot, (_key, value: unknown) =>
-      removePairingQrContent(value),
-    );
+    const json = JSON.stringify(projected, (_key, value: unknown) => {
+      if (value === projected.messages) {
+        return projected.messages.map((message) => {
+          const record = asOptionalRecord(message);
+          if (!record || !Object.hasOwn(record, "openclawResponsesInputReplay")) {
+            return message;
+          }
+          const { openclawResponsesInputReplay: _replay, ...display } = record;
+          return display;
+        });
+      }
+      return removePairingQrContent(value);
+    });
     snapshot = JSON.parse(json);
     weight = json.length;
   } catch {
@@ -438,13 +469,7 @@ export class SessionSnapshotStore implements ChatCacheObserver {
       await resetSessionSnapshotDatabase();
       return null;
     }
-    let snapshot = record.snapshot;
-    const messages = snapshot.messages.map(removePairingQrContent);
-    if (messages.some((message, index) => message !== snapshot.messages[index])) {
-      snapshot = { ...snapshot, messages };
-      // Older writers persisted live QR credentials; repair through the normal write owner.
-      this.write(sessionKey, snapshot);
-    }
+    const snapshot = record.snapshot;
     setSessionCacheValue(this.hydratedSnapshots, sessionKey, new WeakRef(snapshot));
     return snapshot;
   }
