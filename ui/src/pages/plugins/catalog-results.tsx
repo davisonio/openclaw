@@ -5,12 +5,7 @@ import { Icon } from "../../components/solid/icon.tsx";
 import { PanelEmptyState } from "../../components/solid/panel-empty-state.tsx";
 import { formatUiExternalText } from "../../lib/format-error.ts";
 import { shouldHandleNavigationClick } from "../../lib/navigation-click.ts";
-import type {
-  PluginDiscoveryCategory,
-  PluginDiscoveryEntry,
-  PluginDiscoveryResult,
-  PluginInstallRequest,
-} from "../../lib/plugins/index.ts";
+import type { PluginDiscoveryEntry, PluginInstallRequest } from "../../lib/plugins/index.ts";
 import { t } from "../../lib/reactive/i18n.ts";
 import { PluginCatalogSkeleton, renderCatalogGridSkeleton } from "./catalog-skeleton.tsx";
 import { PluginArtTile } from "./consent-dialog.tsx";
@@ -18,33 +13,19 @@ import { PluginInstallAction } from "./install-action.tsx";
 import type { PluginInstallProgress } from "./install-progress.ts";
 import {
   renderPluginAuthor,
-  renderPluginCardSummary,
+  PluginCardSummary,
   renderPluginOfficialBadge,
   renderPluginStateStatus,
 } from "./plugin-card.tsx";
+import type { PluginDiscoveryIntent, PluginDiscoveryState } from "./plugin-discovery.ts";
 import { renderPluginRowMessage, type PluginRowMessage } from "./plugin-row-message.tsx";
 import type { PluginMutationAction } from "./plugins-page-model.ts";
 import { resolvePluginCatalogIconUrl } from "./presentation.ts";
 
-export type PluginDiscoveryIntent = "all" | "bundled" | "trending" | "official" | "featured";
-
-export type PluginCatalogResultsProps = {
+export type PluginCatalogResultsProps = PluginDiscoveryState & {
+  registerIcon?: (readId: () => string) => () => void;
   connected: boolean;
-  loading: boolean;
-  result: PluginDiscoveryResult | null;
-  error: string | null;
-  remoteError: string | null;
-  categories: readonly PluginDiscoveryCategory[];
-  categoriesLoading: boolean;
-  categoriesError: string | null;
   onRetryCategories: () => void;
-  featured: readonly PluginDiscoveryEntry[];
-  trending: readonly PluginDiscoveryEntry[];
-  loadingMore: boolean;
-  loadMoreError: string | null;
-  intent: PluginDiscoveryIntent;
-  category: string | null;
-  query: string;
   iconUrls: Readonly<Record<string, string>>;
   pluginIconUrls: Readonly<Record<string, string>>;
   iconLoading?: (url: string) => boolean;
@@ -198,16 +179,18 @@ function CatalogIcon(props: {
   plugin: PluginDiscoveryEntry;
   state: PluginCatalogResultsProps;
 }): JSX.Element {
-  const iconUrl = () =>
+  const iconUrl = createMemo(() =>
     resolvePluginCatalogIconUrl(
       {
         pluginId: props.plugin.local.pluginId,
         imageUrl: props.plugin.catalog.imageUrl,
       },
       props.state,
-    );
+    ),
+  );
   return (
     <PluginArtTile
+      registerIcon={props.state.registerIcon}
       slug={props.plugin.local.pluginId ?? props.plugin.id}
       name={props.plugin.catalog.name}
       iconUrl={iconUrl() ?? undefined}
@@ -296,7 +279,9 @@ function CatalogCard(props: {
           )}
         </div>
       </div>
-      {renderPluginCardSummary(props.plugin.catalog.summary || t("pluginsPage.optionalCapability"))}
+      <PluginCardSummary
+        summary={props.plugin.catalog.summary || t("pluginsPage.optionalCapability")}
+      />
       {renderPluginRowMessage(props.state.messages?.[`install:${props.plugin.id}`], {
         busy: busy(),
         onContinue:

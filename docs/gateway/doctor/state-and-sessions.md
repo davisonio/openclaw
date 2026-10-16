@@ -9,6 +9,19 @@ read_when:
 Checks 3-7b cover legacy on-disk state migrations, session integrity, model
 auth health, sandbox images, and plugin installs.
 
+## Legacy data and PostgreSQL
+
+Run `openclaw doctor --fix` before porting SQLite stores to PostgreSQL. Port
+preflight names any pending declared legacy migrations and refuses until they
+are complete. This covers native Codex task assignments, Matrix inbound dedupe,
+and legacy memory index sidecars.
+
+For families already using PostgreSQL, Doctor records an intentional non-outcome
+for these SQLite-only migrations and leaves the engine anchor alone. Legacy
+memory sidecars remain unchanged; normal reindexing uses the authoritative
+memory sources to rebuild the PostgreSQL index and may re-embed them. See
+[Database engines](/reference/database-engines#legacy-data-and-postgresql).
+
 ## Checks 3-7b
 
 <AccordionGroup>
@@ -183,7 +196,7 @@ auth health, sandbox images, and plugin installs.
 
     Doctor also reports auth profiles that are temporarily unusable due to short cooldowns (rate limits/timeouts/auth failures) or longer disables (billing/credit failures).
 
-    Doctor also imports legacy generated provider catalogs (`plugins/*/catalog.json` and retained migration claims) into agent SQLite while preserving provider credentials. Run `openclaw doctor --fix` to import these catalogs or repair persisted generated models whose transport API cannot be derived. Ordinary model loading reads stored SQLite catalogs without importing sidecars or repairing saved rows. Initial disk discovery and explicit registry refresh report legacy catalogs with a Doctor command; hot model lookups and lifecycle-captured catalogs do not inspect legacy files. Newly generated catalogs are still normalized before publication.
+    Doctor also imports legacy generated provider catalogs (`plugins/*/catalog.json` and retained migration claims) into agent SQLite while preserving provider credentials. Run `openclaw doctor --fix` to import these catalogs, remove generated model rows whose transport API cannot be derived, or complete missing numeric cost rates with zero. Supplied rates and pricing metadata are preserved; null or non-numeric costs still need correction at the provider source followed by a catalog refresh. Ordinary model loading reads stored SQLite catalogs without importing sidecars or repairing saved rows. Initial disk discovery and explicit registry refresh report legacy catalogs with a Doctor command; hot model lookups and lifecycle-captured catalogs do not inspect legacy files. Newly generated catalogs are still normalized before publication.
 
     OAuth credential sidecar imports are retired. Doctor leaves their files and encryption keys untouched. When a legacy `auth-profiles.json` still references a sidecar, Doctor refuses the migration: upgrade through `2026.9.7` and run `openclaw doctor --fix` from an interactive terminal on the original host before retrying; that release can recover the historical key and import the credentials. Unreferenced sidecars stay in place without blocking. See [retention policy](/gateway/doctor/config-migrations#retention-policy).
 
