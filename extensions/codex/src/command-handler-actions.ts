@@ -296,7 +296,7 @@ export async function handleNativeGoal(
         { threadId: binding.threadId },
         { ...goalRequestOptions, assertOwnerCurrent: () => assertCodexHostOwnerCurrent(ctx) },
       );
-      return isJsonObject(response) && response.cleared === true
+      return isJsonObject(response) && response.cleared
         ? "Cleared the Codex goal."
         : "No Codex goal was active.";
     }
