@@ -31,7 +31,7 @@ const delivery = vi.hoisted(() => ({
   afterResult: undefined as (() => void) | undefined,
   settlement: undefined as Promise<SqliteWorkerOperationSettlement> | undefined,
   hideCommit: false,
-  appendSizes: [] as number[],
+  appendCalls: 0,
 }));
 vi.mock("../state/openclaw-agent-execution.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../state/openclaw-agent-execution.js")>();
@@ -68,7 +68,7 @@ vi.mock("../state/openclaw-agent-execution.js", async (importOriginal) => {
               operation({
                 execute: async (command, commandOptions) => {
                   if (command.type === "trajectory.events.append") {
-                    delivery.appendSizes.push(command.input.events.length);
+                    delivery.appendCalls += 1;
                     const before = delivery.beforeAppend;
                     delivery.beforeAppend = undefined;
                     await before?.();
@@ -145,7 +145,7 @@ afterEach(() => {
   delivery.afterResult = undefined;
   delivery.settlement = undefined;
   delivery.hideCommit = false;
-  delivery.appendSizes = [];
+  delivery.appendCalls = 0;
   vi.restoreAllMocks();
 });
 
@@ -225,7 +225,7 @@ it("keeps a large eight-event turn in one append across writer yields", async ()
       }
     }
     await sink.flush();
-    expect(delivery.appendSizes).toEqual([8]);
+    expect(delivery.appendCalls).toBe(1);
     expect(
       (await loadSqliteTrajectoryRuntimeEvents(target)).map((event) => JSON.stringify(event)),
     ).toEqual(lines);
