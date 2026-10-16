@@ -30,7 +30,7 @@ import {
 import { AppSidebarBase } from "./app-sidebar-base.ts";
 import {
   personalSidebarZone,
-  SidebarPinnedSessions,
+  createSidebarPinnedSessions,
   personalSidebarOwnerProjection,
   personalSidebarOwnerFilterId,
   projectUnpinnedSessionRows,
@@ -144,7 +144,7 @@ export abstract class AppSidebarSessionNavigationElement extends AppSidebarBase 
 
   sessionSortMode: SidebarSessionSortMode = loadStoredSidebarSessionSortMode();
 
-  readonly pinnedSessions = new SidebarPinnedSessions(this);
+  readonly pinnedSessions = createSidebarPinnedSessions(this);
   readonly sessionProjection = new SidebarSessionProjection();
   private readonly navigationMemo = new SidebarProjectionMemo<SidebarSessionNavigationState>();
   private readonly rowsMemo = new SidebarProjectionMemo<SidebarRecentSession[]>();
