@@ -93,7 +93,7 @@ describe("composer queue", () => {
           presented: () => true,
           read: () => queue,
         });
-        invalidate = lifecycle.invalidate;
+        invalidate = () => lifecycle.invalidate();
         return createComponent(renderChatQueueSolid, {
           get queue() {
             return lifecycle.snapshot();

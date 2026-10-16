@@ -123,7 +123,6 @@ describe("chat pane warm reload", () => {
         ChatPaneRuntime,
       ) as unknown as TestChatPane;
       vi.spyOn(pane, "requestUpdate").mockImplementation(() => undefined);
-      vi.spyOn(pane, "performUpdate").mockImplementation(() => undefined);
       const context = createInitializationContext(
         createGatewayBrowserClientFixture({
           offlineRecoveryScope: "test-recovery-scope",

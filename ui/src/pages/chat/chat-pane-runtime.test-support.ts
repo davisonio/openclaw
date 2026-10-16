@@ -134,9 +134,9 @@ export function createPaneTestHost<R extends ChatPaneRuntime>(
           runtime.chatState.commitRender();
         };
       }
-      key = runtimeKey(key);
-      const source = owner(key);
-      const value: unknown = Reflect.get(source, key);
+      const mappedKey = runtimeKey(key);
+      const source = owner(mappedKey);
+      const value: unknown = Reflect.get(source, mappedKey);
       if (typeof value !== "function" || vi.isMockFunction(value)) {
         return value;
       }
@@ -146,28 +146,28 @@ export function createPaneTestHost<R extends ChatPaneRuntime>(
       return bound.get(value);
     },
     set(_target, key, value) {
-      key = runtimeKey(key);
-      const source = owner(key);
-      const previous = Reflect.get(source, key);
-      const applied = Reflect.set(source, key, value);
-      if (applied && inputs.has(String(key)) && !Object.is(previous, value)) {
+      const mappedKey = runtimeKey(key);
+      const source = owner(mappedKey);
+      const previous = Reflect.get(source, mappedKey);
+      const applied = Reflect.set(source, mappedKey, value);
+      if (applied && inputs.has(String(mappedKey)) && !Object.is(previous, value)) {
         runtime.invalidate();
       }
       return applied;
     },
     defineProperty(_target, key, descriptor) {
-      key = runtimeKey(key);
-      return Reflect.defineProperty(owner(key), key, descriptor);
+      const mappedKey = runtimeKey(key);
+      return Reflect.defineProperty(owner(mappedKey), mappedKey, descriptor);
     },
     deleteProperty(_target, key) {
-      key = runtimeKey(key);
-      return Reflect.deleteProperty(owner(key), key);
+      const mappedKey = runtimeKey(key);
+      return Reflect.deleteProperty(owner(mappedKey), mappedKey);
     },
     getOwnPropertyDescriptor(_target, key) {
-      key = runtimeKey(key);
-      const source = owner(key);
+      const mappedKey = runtimeKey(key);
+      const source = owner(mappedKey);
       for (let current: object | null = source; current; current = Object.getPrototypeOf(current)) {
-        const descriptor = Object.getOwnPropertyDescriptor(current, key);
+        const descriptor = Object.getOwnPropertyDescriptor(current, mappedKey);
         if (descriptor) {
           return { ...descriptor, configurable: true };
         }
@@ -175,8 +175,8 @@ export function createPaneTestHost<R extends ChatPaneRuntime>(
       return undefined;
     },
     has(_target, key) {
-      key = runtimeKey(key);
-      return key in runtime || key in element;
+      const mappedKey = runtimeKey(key);
+      return mappedKey in runtime || mappedKey in element;
     },
   });
   // SAFETY: This test adapter forwards controller members and native DOM access to their owners.

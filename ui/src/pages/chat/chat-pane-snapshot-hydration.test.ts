@@ -55,7 +55,6 @@ describe("stored chat snapshot hydration", () => {
       ChatPaneRuntime,
     ) as unknown as TestChatPane;
     vi.spyOn(pane, "requestUpdate").mockImplementation(() => undefined);
-    vi.spyOn(pane, "performUpdate").mockImplementation(() => undefined);
     pane.sessionKey = targetSessionKey;
     pane.chatMessagesBySession = sharedMessages;
     pane.context = createInitializationContext(
@@ -383,7 +382,6 @@ describe("stored chat snapshot hydration", () => {
       ChatPaneRuntime,
     ) as unknown as TestChatPane;
     vi.spyOn(pane, "requestUpdate").mockImplementation(() => undefined);
-    vi.spyOn(pane, "performUpdate").mockImplementation(() => undefined);
     pane.sessionKey = targetSessionKey;
     const sharedMessages: ChatMessageCache = new Map();
     pane.chatMessagesBySession = sharedMessages;
