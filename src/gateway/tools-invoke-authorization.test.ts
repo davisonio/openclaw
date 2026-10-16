@@ -2,6 +2,7 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { Type } from "typebox";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AnyAgentTool } from "../agents/tools/common.js";
+import { captureRuntimeConfigAsyncReader } from "../config/io.runtime.js";
 import { upsertSessionEntryCore } from "../config/sessions/session-accessor.js";
 import { memorySessionActorOwners } from "../config/sessions/session-actor-memory-owner.js";
 import { addSessionMember, removeSessionMember } from "../config/sessions/session-sharing-store.js";
@@ -191,6 +192,7 @@ describe.each(["HTTP", "WebSocket"] as const)(
     it.each(cases)("$label", async (testCase) => {
       const stateOptions = { label: "standalone-tool-role", prepareProfileCatalog: true };
       await withOpenClawTestState(stateOptions, async () => {
+        await captureRuntimeConfigAsyncReader()();
         const email = "standalone-operator@example.test";
         const profile = ensureProfileForEmail(email);
         using _ = { [Symbol.dispose]: (await prepareUserProfileCatalog()).release };
@@ -340,6 +342,7 @@ it.each([
   "keeps the result boundary for %s (%s, revoked=%s)",
   async (action, deliveryStatus, revokeCaller, expectedStatus) => {
     await withOpenClawTestState({ label: "standalone-tool-creation" }, async () => {
+      await captureRuntimeConfigAsyncReader()();
       const sessionKey = "agent:main:outbound-first-contact";
       let callerCurrent = true;
       runtime.cfg = { agents: { entries: { main: {} } } };

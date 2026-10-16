@@ -10,6 +10,7 @@ import {
 import type { runBeforeToolCallHook as runBeforeToolCallHookType } from "../agents/agent-tools.before-tool-call.js";
 import type { OpenClawToolsOptions } from "../agents/openclaw-tools.types.js";
 import type { AnyAgentTool } from "../agents/tools/common.js";
+import { captureRuntimeConfigAsyncReader } from "../config/io.runtime.js";
 import { upsertSessionEntryCore } from "../config/sessions/session-accessor.js";
 import { withPluginRuntimeGatewayRequestScope } from "../plugins/runtime/gateway-request-scope.js";
 import { prepareUserProfileCatalog } from "../state/user-profile-list.js";
@@ -556,6 +557,7 @@ describe("POST /tools/invoke", () => {
     async ({ toolName, withProfile }) => {
       const profileState = { label: "tools-invoke-system-authority", prepareProfileCatalog: true };
       await withOpenClawTestState(profileState, async () => {
+        await captureRuntimeConfigAsyncReader()();
         const owner = ensureGatewayOwnerProfile("Gateway Owner");
         const sessionKey = "agent:main:sysauth-primary";
         const entry = {
@@ -607,6 +609,7 @@ describe("POST /tools/invoke", () => {
   it("rejects a nested sessions_send target that the operator cannot mutate", async () => {
     const profileState = { label: "tools-invoke-foreign-session", prepareProfileCatalog: true };
     await withOpenClawTestState(profileState, async () => {
+      await captureRuntimeConfigAsyncReader()();
       const owner = ensureProfileForEmail("owner@example.test");
       const guest = ensureProfileForEmail("guest@example.test");
       using _ = { [Symbol.dispose]: (await prepareUserProfileCatalog()).release };
@@ -668,6 +671,7 @@ describe("POST /tools/invoke", () => {
       prepareProfileCatalog: true,
     };
     await withOpenClawTestState(profileState, async () => {
+      await captureRuntimeConfigAsyncReader()();
       const owner = ensureProfileForEmail("owner@example.test");
       ensureProfileForEmail("guest@example.test");
       using _ = { [Symbol.dispose]: (await prepareUserProfileCatalog()).release };
@@ -907,6 +911,7 @@ describe("POST /tools/invoke", () => {
       prepareProfileCatalog: true,
     };
     await withOpenClawTestState(profileState, async () => {
+      await captureRuntimeConfigAsyncReader()();
       const owner = ensureProfileForEmail("role-owner@example.test");
       const sessionKey = "agent:main:shared-secret-owner-session";
       const entry = {
