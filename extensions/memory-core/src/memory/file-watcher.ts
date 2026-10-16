@@ -86,7 +86,7 @@ function sharedSelectionKey(members: Iterable<ObservationMember>): string {
   return JSON.stringify(
     [
       ...new Set([...members].flatMap((member) => member.policy.selectionKeys(member.group))),
-    ].sort(),
+    ].toSorted(),
   );
 }
 

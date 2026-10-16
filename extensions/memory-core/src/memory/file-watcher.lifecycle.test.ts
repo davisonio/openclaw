@@ -189,13 +189,13 @@ describe("Memory observation lifecycle", () => {
     const peer = owner(undefined, 0, [], { agentId: "peer", images: peerImages });
     await peer.watcher.start();
     expect(observer.observations).toHaveLength(1);
-    expect(entry.subscription.setScopes).not.toHaveBeenCalled();
+    expect(entry.setScopes).not.toHaveBeenCalled();
     expect(first.onDirty).not.toHaveBeenCalled();
     expect(peer.onDirty).toHaveBeenCalledOnce();
     expect(peer.watcher.health()[0]?.state).toBe("ready");
 
     await peer.watcher.close();
-    expect(entry.subscription.setScopes).not.toHaveBeenCalled();
+    expect(entry.setScopes).not.toHaveBeenCalled();
     expect(entry.close).not.toHaveBeenCalled();
     entry.dirty();
     expect(first.onDirty).toHaveBeenCalledOnce();
@@ -215,13 +215,13 @@ describe("Memory observation lifecycle", () => {
     const media = owner(undefined, 0, [], { agentId: "media", images: true });
     await media.watcher.start();
     expect(entry.options.scopes).toEqual(scopes);
-    expect(entry.subscription.setScopes).toHaveBeenCalledOnce();
+    expect(entry.setScopes).toHaveBeenCalledOnce();
     expect(entry.options.exclude?.(image)).toBe(false);
     entry.dirty([{ path: image.path, type: "content" }]);
     expect(text.onDirty).not.toHaveBeenCalled();
     expect(media.onDirty).toHaveBeenCalledOnce();
     await media.watcher.close();
-    expect(entry.subscription.setScopes).toHaveBeenCalledTimes(2);
+    expect(entry.setScopes).toHaveBeenCalledTimes(2);
     expect(entry.options.exclude?.(image)).toBe(true);
   });
 
@@ -359,7 +359,7 @@ describe("Memory observation lifecycle", () => {
       (observation) => observation.root.rootDir === path.dirname(notes),
     )!;
     expect(observer.observations).toHaveLength(2);
-    expect(entry.subscription.setScopes).toHaveBeenCalledOnce();
+    expect(entry.setScopes).toHaveBeenCalledOnce();
     expect(entry.options.scopes.map((scope) => scope.path).toSorted()).toEqual(["images", "notes"]);
     const image = { path: "notes/photo.png", kind: "file" as const };
     expect(entry.options.exclude?.(image)).toBe(false);
@@ -372,7 +372,7 @@ describe("Memory observation lifecycle", () => {
     expect(text.onDirty).toHaveBeenCalledOnce();
     expect(media.onDirty).toHaveBeenCalledTimes(4);
     await media.watcher.close();
-    expect(entry.subscription.setScopes).toHaveBeenCalledTimes(2);
+    expect(entry.setScopes).toHaveBeenCalledTimes(2);
     expect(entry.options.exclude?.(image)).toBe(true);
     expect(entry.close).not.toHaveBeenCalled();
   });
