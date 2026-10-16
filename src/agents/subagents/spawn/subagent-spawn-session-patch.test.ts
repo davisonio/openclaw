@@ -9,6 +9,7 @@ import {
 import { writeSessionEntry } from "../../../config/sessions/session-accessor.sqlite-entry-store.js";
 import { replaceTranscriptEvents } from "../../../config/sessions/session-accessor.sqlite-transcript-write.test-support.js";
 import * as sessionStorePaths from "../../../config/sessions/session-store-path.js";
+import type { SessionEntry } from "../../../config/sessions/types.js";
 import {
   bindInProcessSessionRun,
   takeInProcessFreshChildSession,
@@ -273,13 +274,14 @@ it("inherits admitted skill pins without overwriting a parent refresh", async ()
       skillLibrarySelections,
     });
     // The parent's own turn keeps writing its row while the child is prepared.
-    const prepare = writeParentDuringChildPrepare(childSessionKey, () =>
-      upsertSessionEntryCore(scope, {
+    let refreshedParent: SessionEntry | null = null;
+    const prepare = writeParentDuringChildPrepare(childSessionKey, async () => {
+      refreshedParent = await upsertSessionEntryCore(scope, {
         updatedAt: 2,
         totalTokens: 10,
         skillLibrarySelections: [],
-      }),
-    );
+      });
+    });
     try {
       const result = await createFromParent(
         lineageSpawnParams(sessionKey, childSessionKey, {
@@ -294,11 +296,11 @@ it("inherits admitted skill pins without overwriting a parent refresh", async ()
         spawnedBySenderIsOwner: true,
         skillLibrarySelections,
       });
-      expect(loadSessionEntry(scope)).toMatchObject({
-        updatedAt: 2,
+      expect(refreshedParent).toMatchObject({
         totalTokens: 10,
         skillLibrarySelections: [],
       });
+      expect(loadSessionEntry(scope)).toEqual(refreshedParent);
     } finally {
       prepare.mockRestore();
     }
