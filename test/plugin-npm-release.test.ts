@@ -23,20 +23,9 @@ import { createDeferred } from "./helpers/promise.js";
 import { writePublishablePluginFixture } from "./helpers/publishable-plugin-fixture.js";
 import { cleanupTempDirs, makeTempDir as makeTempRepoRoot } from "./helpers/temp-dir.js";
 
-type ExecFileSync = typeof execFileSync;
-const childProcessMock = vi.hoisted(() => ({
-  execFileSyncOverride: undefined as ExecFileSync | undefined,
-}));
-
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
-  const mockedExecFileSync = ((...args: unknown[]) => {
-    const implementation = (childProcessMock.execFileSyncOverride ?? actual.execFileSync) as (
-      ...args: unknown[]
-    ) => unknown;
-    return implementation(...args);
-  }) as ExecFileSync;
-  return { ...actual, execFileSync: mockedExecFileSync };
+  return { ...actual, execFileSync: vi.fn(actual.execFileSync) };
 });
 
 const tempDirs: string[] = [];
@@ -50,10 +39,8 @@ const makePlugin = (extensionId: string): PublishablePluginPackage => ({
   channel: "stable",
   publishTag: "latest",
 });
-const allPublishable = () => [
-  ...collectPublishablePluginPackages(),
-  ...collectClawHubPublishablePluginPackages(),
-];
+const allPublishable = () =>
+  collectPublishablePluginPackages().concat(collectClawHubPublishablePluginPackages());
 const readPackage = (packageDir: string): PluginPackageJson =>
   JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8"));
 const isExternal = (pluginId: string, packageJson: PluginPackageJson) =>
@@ -64,7 +51,7 @@ const isExternal = (pluginId: string, packageJson: PluginPackageJson) =>
   });
 
 afterEach(() => {
-  childProcessMock.execFileSyncOverride = undefined;
+  vi.mocked(execFileSync).mockReset();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   cleanupTempDirs(tempDirs);
@@ -79,14 +66,13 @@ it("requires the external plugin package compatibility contract for npm publish"
   const packageJson = readPackage(packageDir);
   delete packageJson.openclaw?.compat;
   delete packageJson.openclaw?.build;
-  expect(
-    collectPublishablePluginPackageErrors({
-      extensionId,
-      packageDir,
-      readmeText: "# Voice call\n",
-      packageJson,
-    }),
-  ).toEqual([
+  const errors = collectPublishablePluginPackageErrors({
+    extensionId,
+    packageDir,
+    readmeText: "# Voice call\n",
+    packageJson,
+  });
+  expect(errors).toEqual([
     "openclaw.compat.pluginApi is required for external code plugin packages.",
     "openclaw.build.openclawVersion is required for external code plugin packages.",
   ]);
@@ -98,10 +84,9 @@ it("warns once per stale dependency without blocking or inspecting Git", () => {
     requiredLatestDependencies: [{ packageName: "@openai/codex", version: "0.139.0" }],
   };
   const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-  const git = vi.fn(() => {
+  const git = vi.mocked(execFileSync).mockImplementation(() => {
     throw new Error("not a Git checkout");
   });
-  childProcessMock.execFileSyncOverride = git as unknown as ExecFileSync;
   const resolveLatest = vi.fn(() => "0.153.0");
   const warnings = assertPluginReleaseDependencyFreshness(
     [plugin, { ...plugin, packageName: "@openclaw/another-harness" }],
@@ -235,28 +220,21 @@ it("keeps deferred publication targets bundled with staged release metadata", ()
 
 it("rejects duplicate selected package provenance instead of choosing the last entry", () => {
   const firstPlugin = makePlugin("feishu");
+  const plugins = [
+    firstPlugin,
+    { ...firstPlugin, extensionId: "feishu-shadow", packageDir: "extensions/feishu-shadow" },
+  ];
   expect(() =>
-    resolveSelectedPublishablePluginPackages({
-      plugins: [
-        firstPlugin,
-        {
-          ...firstPlugin,
-          extensionId: "feishu-shadow",
-          packageDir: "extensions/feishu-shadow",
-        },
-      ],
-      selection: ["@openclaw/feishu"],
-    }),
+    resolveSelectedPublishablePluginPackages({ plugins, selection: ["@openclaw/feishu"] }),
   ).toThrow("Plugin selection has conflicting plugin package provenance");
 });
 
 it("extracts unique extension ids from changed extension paths", () => {
-  expect(
-    collectChangedExtensionIdsFromPaths([
-      bundledPluginFile("zalo", "index.ts"),
-      bundledPluginFile("zalo", "package.json"),
-      bundledPluginFile("feishu", "src/client.ts"),
-      "docs/reference/RELEASING.md",
-    ]),
-  ).toEqual(["feishu", "zalo"]);
+  const paths = [
+    bundledPluginFile("zalo", "index.ts"),
+    bundledPluginFile("zalo", "package.json"),
+    bundledPluginFile("feishu", "src/client.ts"),
+    "docs/reference/RELEASING.md",
+  ];
+  expect(collectChangedExtensionIdsFromPaths(paths)).toEqual(["feishu", "zalo"]);
 });
