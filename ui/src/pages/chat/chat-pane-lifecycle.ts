@@ -286,7 +286,11 @@ export abstract class ChatPaneLifecycle extends ChatPaneSessionObservation {
     const pageState = createPageState(
       this.context,
       chatState.createRenderLifecycle(),
-      this.element,
+      {
+        sessionKey: this.sessionKey,
+        dispatchEvent: (event) => this.element.dispatchEvent(event),
+        querySelector: (selector) => this.element.querySelector(selector),
+      },
       this.chatMessagesBySession,
     );
     pageState.chatMetadataIsPresented = () =>

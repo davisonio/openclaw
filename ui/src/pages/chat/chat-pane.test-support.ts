@@ -700,7 +700,11 @@ class RenderTestChatPane extends ChatPaneRuntime {
     this.state = createPageState(
       context,
       { afterCommit: () => () => {}, invalidate: () => {} },
-      this.element,
+      {
+        sessionKey: this.sessionKey,
+        dispatchEvent: (event) => this.element.dispatchEvent(event),
+        querySelector: (selector) => this.element.querySelector(selector),
+      },
     );
     return this.state;
   }
