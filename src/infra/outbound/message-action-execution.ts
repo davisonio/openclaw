@@ -20,6 +20,7 @@ import type {
 } from "../../channels/plugins/types.public.js";
 import { isChannelPartialDeliveryError } from "../../channels/turn/partial-delivery-error.js";
 import {
+  composeSessionSourceAssertion,
   runWithSessionSourceScope,
   type SessionSourceAssertion,
 } from "../../config/sessions/session-source-authority.js";
@@ -71,6 +72,21 @@ export function assertMessageDeliveryCurrent(input: MessageActionInput): void {
   input.assertDirectAdapterHandoff?.();
   input.messageActionAuthorization?.scheduled?.assertCurrent();
   input.messageActionAuthorization?.deliveryAttempt?.assertCurrent();
+}
+
+/** Keep the occurrence's prepared sources through transcript and transport commits. */
+export function captureMessageDeliveryAuthority(input: MessageActionInput): SessionSourceAssertion {
+  return composeSessionSourceAssertion(
+    [
+      input.assertDirectAdapterHandoff,
+      input.messageActionAuthorization?.scheduled?.assertCurrent,
+      input.messageActionAuthorization?.deliveryAttempt?.assertCurrent,
+    ],
+    (assertSources) => {
+      throwIfAborted(input.abortSignal);
+      assertSources();
+    },
+  );
 }
 
 export async function beforeMessageDeliveryAttempt(input: MessageActionInput): Promise<void> {

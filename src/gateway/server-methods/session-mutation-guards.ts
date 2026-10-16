@@ -5,6 +5,7 @@ import { withSessionPendingInputAuthorityGuard } from "../../config/sessions/ses
 import {
   captureExternalSessionCommitGuard,
   composeSessionSourceAssertion,
+  type SessionSourceAssertion,
 } from "../../config/sessions/session-source-authority.js";
 import { isGatewayWorkerApprovalMethod } from "../../infra/approval-gateway-runtime-methods.js";
 import { operatorScopeSatisfied } from "../../shared/operator-scope-compat.js";
@@ -120,7 +121,7 @@ function captureRequestMutationOptions(options: GatewayRequestOptions, client = 
   return { req, client, signal, hasCurrentClientAuthority, sessionMutationCommitGuard };
 }
 
-/** Opaque SDK guards retain their synchronous commit boundary from v2026.9.4. */
+/** Prepared request owners use workers; opaque callbacks retain their native metadata. */
 export function readGatewayRequestMutationAuthority(
   options: RequestMutationOptions,
 ): GatewayRequestMutationAuthority {
@@ -130,15 +131,24 @@ export function readGatewayRequestMutationAuthority(
   }
   const { req, client, signal, hasCurrentClientAuthority, sessionMutationCommitGuard } = options;
   const captured = { req, client, signal, hasCurrentClientAuthority, sessionMutationCommitGuard };
-  const assertLifetimeCurrent = captureRequestAuthorityAssertion(captured, true);
-  const compatibility: GatewayRequestMutationAuthority = {
-    family: "native-compatibility",
+  const source: SessionSourceAssertion | undefined = sessionMutationCommitGuard;
+  const workerCompatible =
+    (!source || source.prepareSessionSource) &&
+    (!hasCurrentClientAuthority || readGatewayDeviceRevocationGuard(hasCurrentClientAuthority));
+  const assertLifetimeCurrent = captureRequestAuthorityAssertion(captured, !workerCompatible);
+  const authority: GatewayRequestMutationAuthority = {
+    ...(workerCompatible
+      ? {
+          family: "worker" as const,
+          assertWorkerCurrent: () => assertRequestTransportCurrent(captured),
+        }
+      : { family: "native-compatibility" as const }),
     assertPreparationCurrent: () => assertRequestTransportCurrent(captured),
     assertCurrent: assertLifetimeCurrent,
     assertLifetimeCurrent,
   };
-  bindRequestMutationAuthority(options, compatibility);
-  return compatibility;
+  bindRequestMutationAuthority(options, authority);
+  return authority;
 }
 
 /** The in-process owner separates preparation and accepted input from opaque commit callbacks. */

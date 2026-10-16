@@ -10,7 +10,6 @@ import {
 } from "../../state/openclaw-agent-db.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { buildConversationIdentity } from "./conversation-identity.js";
-import { trimTranscriptForManualCompact } from "./session-accessor.sqlite-compaction.js";
 import {
   linkSessionConversation,
   prepareConversationIdentities,
@@ -364,22 +363,23 @@ it.each([
   },
 );
 
-it("rolls back the native manual trim when accounting cannot be cleared", async () => {
+it("rolls back the worker manual trim when accounting cannot be cleared", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
     const f = createSessionCompoundWorkerFixture();
     const records = createManualCompactRecords(f.scope.sessionId);
     replaceTranscriptEventsSync(f.scope, records);
     const before = f.read();
     f.database.db.exec(`
-      CREATE TEMP TRIGGER reject_manual_compact_metadata_update
-      BEFORE UPDATE OF entry_json ON main.session_nodes
+      CREATE TRIGGER reject_manual_compact_metadata_update
+      BEFORE UPDATE OF entry_json ON session_nodes
       BEGIN
         SELECT RAISE(ABORT, 'injected manual compact metadata failure');
       END;
     `);
     try {
       await expect(
-        trimTranscriptForManualCompact(f.scope, (lines) => [lines[0]!, ...lines.slice(-2)], {
+        trimSessionTranscriptForManualCompact(f.scope, {
+          maxLines: 3,
           nowMs: 500,
         }),
       ).rejects.toThrow("injected manual compact metadata failure");

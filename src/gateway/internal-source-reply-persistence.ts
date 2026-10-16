@@ -77,7 +77,6 @@ async function completePersistedInternalSourceReply(params: {
   const options: Parameters<typeof persistSessionTranscriptTurn>[1] = {
     config: params.cfg,
     ...expected,
-    assertCurrent,
     messages: [
       {
         eventId: messageId,
@@ -202,17 +201,7 @@ export async function persistInternalSourceReply(params: {
           attachSourceReplyMedia(result, acceptCompletion);
         },
       };
-      const appended = await appendAssistantMessageToSessionTranscript({
-        ...options,
-        assertCurrent: captureOwnedTranscriptWriteAssertion({
-          agentId: params.agentId,
-          sessionKey: params.sessionKey,
-          sessionId: params.expectedSessionId,
-          storePath: resolveSessionStorePathCore(params.cfg.session?.store, {
-            agentId: params.agentId,
-          }),
-        }),
-      });
+      const appended = await appendAssistantMessageToSessionTranscript(options);
       if (!appended.ok) {
         throw new Error(`Internal source reply persistence failed: ${appended.reason}`);
       }
