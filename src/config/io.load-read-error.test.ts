@@ -36,11 +36,11 @@ it.each(["sync", "async"] as const)(
     vi.spyOn(fs, "existsSync").mockImplementation((file) =>
       file === configPath ? false : exists(file),
     );
-    vi.spyOn(fs.promises, "access").mockImplementation(async (file, mode) => {
+    vi.spyOn(fs.promises, "access").mockImplementation(async (file, accessMode) => {
       if (file === configPath) {
         throw failure;
       }
-      return access(file, mode);
+      return access(file, accessMode);
     });
     vi.spyOn(fs, "readFileSync").mockImplementation((file, encoding) => {
       if (file === configPath) {
