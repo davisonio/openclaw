@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { writeSessionEntry } from "../../../config/sessions/session-accessor.sqlite-entry-store.js";
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "../../../infra/kysely-sync.js";
 import { createDeferredCore } from "../../../shared/deferred.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../../../state/openclaw-agent-db.generated.js";
@@ -44,30 +45,10 @@ async function withStream(
 }
 
 function seedSession(options: { agentId: string; env: NodeJS.ProcessEnv }, sessionKey: string) {
-  runOpenClawAgentWriteTransaction((database) => {
-    const db = getNodeSqliteKysely<
-      Pick<OpenClawAgentKyselyDatabase, "session_nodes" | "session_windows">
-    >(database.db);
-    executeSqliteQuerySync(
-      database.db,
-      db.insertInto("session_nodes").values({
-        session_key: sessionKey,
-        current_session_id: "session-1",
-        entry_json: "{}",
-        updated_at: 1,
-      }),
-    );
-    executeSqliteQuerySync(
-      database.db,
-      db.insertInto("session_windows").values({
-        session_id: "session-1",
-        session_key: sessionKey,
-        session_scope: "conversation",
-        created_at: 1,
-        updated_at: 1,
-      }),
-    );
-  }, options);
+  runOpenClawAgentWriteTransaction(
+    (database) => writeSessionEntry(database, sessionKey, { sessionId: "session-1", updatedAt: 1 }),
+    options,
+  );
 }
 
 describe("ACP parent stream SQLite store", () => {

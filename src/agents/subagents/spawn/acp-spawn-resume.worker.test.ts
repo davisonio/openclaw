@@ -187,12 +187,10 @@ it("resolves resume ownership off-thread, preserving backend, order, and lifecyc
           }),
         );
     const changedAgent = changeOwnedMetaDuringRead({ ...owned.meta, agent: "cursor" });
-    try {
-      await expectOwnership("owned", false);
-    } finally {
+    await expectOwnership("owned", false).finally(() => {
       changedAgent.mockRestore();
       writeMeta(owned, owned.meta);
-    }
+    });
     const changedIdentity = changeOwnedMetaDuringRead({
       ...owned.meta,
       identity: {
@@ -202,11 +200,7 @@ it("resolves resume ownership off-thread, preserving backend, order, and lifecyc
         agentSessionId: "replacement",
       },
     });
-    try {
-      await expectOwnership("owned", false);
-    } finally {
-      changedIdentity.mockRestore();
-    }
+    await expectOwnership("owned", false).finally(() => changedIdentity.mockRestore());
     let active = true;
     const intercept = vi
       .spyOn(entryReader, "withSessionEntryReadOnlyInWorker")
@@ -214,21 +208,19 @@ it("resolves resume ownership off-thread, preserving backend, order, and lifecyc
         active = false;
         return read(...args);
       });
-    try {
-      await expect(
-        validateAcpResumeSessionOwnership({
-          ...input,
-          resumeSessionId: "replacement",
-          assertCurrent() {
-            if (!active) {
-              throw new Error("request retired");
-            }
-          },
-        }),
-      ).rejects.toThrow("request retired");
-    } finally {
-      intercept.mockRestore();
-    }
+    await expect(
+      validateAcpResumeSessionOwnership({
+        ...input,
+        resumeSessionId: "replacement",
+        assertCurrent() {
+          if (!active) {
+            throw new Error("request retired");
+          }
+        },
+      }),
+    )
+      .rejects.toThrow("request retired")
+      .finally(() => intercept.mockRestore());
 
     for (const mutation of [
       "unchanged",
@@ -325,16 +317,14 @@ it("resolves resume ownership off-thread, preserving backend, order, and lifecyc
         } else if (mutation === "runtime") {
           writeMeta(source, { ...source.meta, agent: "cursor" });
         } else if (mutation === "deleted") {
-          expect(
-            (
-              await deleteSessionEntryLifecycle({
-                ...scope,
-                storePath: resolveSessionStorePathCore(cfg.session?.store, scope),
-                target: { canonicalKey: source.sessionKey, storeKeys: [source.sessionKey] },
-                archiveTranscript: false,
-              })
-            ).deleted,
-          ).toBe(true);
+          await expect(
+            deleteSessionEntryLifecycle({
+              ...scope,
+              storePath: resolveSessionStorePathCore(cfg.session?.store, scope),
+              target: { canonicalKey: source.sessionKey, storeKeys: [source.sessionKey] },
+              archiveTranscript: false,
+            }),
+          ).resolves.toMatchObject({ deleted: true });
         } else if (mutation === "retired") {
           current = false;
         } else if (mutation === "snapshot-reassigned") {

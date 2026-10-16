@@ -1,7 +1,6 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-/** Tests ACP spawn planning, policy gates, bindings, cleanup, and parent stream setup. */
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.js";
@@ -11,7 +10,10 @@ import { testing as acpRuntimeRegistryTesting } from "../../../acp/runtime/regis
 import { createExecutionIdentityAdmissionToken } from "../../../audit/execution-identity-admission.js";
 import type { ThinkLevel } from "../../../auto-reply/thinking.shared.js";
 import { getLoadedChannelPluginForRead } from "../../../channels/plugins/registry-loaded.js";
+import type { ChannelPlugin } from "../../../channels/plugins/types.public.js";
 import type { SessionEntry } from "../../../config/sessions/types.js";
+import type { AgentDefaultsConfig } from "../../../config/types.agent-defaults.js";
+import type { AgentEntryConfig } from "../../../config/types.agents.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import { readAgentRuntimeExecutionLineage } from "../../../gateway/agent-runtime-execution-lineage.js";
 import type { AgentRuntimeIdentity } from "../../../gateway/agent-runtime-identity-token.js";
@@ -68,7 +70,6 @@ const hoisted = vi.hoisted(() => ({
   sessionBindingUnbindMock: vi.fn(),
   sessionBindingResolveByConversationMock: vi.fn(),
   sessionBindingListBySessionMock: vi.fn(),
-  closeSessionMock: vi.fn(),
   initializeSessionMock: vi.fn(),
   getAcpSessionManagerMock: vi.fn(),
   startAcpSpawnParentStreamRelayMock: vi.fn(),
@@ -213,27 +214,32 @@ function gatewayResponse(method?: string) {
   return method === "sessions.patch" || method === "sessions.delete" ? { ok: true } : {};
 }
 
+type BindingInput = Parameters<NonNullable<SessionBindingAdapter["bind"]>>[0];
+
+function bindingMetadata(input: BindingInput, agentId = "codex", webhookId?: string) {
+  return {
+    boundBy: typeof input.metadata?.boundBy === "string" ? input.metadata.boundBy : "system",
+    agentId,
+    ...(webhookId ? { webhookId } : {}),
+  };
+}
+
 function mockConversationBinding(channel: string, agentId = "codex", parentRoom?: string): void {
-  hoisted.sessionBindingBindMock.mockImplementationOnce(
-    async (input: Parameters<NonNullable<SessionBindingAdapter["bind"]>>[0]) =>
-      createSessionBinding({
-        targetSessionKey: input.targetSessionKey,
-        conversation: {
-          ...input.conversation,
-          channel,
-          ...(parentRoom
-            ? {
-                conversationId: "child-thread",
-                parentConversationId: input.conversation.parentConversationId ?? parentRoom,
-              }
-            : {}),
-        },
-        metadata: {
-          boundBy: typeof input.metadata?.boundBy === "string" ? input.metadata.boundBy : "system",
-          agentId,
-          ...(parentRoom ? { webhookId: "wh-1" } : {}),
-        },
-      }),
+  hoisted.sessionBindingBindMock.mockImplementationOnce(async (input: BindingInput) =>
+    createSessionBinding({
+      targetSessionKey: input.targetSessionKey,
+      conversation: {
+        ...input.conversation,
+        channel,
+        ...(parentRoom
+          ? {
+              conversationId: "child-thread",
+              parentConversationId: input.conversation.parentConversationId ?? parentRoom,
+            }
+          : {}),
+      },
+      metadata: bindingMetadata(input, agentId, parentRoom ? "wh-1" : undefined),
+    }),
   );
 }
 
@@ -279,10 +285,6 @@ function configureCrossAgentWorkspaceSpawn(fixture: CrossAgentWorkspaceFixture):
   };
 }
 
-function latestBindingInput(): Record<string, unknown> {
-  return expectRecordFields(latestMockCall(hoisted.sessionBindingBindMock, "session bind")[0], {});
-}
-
 function gatewayRequests(): Array<{ method?: string; params?: Record<string, unknown> }> {
   return hoisted.callGatewayMock.mock.calls.map(
     (call: unknown[]) => call[0] as { method?: string; params?: Record<string, unknown> },
@@ -308,10 +310,8 @@ function expectInitializeSessionFields(expected: Record<string, unknown>): Recor
   );
 }
 
-function expectBindingCallFields(expected: Record<string, unknown>): Record<string, unknown> {
-  const input = latestBindingInput();
-  expect(input).toMatchObject(expected);
-  return input;
+function expectBindingCallFields(expected: Record<string, unknown>): void {
+  expect(latestMockCall(hoisted.sessionBindingBindMock, "session bind")[0]).toMatchObject(expected);
 }
 
 function expectRelayCallFields(expected: Record<string, unknown>, callIndex = 0): void {
@@ -322,12 +322,12 @@ function expectRelayCallFields(expected: Record<string, unknown>, callIndex = 0)
 }
 
 function resolveMatrixRoomTargetForTest(value: string | undefined): string | undefined {
-  const trimmed = value?.trim();
-  if (!trimmed) {
-    return undefined;
-  }
-  const normalized = trimmed.replace(/^(?:matrix:)?(?:channel:|room:)/iu, "").trim();
-  return normalized || undefined;
+  return (
+    value
+      ?.trim()
+      .replace(/^(?:matrix:)?(?:channel:|room:)/iu, "")
+      .trim() || undefined
+  );
 }
 
 function configureChannelBindings(channel: string, accountId?: string, defaultAccount?: string) {
@@ -344,35 +344,23 @@ function configureChannelBindings(channel: string, accountId?: string, defaultAc
 
 function enableMatrixAcpThreadBindings(): void {
   configureChannelBindings("matrix");
-  const matrixPlugin = {
+  const matrixPlugin: ChannelPlugin = {
     ...createChannelTestPluginBase({ id: "matrix" }),
     conversationBindings: { defaultTopLevelPlacement: "child" },
     messaging: {
-      resolveDeliveryTarget: ({
-        conversationId,
-        parentConversationId,
-      }: {
-        conversationId: string;
-        parentConversationId?: string;
-      }) => {
+      resolveDeliveryTarget: ({ conversationId, parentConversationId }) => {
         const parent = resolveMatrixRoomTargetForTest(parentConversationId);
         const child = conversationId.trim();
         return parent ? { to: `room:${parent}`, threadId: child } : { to: `room:${child}` };
       },
-      resolveInboundConversation: ({
-        to,
-        threadId,
-      }: {
-        to?: string;
-        threadId?: string | number;
-      }) => {
+      resolveInboundConversation: ({ to, threadId }) => {
         const parent = resolveMatrixRoomTargetForTest(to);
         const thread = threadId != null ? String(threadId).trim() : "";
         return thread && parent
           ? { conversationId: thread, parentConversationId: parent }
           : parent
             ? { conversationId: parent }
-            : undefined;
+            : null;
       },
     },
   };
@@ -386,20 +374,6 @@ function enableLineCurrentConversationBindings(): void {
   configureChannelBindings("line");
   const linePlugin = {
     ...createChannelTestPluginBase({ id: "line" }),
-    messaging: {
-      resolveInboundConversation: ({
-        conversationId,
-        to,
-      }: {
-        conversationId?: string;
-        to?: string;
-      }) => {
-        const source = (conversationId ?? to ?? "").trim();
-        const normalized =
-          source.match(/^line:(?:(?:user|group|room):)?(.+)$/i)?.[1]?.trim() ?? source;
-        return normalized ? { conversationId: normalized } : undefined;
-      },
-    },
   };
   setActivePluginRegistry(
     createTestRegistry([{ pluginId: "line", plugin: linePlugin, source: "test" }]),
@@ -495,74 +469,48 @@ describe("spawnAcpDirect", () => {
       .mockReset()
       .mockImplementation(async (args: { method?: string }) => gatewayResponse(args.method));
 
-    hoisted.closeSessionMock.mockReset().mockResolvedValue({
-      runtimeClosed: true,
-      metaCleared: false,
-    });
     hoisted.getAcpSessionManagerMock.mockReset().mockReturnValue({
-      initializeSession: async (params: AcpInitializeSessionInput) =>
-        await hoisted.initializeSessionMock(params),
-      closeSession: async (params: unknown) => await hoisted.closeSessionMock(params),
+      initializeSession: hoisted.initializeSessionMock,
     });
-    hoisted.initializeSessionMock.mockReset().mockImplementation(async (argsUnknown: unknown) => {
-      const args = argsUnknown as AcpInitializeSessionInput;
-      const runtimeSessionName = `${args.sessionKey}:runtime`;
-      const cwd = typeof args.cwd === "string" ? args.cwd : undefined;
-      return {
-        closeRuntimeOnFailure: hoisted.closeRuntimeOnFailureMock,
-        sessionEntry: { sessionId: "sess-123", updatedAt: Date.now() },
-        runtime: { close: vi.fn().mockResolvedValue(undefined) },
-        handle: {
-          sessionKey: args.sessionKey,
-          backend: "acpx",
-          runtimeSessionName,
-          ...(cwd ? { cwd } : {}),
-          agentSessionId: "codex-inner-1",
-          backendSessionId: "acpx-1",
-        },
-        meta: {
-          backend: "acpx",
-          agent: args.agent,
-          runtimeSessionName,
-          ...(cwd ? { runtimeOptions: { cwd }, cwd } : {}),
-          identity: {
-            state: "pending",
-            source: "ensure",
-            acpxSessionId: "acpx-1",
-            agentSessionId: "codex-inner-1",
-            lastUpdatedAt: Date.now(),
-          },
-          mode: args.mode,
-          state: "idle",
-          lastActivityAt: Date.now(),
-        },
-      };
-    });
-
-    hoisted.sessionBindingBindMock
+    hoisted.initializeSessionMock
       .mockReset()
-      .mockImplementation(
-        async (input: {
-          targetSessionKey: string;
-          conversation: { accountId: string };
-          metadata?: Record<string, unknown>;
-        }) =>
-          createSessionBinding({
-            targetSessionKey: input.targetSessionKey,
-            conversation: {
-              channel: "discord",
-              accountId: input.conversation.accountId,
-              conversationId: "child-thread",
-              parentConversationId: "parent-channel",
+      .mockImplementation(async (args: AcpInitializeSessionInput) => {
+        const runtimeSessionName = `${args.sessionKey}:runtime`;
+        const cwd = typeof args.cwd === "string" ? args.cwd : undefined;
+        return {
+          closeRuntimeOnFailure: hoisted.closeRuntimeOnFailureMock,
+          sessionEntry: { sessionId: "sess-123", updatedAt: Date.now() },
+          meta: {
+            backend: "acpx",
+            agent: args.agent,
+            runtimeSessionName,
+            ...(cwd ? { runtimeOptions: { cwd }, cwd } : {}),
+            identity: {
+              state: "pending",
+              source: "ensure",
+              acpxSessionId: "acpx-1",
+              agentSessionId: "codex-inner-1",
+              lastUpdatedAt: Date.now(),
             },
-            metadata: {
-              boundBy:
-                typeof input.metadata?.boundBy === "string" ? input.metadata.boundBy : "system",
-              agentId: "codex",
-              webhookId: "wh-1",
-            },
-          }),
-      );
+            mode: args.mode,
+            state: "idle",
+            lastActivityAt: Date.now(),
+          },
+        };
+      });
+
+    hoisted.sessionBindingBindMock.mockReset().mockImplementation(async (input: BindingInput) =>
+      createSessionBinding({
+        targetSessionKey: input.targetSessionKey,
+        conversation: {
+          channel: "discord",
+          accountId: input.conversation.accountId,
+          conversationId: "child-thread",
+          parentConversationId: "parent-channel",
+        },
+        metadata: bindingMetadata(input, "codex", "wh-1"),
+      }),
+    );
     hoisted.sessionBindingResolveByConversationMock.mockReset().mockReturnValue(null);
     hoisted.sessionBindingListBySessionMock.mockReset().mockReturnValue([]);
     hoisted.sessionBindingUnbindMock.mockReset().mockResolvedValue([]);
@@ -678,10 +626,7 @@ describe("spawnAcpDirect", () => {
 
   it("strips an inherited OpenClaw auth profile before ACP initialization", async () => {
     configureSubagentDefaults({ model: "openai/gpt-5.6-luna@openai:test-profile" });
-
-    const result = await spawn({});
-
-    expectAcceptedSpawn(result);
+    expectAcceptedSpawn(await spawn());
     const initInput = expectInitializeSessionFields({ agent: "codex" });
     expect(initInput.runtimeOptions).toEqual(
       expect.objectContaining({ model: "openai/gpt-5.6-luna" }),
@@ -701,98 +646,76 @@ describe("spawnAcpDirect", () => {
 
   it.each<{
     name: string;
-    model?: string;
-    subagentModel?: string;
+    agent: Partial<AgentEntryConfig>;
+    defaults?: Partial<AgentDefaultsConfig>;
     thinking?: ThinkLevel;
-    inherited?: ThinkLevel;
-    ownerThinking?: ThinkLevel;
-    globalThinking?: ThinkLevel;
-    modelThinking?: ThinkLevel;
-    expectedModel?: string;
-    expectedThinking?: ThinkLevel;
+    expected: { model?: string; thinking?: ThinkLevel };
   }>([
     {
       name: "target-provider alias",
-      model: "anthropic/claude-sonnet-4-6",
-      subagentModel: "opus",
-      inherited: "low",
-      expectedModel: "anthropic/claude-opus-4-6",
-      expectedThinking: "low",
+      agent: {
+        model: "anthropic/claude-sonnet-4-6",
+        subagents: { model: "opus", thinking: "low" },
+      },
+      defaults: { models: { "claude-opus-4-6": { alias: "opus" } } },
+      expected: { model: "anthropic/claude-opus-4-6", thinking: "low" },
     },
-    { name: "explicit max", thinking: "max", inherited: "low", expectedThinking: "max" },
+    {
+      name: "explicit max",
+      agent: {},
+      thinking: "max",
+      defaults: { subagents: { thinking: "low" } },
+      expected: { thinking: "max" },
+    },
     {
       name: "configured model with global thinking default",
-      model: "anthropic/claude-sonnet-4-6",
-      globalThinking: "off",
-      expectedModel: "anthropic/claude-sonnet-4-6",
-      expectedThinking: "off",
+      agent: { model: "anthropic/claude-sonnet-4-6" },
+      defaults: { thinkingDefault: "off" },
+      expected: { model: "anthropic/claude-sonnet-4-6", thinking: "off" },
     },
     {
       name: "opaque harness model",
-      model: "harness-only[context=272k,reasoning=medium,fast=false]",
-      expectedModel: "harness-only[context=272k,reasoning=medium,fast=false]",
+      agent: { model: "harness-only[context=272k,reasoning=medium,fast=false]" },
+      expected: { model: "harness-only[context=272k,reasoning=medium,fast=false]" },
     },
     {
       name: "owner thinking without model override",
-      ownerThinking: "off",
-      globalThinking: "high",
-      expectedThinking: "off",
+      agent: { thinkingDefault: "off" },
+      defaults: { thinkingDefault: "high" },
+      expected: { thinking: "off" },
     },
     {
       name: "model-profile thinking default",
-      model: "openai/gpt-5.4",
-      modelThinking: "high",
-      expectedModel: "openai/gpt-5.4",
-      expectedThinking: "high",
+      agent: { model: "openai/gpt-5.4" },
+      defaults: { models: { "openai/gpt-5.4": { params: { thinking: "high" } } } },
+      expected: { model: "openai/gpt-5.4", thinking: "high" },
     },
-  ])(
-    "resolves ACP runtime options: $name",
-    async ({
-      model,
-      subagentModel,
-      thinking,
-      inherited,
-      ownerThinking,
-      globalThinking,
-      modelThinking,
-      expectedModel,
-      expectedThinking,
-    }) => {
-      hoisted.state.cfg.agents = {
-        entries: {
-          "codex-acp": {
-            runtime: { type: "acp", acp: { agent: "codex" } },
-            model,
-            thinkingDefault: ownerThinking,
-            subagents: { model: subagentModel, thinking: subagentModel ? inherited : undefined },
-          },
+  ])("resolves ACP runtime options: $name", async ({ agent, defaults, thinking, expected }) => {
+    hoisted.state.cfg.agents = {
+      entries: {
+        "codex-acp": {
+          runtime: { type: "acp", acp: { agent: "codex" } },
+          ...agent,
         },
-        defaults: {
-          model: "openai/gpt-5.4",
-          thinkingDefault: globalThinking,
-          models: {
-            ...(subagentModel ? { "claude-opus-4-6": { alias: "opus" } } : {}),
-            ...(model && modelThinking ? { [model]: { params: { thinking: modelThinking } } } : {}),
-          },
-          subagents: {
-            allowAgents: ["codex"],
-            maxSpawnDepth: 2,
-            thinking: subagentModel ? undefined : inherited,
-          },
+      },
+      defaults: {
+        model: "openai/gpt-5.4",
+        ...defaults,
+        subagents: {
+          allowAgents: ["codex"],
+          maxSpawnDepth: 2,
+          ...defaults?.subagents,
         },
-      };
-      expectAcceptedSpawn(await spawn({ agentId: "codex-acp", thinking }));
-      expectInitializeSessionFields({
-        agent: "codex",
-        backendId: "acpx",
-        thinkingExplicit: thinking !== undefined,
-        runtimeOptions: {
-          ...(expectedModel ? { model: expectedModel } : {}),
-          ...(expectedThinking ? { thinking: expectedThinking } : {}),
-        },
-      });
-    },
-  );
+      },
+    };
+    expectAcceptedSpawn(await spawn({ agentId: "codex-acp", thinking }));
+    expectInitializeSessionFields({
+      agent: "codex",
+      backendId: "acpx",
+      thinkingExplicit: thinking !== undefined,
+      runtimeOptions: expected,
+    });
+  });
 
   it("caps configured ACP runtime timeout without shortening spawn tracking", async () => {
     configureSubagentDefaults({ runTimeoutSeconds: 172_800 });
@@ -825,9 +748,9 @@ describe("spawnAcpDirect", () => {
 
   it("forwards prepared image attachments through the gateway agent call", async () => {
     const imageBase64 = Buffer.from("png-bytes").toString("base64");
-    const result = await spawn({ attachments: [{ mediaType: "image/png", data: imageBase64 }] });
-
-    expectAcceptedSpawn(result);
+    expectAcceptedSpawn(
+      await spawn({ attachments: [{ mediaType: "image/png", data: imageBase64 }] }),
+    );
     const agentCall = gatewayRequest("agent");
     expect(agentCall?.params?.attachments).toEqual([
       { type: "image", source: { type: "base64", media_type: "image/png", data: imageBase64 } },
@@ -1174,10 +1097,7 @@ describe("spawnAcpDirect", () => {
 
   it("rejects disallowed ACP agents", async () => {
     hoisted.state.cfg.acp = { enabled: true, backend: "acpx", allowedAgents: ["claudecode"] };
-
-    const result = await spawn({});
-
-    expectRecordFields(result, { status: "forbidden" });
+    expectRecordFields(await spawn(), { status: "forbidden" });
   });
 
   it("implicitly streams mode=run ACP spawns for subagent requester sessions", async () => {
@@ -1188,15 +1108,15 @@ describe("spawnAcpDirect", () => {
       .mockReset()
       .mockReturnValueOnce(firstHandle)
       .mockReturnValueOnce(secondHandle);
-    const result = await spawn({}, context);
-
-    const accepted = expectAcceptedSpawn(result);
+    const accepted = expectAcceptedSpawn(await spawn({}, context));
     expect(accepted.mode).toBe("run");
     const agentCall = gatewayRequest("agent");
-    expect(agentCall?.params?.deliver).toBe(false);
-    expect(agentCall?.params?.channel).toBeUndefined();
-    expect(agentCall?.params?.to).toBeUndefined();
-    expect(agentCall?.params?.threadId).toBeUndefined();
+    expect(agentCall?.params).toMatchObject({
+      deliver: false,
+      channel: undefined,
+      to: undefined,
+      threadId: undefined,
+    });
     expectRelayCallFields({
       parentSessionKey: "agent:main:subagent:parent",
       agentId: "codex",
@@ -1224,9 +1144,7 @@ describe("spawnAcpDirect", () => {
       subagentRole: "orchestrator",
       subagentControlScope: "children",
     });
-    const result = await spawn({}, context);
-
-    const accepted = expectAcceptedSpawn(result);
+    const accepted = expectAcceptedSpawn(await spawn({}, context));
     expect(accepted.mode).toBe("run");
     expect(hoisted.startAcpSpawnParentStreamRelayMock).not.toHaveBeenCalled();
   });

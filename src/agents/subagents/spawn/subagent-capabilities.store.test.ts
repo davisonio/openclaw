@@ -56,23 +56,15 @@ function makeEntry(sessionId: string, fields: Partial<SessionEntry> = {}): Sessi
   return { sessionId, updatedAt: 1, ...fields };
 }
 
-function readPolicy(key: string, options: Parameters<typeof resolveCapabilities>[1]) {
-  return {
-    depth: resolveCapabilities(key, options).depth,
-    deny: resolveDenylist(key, options),
-  };
-}
-
-function readLineage(key: string, options: Parameters<typeof resolveCapabilities>[1]) {
-  return {
-    capabilities: resolveCapabilities(key, options),
-    depth: resolveDepth(key, options),
-    ...(key !== "child-id" && {
-      envelope: isSubagentEnvelopeSession(key, options),
-      allow: resolveAllowlist(key, options),
-      deny: resolveDenylist(key, options),
-    }),
-  };
+function writeEntries(storePath: string, entries: Record<string, SessionEntry>) {
+  runOpenClawAgentWriteTransaction(
+    (database) => {
+      for (const [key, value] of Object.entries(entries)) {
+        writeSessionEntry(database, key, value);
+      }
+    },
+    { agentId: "main", path: storePath },
+  );
 }
 
 describe("persisted subagent capability lookups", () => {
@@ -86,13 +78,13 @@ describe("persisted subagent capability lookups", () => {
         const cfg = useDefault ? {} : { session: { store: storePath } };
         const key = "agent:main:dashboard:resident-capabilities";
         const scope = { agentId: "main", storePath, sessionKey: key };
-        await sessionAccessor.upsertSessionEntryCore(
-          { ...scope, sessionKey: "agent:main:main" },
-          { sessionId: "parent", updatedAt: 1 },
-        );
-        await sessionAccessor.upsertSessionEntryCore(scope, {
-          sessionId: "resident-child",
-          updatedAt: 1,
+        const seed = (sessionKey: string, sessionId: string, fields?: Partial<SessionEntry>) =>
+          sessionAccessor.upsertSessionEntryCore(
+            { ...scope, sessionKey },
+            makeEntry(sessionId, fields),
+          );
+        await seed("agent:main:main", "parent");
+        await seed(key, "resident-child", {
           spawnedBy: "agent:main:main",
           spawnDepth: 2,
           inheritedToolPolicyVersion: 1,
@@ -116,17 +108,23 @@ describe("persisted subagent capability lookups", () => {
               return copied;
             },
             async () => {
+              const policy = { allow: ["read"], deny: ["exec"] };
               const resolve = () =>
-                resolveRequesterToolPolicies({ config: cfg, agentId: "main", sessionKey: key });
-              expect(resolve().inheritedToolPolicy).toEqual({ allow: ["read"], deny: ["exec"] });
+                resolveRequesterToolPolicies({
+                  config: cfg,
+                  agentId: "main",
+                  sessionKey: key,
+                });
+              const readPolicy = () => {
+                const current = resolve();
+                const depth = resolveCapabilities(key, { cfg, store: current.subagentStore }).depth;
+                return { policy: current.inheritedToolPolicy, depth };
+              };
+              expect(resolve().inheritedToolPolicy).toEqual(policy);
               const queries = observeSqliteReadSql(StatementSync.prototype);
               try {
                 for (let turn = 0; turn < 50; turn += 1) {
-                  const policy = resolve();
-                  expect(policy.inheritedToolPolicy).toEqual({ allow: ["read"], deny: ["exec"] });
-                  expect(resolveCapabilities(key, { cfg, store: policy.subagentStore }).depth).toBe(
-                    2,
-                  );
+                  expect(readPolicy()).toEqual({ policy, depth: 2 });
                 }
                 expect(queries.queries).toHaveLength(0);
               } finally {
@@ -136,22 +134,19 @@ describe("persisted subagent capability lookups", () => {
                 spawnDepth: 3,
                 inheritedToolDeny: ["exec", "write"],
               }));
-              const current = resolve();
-              expect(current.inheritedToolPolicy).toEqual({
-                allow: ["read"],
-                deny: ["exec", "write"],
+              expect(readPolicy()).toEqual({
+                policy: { ...policy, deny: ["exec", "write"] },
+                depth: 3,
               });
-              expect(resolveCapabilities(key, { cfg, store: current.subagentStore }).depth).toBe(3);
               const retained = createSubagentSessionStore(storePath, "main");
               const createdKey = "agent:main:subagent:created";
-              expect(retained.get(createdKey)).toBeUndefined();
-              expect(retained.getById("created-child")).toBeUndefined();
-              await sessionAccessor.upsertSessionEntryCore(
-                { ...scope, sessionKey: createdKey },
-                { sessionId: "created-child", updatedAt: 2, spawnDepth: 4 },
-              );
-              expect(retained.get(createdKey)?.spawnDepth).toBe(4);
-              expect(retained.getById("created-child")?.spawnDepth).toBe(4);
+              const readCreated = () => [
+                retained.get(createdKey),
+                retained.getById("created-child"),
+              ];
+              expect(readCreated()).toEqual([undefined, undefined]);
+              await seed(createdKey, "created-child", { updatedAt: 2, spawnDepth: 4 });
+              expect(readCreated().map((entry) => entry?.spawnDepth)).toEqual([4, 4]);
 
               // Rebinding a context updates its copies; rebinding a copy creates a separate owner.
               bindSessionRowProjection(context, () => undefined);
@@ -181,21 +176,15 @@ describe("persisted subagent capability lookups", () => {
   it("prepares requested capability rows and observes the next committed policy", async () => {
     const { storePath, cfg, key } = fixture("subagent-capability-memo-");
     const write = (spawnDepth: number) =>
-      runOpenClawAgentWriteTransaction(
-        (database) => {
-          writeSessionEntry(database, key, {
-            sessionId: "child",
-            updatedAt: 1,
-            spawnDepth,
-            inheritedToolDeny: ["exec"],
-          });
-        },
-        { agentId: "main", path: storePath },
-      );
+      writeEntries(storePath, {
+        [key]: makeEntry("child", { spawnDepth, inheritedToolDeny: ["exec"] }),
+      });
+    const depth = () => resolveCapabilities(key, { cfg }).depth;
     write(2);
     const store = resolveStore(key, { cfg });
     await withPreparedRead(() => {
-      expect(readPolicy(key, { cfg, store })).toEqual({ depth: 2, deny: ["exec"] });
+      expect(resolveCapabilities(key, { cfg, store }).depth).toBe(2);
+      expect(resolveDenylist(key, { cfg, store })).toEqual(["exec"]);
       expect(resolveCapabilities("agent:main:subagent:missing", { cfg, store }).depth).toBe(1);
     });
     let entryReads = 0;
@@ -208,20 +197,13 @@ describe("persisted subagent capability lookups", () => {
       return run(request, controls);
     });
     write(4);
-    expect(await withPreparedRead(() => resolveCapabilities(key, { cfg }).depth)).toBe(4);
+    expect(await withPreparedRead(depth)).toBe(4);
     expect(entryReads).toBe(0);
+    const partial = { [key]: { spawnedBy: "agent:main:main" } };
     expect(
-      await withPreparedRead(
-        () =>
-          resolveCapabilities(key, {
-            cfg,
-            store: { [key]: { spawnedBy: "agent:main:main" } },
-          }).depth,
-      ),
+      await withPreparedRead(() => resolveCapabilities(key, { cfg, store: partial }).depth),
     ).toBe(4);
-    const retained = await prepareSessionCapabilityRead(
-      () => resolveCapabilities(key, { cfg }).depth,
-    );
+    const retained = await prepareSessionCapabilityRead(depth);
     try {
       expect(retained.read()).toBe(4);
       write(5);
@@ -236,7 +218,8 @@ describe("persisted subagent capability lookups", () => {
     );
     entryReads = 0;
     await withPreparedRead(() => {
-      expect(readPolicy(key, { cfg })).toEqual({ depth: 6, deny: ["exec", "write"] });
+      expect(resolveCapabilities(key, { cfg }).depth).toBe(6);
+      expect(resolveDenylist(key, { cfg })).toEqual(["exec", "write"]);
     });
     expect(entryReads).toBe(0);
   });
@@ -291,23 +274,15 @@ describe("persisted subagent capability lookups", () => {
         [cycle]: makeEntry("cycle-one", { spawnedBy: "agent:main:acp:cycle-two" }),
         "agent:main:acp:cycle-two": makeEntry("cycle-two", { spawnedBy: cycle }),
       };
-      runOpenClawAgentWriteTransaction(
-        (database) => {
-          for (const [key, entry] of Object.entries(entries)) {
-            writeSessionEntry(database, key, entry);
-          }
-          for (let i = 0; i < 64; i++) {
-            writeSessionEntry(
-              database,
-              `agent:main:dashboard:unrelated-${i}`,
-              makeEntry(`unrelated-${i}`, {
-                skillsSnapshot: { prompt: "unrelated saved prompt", skills: [] },
-              }),
-            );
-          }
-        },
-        { agentId: "main", path: storePath },
+      const unrelated = Object.fromEntries(
+        Array.from({ length: 64 }, (_, i): [string, SessionEntry] => [
+          `agent:main:dashboard:unrelated-${i}`,
+          makeEntry(`unrelated-${i}`, {
+            skillsSnapshot: { prompt: "unrelated saved prompt", skills: [] },
+          }),
+        ]),
       );
+      writeEntries(storePath, { ...entries, ...unrelated });
       const listing = vi.spyOn(sessionAccessor, "listSessionEntriesReadOnly");
       const explicit = {
         ...entries,
@@ -319,9 +294,11 @@ describe("persisted subagent capability lookups", () => {
         const persisted = resolveStore(key, { cfg });
         await withPreparedRead(() => {
           for (const store of stores) {
-            expect(readLineage(key, { cfg, store: persisted })).toEqual(
-              readLineage(key, { store }),
-            );
+            const readers = [resolveCapabilities, resolveDepth];
+            const policyReaders = [isSubagentEnvelopeSession, resolveAllowlist, resolveDenylist];
+            for (const read of [...readers, ...(key === "child-id" ? [] : policyReaders)]) {
+              expect(read(key, { cfg, store: persisted })).toEqual(read(key, { store }));
+            }
           }
         });
       }
