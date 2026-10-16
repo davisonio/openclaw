@@ -10,10 +10,7 @@ const leaseOptions = { token: "123:abc", accountId: "default" };
 const acquire = (options: Partial<Parameters<typeof acquireTelegramPollingLease>[0]> = {}) =>
   acquireTelegramPollingLease({ ...leaseOptions, ...options });
 const releaseStopped = (waitMs?: number) =>
-  releaseStoppedTelegramPollingLease({
-    ...leaseOptions,
-    ...(waitMs === undefined ? {} : { waitMs }),
-  });
+  releaseStoppedTelegramPollingLease({ ...leaseOptions, waitMs });
 async function initialLease(accountId = "default") {
   const abort = new AbortController();
   const first = await acquire({ accountId, abortSignal: abort.signal });

@@ -16,7 +16,7 @@ const fallbackPayload = (telegram: Record<string, unknown>): Payload => ({
   channelData: { telegram },
 });
 
-describe("telegramOutbound normalizePayload", () => {
+describe("telegramOutbound", () => {
   it.each([
     {
       name: "buttons without fallback",
@@ -69,9 +69,6 @@ describe("telegramOutbound normalizePayload", () => {
       null,
     ]);
   });
-});
-
-describe("telegramOutbound presentation", () => {
   it("preserves fallback labels after core capability adaptation", async () => {
     const label = "Open the workspace with the complete deployment instructions for production";
     const sourcePresentation = buttons(
@@ -118,9 +115,6 @@ describe("telegramOutbound presentation", () => {
       },
     });
   });
-});
-
-describe("telegramOutbound.sanitizeText", () => {
   const islandText =
     'before <details><summary>More</summary>body</details> <tg-math-block>x^2</tg-math-block> <ul><li><input type="checkbox" checked/>done</li></ul>';
   it.each([false, true])("sanitizes rich default account=%s", (rich) => {
