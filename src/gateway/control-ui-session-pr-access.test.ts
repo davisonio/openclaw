@@ -382,6 +382,7 @@ describe("registered session PR subscriptions", () => {
             identity: session.sessionKey,
             readSource: { agentId: "main", path: "/synthetic/unused.sqlite" },
             source: null,
+            assertCurrent() {},
           };
         },
       });

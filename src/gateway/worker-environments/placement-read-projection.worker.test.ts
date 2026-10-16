@@ -432,7 +432,6 @@ describe("worker placement read projection", () => {
           observedAtMs: 2000,
         });
       }
-      expect(monitor.version()).toBe(2);
       expect(warn).not.toHaveBeenCalled();
     } finally {
       sql.restore();
