@@ -293,7 +293,6 @@ describe("exact SQLite session reads", () => {
       { ...scope, sessionKey: "agent:main:unrelated" },
       { sessionId: "unrelated", updatedAt: 1, label: "unrelated payload ".repeat(1024) },
     );
-    loadExactSessionEntryReadOnly({ ...scope, projection: "list" });
     const database = openOpenClawAgentDatabase(scope);
     const queries = trackSqliteStatementExecutions(
       requireNativeSqliteDatabase(database.db),
