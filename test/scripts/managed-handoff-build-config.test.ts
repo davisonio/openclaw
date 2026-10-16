@@ -399,6 +399,14 @@ it.each(
               databasePath: process.argv[5], serviceManagerEnv: {},
             });
             assert.deepEqual(store.read(process.cwd()), { kind: "absent" });
+            const acquired = store.acquire(process.cwd(), "fixture-owner", { kind: "update" });
+            assert.equal(acquired.kind, "acquired");
+            try {
+              assert.equal(store.read(process.cwd()).kind, "current");
+            } finally {
+              assert.equal(store.release(acquired.lease), true);
+            }
+            assert.deepEqual(store.read(process.cwd()), { kind: "absent" });
             assert(helperCalls.length > 0, "Windows handoff did not execute the packaged ACL helper");
             assert(helperCalls.every(file => file === path.join(path.dirname(entryPath), "windows-security-helper.exe")));
             console.log("staged Windows ACL helper executed");
