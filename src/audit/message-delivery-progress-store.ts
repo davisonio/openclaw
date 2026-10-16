@@ -306,7 +306,7 @@ export function recordOutboundMessageProgressInDatabase(
           .insertInto("outbound_message_progress")
           .values(bindProgressRow(db, input, executionBinding))
           .onConflict((conflict) => conflict.column("source_id").doNothing())
-          .returning("sequence"),
+          .returningAll(),
       );
       if (!insert) {
         return undefined;
@@ -315,14 +315,19 @@ export function recordOutboundMessageProgressInDatabase(
       if (!Number.isSafeInteger(sequence) || sequence < 1) {
         throw new Error("outbound message progress sequence is outside the supported range");
       }
-      pruneProgressAfterInsert(db, Date.now());
-      const row = executeSqliteQueryTakeFirstSync(
-        db,
-        progressDb(db)
-          .selectFrom("outbound_message_progress")
-          .selectAll()
-          .where("sequence", "=", sequence),
-      );
+      const now = Date.now();
+      pruneProgressAfterInsert(db, now);
+      // Only an expired replay can lose its newly allocated sequence to pruning.
+      const row =
+        insert.occurred_at < now - OUTBOUND_MESSAGE_PROGRESS_RETENTION_MS
+          ? executeSqliteQueryTakeFirstSync(
+              db,
+              progressDb(db)
+                .selectFrom("outbound_message_progress")
+                .selectAll()
+                .where("sequence", "=", sequence),
+            )
+          : insert;
       return row ? rowToProgressEvent(row) : undefined;
     }, options);
   } catch (error) {
