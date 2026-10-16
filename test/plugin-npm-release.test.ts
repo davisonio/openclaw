@@ -1,9 +1,8 @@
-// Plugin npm release tests validate plugin npm release artifacts.
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { bundledPluginFile, bundledPluginRoot } from "openclaw/plugin-sdk/test-fixtures";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import {
   collectBundledPluginBuildEntries,
   collectRootPackageExcludedExtensionDirs,
@@ -15,7 +14,6 @@ import {
   collectPluginReleasePlan,
   collectPublishablePluginPackages,
   collectPublishablePluginPackageErrors,
-  OPENCLAW_PLUGIN_NPM_REPOSITORY_URL,
   resolveSelectedPublishablePluginPackages,
   type PublishablePluginPackage,
 } from "../scripts/lib/plugin-npm-release.ts";
@@ -26,7 +24,6 @@ import { writePublishablePluginFixture } from "./helpers/publishable-plugin-fixt
 import { cleanupTempDirs, makeTempDir as makeTempRepoRoot } from "./helpers/temp-dir.js";
 
 type ExecFileSync = typeof execFileSync;
-
 const childProcessMock = vi.hoisted(() => ({
   execFileSyncOverride: undefined as ExecFileSync | undefined,
 }));
@@ -43,30 +40,51 @@ vi.mock("node:child_process", async (importOriginal) => {
 });
 
 const tempDirs: string[] = [];
+const version = "2026.4.10";
+const makeRepo = () => makeTempRepoRoot(tempDirs, "openclaw-plugin-npm-release-");
+const makePlugin = (extensionId: string): PublishablePluginPackage => ({
+  extensionId,
+  packageDir: bundledPluginRoot(extensionId),
+  packageName: `@openclaw/${extensionId}`,
+  version: "2026.6.11",
+  channel: "stable",
+  publishTag: "latest",
+});
+const allPublishable = () => [
+  ...collectPublishablePluginPackages(),
+  ...collectClawHubPublishablePluginPackages(),
+];
+const readPackage = (packageDir: string): PluginPackageJson =>
+  JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8"));
+const isExternal = (pluginId: string, packageJson: PluginPackageJson) =>
+  isExternallyDistributedPlugin({
+    pluginId,
+    packageName: packageJson.name,
+    packageBuild: packageJson.openclaw?.build,
+  });
 
 afterEach(() => {
   childProcessMock.execFileSyncOverride = undefined;
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
   cleanupTempDirs(tempDirs);
 });
 
 it("requires the external plugin package compatibility contract for npm publish", () => {
+  const { extensionId, packageDir } = writePublishablePluginFixture(makeRepo(), {
+    extensionId: "voice-call",
+    version: "2026.5.1-beta.1",
+    publishTo: "npm",
+  });
+  const packageJson = readPackage(packageDir);
+  delete packageJson.openclaw?.compat;
+  delete packageJson.openclaw?.build;
   expect(
     collectPublishablePluginPackageErrors({
-      extensionId: "voice-call",
-      packageDir: bundledPluginRoot("voice-call"),
+      extensionId,
+      packageDir,
       readmeText: "# Voice call\n",
-      packageJson: {
-        name: "@openclaw/voice-call",
-        version: "2026.5.1-beta.1",
-        type: "module",
-        repository: { type: "git", url: OPENCLAW_PLUGIN_NPM_REPOSITORY_URL },
-        openclaw: {
-          extensions: ["./index.ts"],
-          install: { npmSpec: "@openclaw/voice-call" },
-          release: { publishToNpm: true },
-        },
-      },
+      packageJson,
     }),
   ).toEqual([
     "openclaw.compat.pluginApi is required for external code plugin packages.",
@@ -74,47 +92,37 @@ it("requires the external plugin package compatibility contract for npm publish"
   ]);
 });
 
-describe("collectPluginReleaseDependencyFreshnessWarnings", () => {
+it("warns once per stale dependency without blocking or inspecting Git", () => {
   const plugin: PublishablePluginPackage = {
-    extensionId: "codex",
-    packageDir: "extensions/codex",
-    packageName: "@openclaw/codex",
-    version: "2026.6.11",
-    channel: "stable",
-    publishTag: "latest",
+    ...makePlugin("codex"),
     requiredLatestDependencies: [{ packageName: "@openai/codex", version: "0.139.0" }],
   };
-
-  afterEach(() => vi.restoreAllMocks());
-
-  it("warns once per stale dependency without blocking or inspecting Git", () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const git = vi.fn(() => {
-      throw new Error("not a Git checkout");
-    });
-    childProcessMock.execFileSyncOverride = git as unknown as ExecFileSync;
-    const resolveLatest = vi.fn(() => "0.153.0");
-    const warnings = assertPluginReleaseDependencyFreshness(
-      [plugin, { ...plugin, packageName: "@openclaw/another-harness" }],
-      "release check",
-      resolveLatest,
-    );
-
-    expect(warnings).toEqual([
-      '@openclaw/codex@2026.6.11: @openai/codex pinned "0.139.0", npm latest is "0.153.0". Freshness is advisory; retain the release-validated pin.',
-      '@openclaw/another-harness@2026.6.11: @openai/codex pinned "0.139.0", npm latest is "0.153.0". Freshness is advisory; retain the release-validated pin.',
-    ]);
-    expect(warn.mock.calls).toEqual(
-      warnings.map((warning) => [`release check: warning: ${warning}`]),
-    );
-    expect(resolveLatest).toHaveBeenCalledExactlyOnceWith("@openai/codex");
-    expect(git).not.toHaveBeenCalled();
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const git = vi.fn(() => {
+    throw new Error("not a Git checkout");
   });
+  childProcessMock.execFileSyncOverride = git as unknown as ExecFileSync;
+  const resolveLatest = vi.fn(() => "0.153.0");
+  const warnings = assertPluginReleaseDependencyFreshness(
+    [plugin, { ...plugin, packageName: "@openclaw/another-harness" }],
+    "release check",
+    resolveLatest,
+  );
+
+  expect(warnings).toEqual([
+    '@openclaw/codex@2026.6.11: @openai/codex pinned "0.139.0", npm latest is "0.153.0". Freshness is advisory; retain the release-validated pin.',
+    '@openclaw/another-harness@2026.6.11: @openai/codex pinned "0.139.0", npm latest is "0.153.0". Freshness is advisory; retain the release-validated pin.',
+  ]);
+  expect(warn.mock.calls).toEqual(
+    warnings.map((warning) => [`release check: warning: ${warning}`]),
+  );
+  expect(resolveLatest).toHaveBeenCalledExactlyOnceWith("@openai/codex");
+  expect(git).not.toHaveBeenCalled();
 });
 
 it("fails closed when the registry refuses the published-version lookup", async () => {
-  const repoDir = makeTempRepoRoot(tempDirs, "openclaw-plugin-npm-release-");
-  writePublishablePluginFixture(repoDir, { version: "2026.4.10", publishTo: "npm" });
+  const repoDir = makeRepo();
+  writePublishablePluginFixture(repoDir, { version, publishTo: "npm" });
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 401 })));
 
   await expect(collectPluginReleasePlan({ rootDir: repoDir })).rejects.toThrow(
@@ -123,8 +131,7 @@ it("fails closed when the registry refuses the published-version lookup", async 
 });
 
 it("bounds parallel registry reads and partitions every selected package", async () => {
-  const repoDir = makeTempRepoRoot(tempDirs, "openclaw-plugin-npm-release-");
-  const version = "2026.4.10";
+  const repoDir = makeRepo();
   const names = Array.from({ length: 10 }, (_, index) => {
     const extensionId = `demo-${index}`;
     return writePublishablePluginFixture(repoDir, { extensionId, version, publishTo: "npm" })
@@ -168,12 +175,12 @@ it("bounds parallel registry reads and partitions every selected package", async
 });
 
 it("rejects duplicate npm package names from different plugin directories", () => {
-  const repoDir = makeTempRepoRoot(tempDirs, "openclaw-plugin-npm-release-");
+  const repoDir = makeRepo();
   for (const extensionId of ["demo-one", "demo-two"]) {
     writePublishablePluginFixture(repoDir, {
       extensionId,
       packageName: "@openclaw/shared-plugin",
-      version: "2026.4.10",
+      version,
       publishTo: "npm",
     });
   }
@@ -185,41 +192,27 @@ it("rejects duplicate npm package names from different plugin directories", () =
 
 it("keeps publishable plugin dist trees out of the core npm package unless bundled", () => {
   const excludedDirs = collectRootPackageExcludedExtensionDirs();
-  const publishablePlugins = [
-    ...collectPublishablePluginPackages(),
-    ...collectClawHubPublishablePluginPackages(),
-  ];
-  for (const plugin of publishablePlugins) {
-    const packageJson = JSON.parse(
-      readFileSync(join(plugin.packageDir, "package.json"), "utf8"),
-    ) as PluginPackageJson;
+  for (const plugin of allPublishable()) {
     expect(excludedDirs.has(plugin.extensionId), plugin.extensionId).toBe(
-      isExternallyDistributedPlugin({
-        pluginId: plugin.extensionId,
-        packageName: plugin.packageName,
-        packageBuild: packageJson.openclaw?.build,
+      isExternal(plugin.extensionId, {
+        ...readPackage(plugin.packageDir),
+        name: plugin.packageName,
       }),
     );
   }
 });
 
 it("keeps deferred publication targets bundled with staged release metadata", () => {
-  const bundledIds = collectBundledPluginBuildEntries({ env: {} }).map(({ id }) => id);
+  const bundledIds = new Set(collectBundledPluginBuildEntries({ env: {} }).map(({ id }) => id));
   const excludedDirs = collectRootPackageExcludedExtensionDirs();
-  const publicationIds = new Set(
-    [...collectPublishablePluginPackages(), ...collectClawHubPublishablePluginPackages()].map(
-      ({ extensionId }) => extensionId,
-    ),
-  );
+  const publicationIds = new Set(allPublishable().map(({ extensionId }) => extensionId));
   for (const { id, minHostVersion, publishToNpm = true } of [
     { id: "cua-computer", minHostVersion: ">=2026.9.6", publishToNpm: false },
     { id: "logbook", minHostVersion: ">=2026.9.5" },
     { id: "memory-wiki", minHostVersion: ">=2026.9.4" },
     { id: "onepassword", minHostVersion: ">=2026.9.4" },
   ]) {
-    const packageJson = JSON.parse(
-      readFileSync(join("extensions", id, "package.json"), "utf8"),
-    ) as PluginPackageJson;
+    const packageJson = readPackage(join("extensions", id));
     expect(packageJson, id).toMatchObject({
       name: `@openclaw/${id}`,
       openclaw: {
@@ -228,45 +221,33 @@ it("keeps deferred publication targets bundled with staged release metadata", ()
         release: { publishToNpm, publishToClawHub: true },
       },
     });
-    expect(bundledIds, id).toContain(id);
-    expect(excludedDirs.has(id), id).toBe(false);
-    expect(publicationIds.has(id), id).toBe(false);
     expect(
-      isExternallyDistributedPlugin({
-        pluginId: id,
-        packageName: packageJson.name,
-        packageBuild: packageJson.openclaw?.build,
-      }),
+      {
+        bundled: bundledIds.has(id),
+        excluded: excludedDirs.has(id),
+        published: publicationIds.has(id),
+        external: isExternal(id, packageJson),
+      },
       id,
-    ).toBe(false);
+    ).toEqual({ bundled: true, excluded: false, published: false, external: false });
   }
 });
 
-describe("resolveSelectedPublishablePluginPackages", () => {
-  const firstPlugin: PublishablePluginPackage = {
-    extensionId: "feishu",
-    packageDir: bundledPluginRoot("feishu"),
-    packageName: "@openclaw/feishu",
-    version: "2026.3.15",
-    channel: "stable",
-    publishTag: "latest",
-  };
-
-  it("rejects duplicate selected package provenance instead of choosing the last entry", () => {
-    expect(() =>
-      resolveSelectedPublishablePluginPackages({
-        plugins: [
-          firstPlugin,
-          {
-            ...firstPlugin,
-            extensionId: "feishu-shadow",
-            packageDir: "extensions/feishu-shadow",
-          },
-        ],
-        selection: ["@openclaw/feishu"],
-      }),
-    ).toThrow("Plugin selection has conflicting plugin package provenance");
-  });
+it("rejects duplicate selected package provenance instead of choosing the last entry", () => {
+  const firstPlugin = makePlugin("feishu");
+  expect(() =>
+    resolveSelectedPublishablePluginPackages({
+      plugins: [
+        firstPlugin,
+        {
+          ...firstPlugin,
+          extensionId: "feishu-shadow",
+          packageDir: "extensions/feishu-shadow",
+        },
+      ],
+      selection: ["@openclaw/feishu"],
+    }),
+  ).toThrow("Plugin selection has conflicting plugin package provenance");
 });
 
 it("extracts unique extension ids from changed extension paths", () => {

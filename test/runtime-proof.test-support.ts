@@ -3,6 +3,9 @@ import type { Server } from "node:http";
 import path from "node:path";
 import { clearConfigCache, clearRuntimeConfigSnapshot } from "../src/config/config.js";
 import { clearSessionStoreCacheForTest } from "../src/config/sessions/store-writer-state.js";
+import type { AgentDefaultsConfig } from "../src/config/types.agent-defaults.js";
+import type { ModelProviderConfig } from "../src/config/types.models.js";
+import type { OpenClawConfig } from "../src/config/types.openclaw.js";
 import {
   disconnectGatewayClient,
   startGatewayWithClient,
@@ -43,6 +46,26 @@ export function useRuntimeProofFixture(hook: Parameters<typeof useAutoCleanupTem
       stateDir,
       workspaceDir,
       configPath,
+      config(
+        provider: { providerId: string; modelRef: string; config: ModelProviderConfig },
+        defaults: AgentDefaultsConfig = {},
+        extra: OpenClawConfig = {},
+      ): OpenClawConfig {
+        return {
+          agents: {
+            defaults: {
+              workspace: workspaceDir,
+              skipBootstrap: true,
+              model: { primary: provider.modelRef },
+              ...defaults,
+            },
+            entries: { main: {} },
+          },
+          models: { mode: "replace", providers: { [provider.providerId]: provider.config } },
+          gateway: { auth: { mode: "token", token } },
+          ...extra,
+        };
+      },
       async close(
         gateway: Awaited<ReturnType<typeof startGatewayWithClient>> | undefined,
         provider: Server | undefined,

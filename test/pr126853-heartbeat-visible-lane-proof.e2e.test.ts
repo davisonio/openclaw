@@ -4,10 +4,9 @@ import path from "node:path";
 import { afterEach, expect, it } from "vitest";
 import { withFastReplyConfig } from "../src/auto-reply/reply/get-reply-fast-path.test-support.js";
 import { getRuntimeConfigSnapshot } from "../src/config/config.js";
-import type { OpenClawConfig } from "../src/config/types.openclaw.js";
 import { startGatewayWithClient } from "../src/gateway/test-helpers.e2e.js";
 import { buildMockOpenAiResponsesProvider } from "../src/gateway/test-openai-responses-model.js";
-import { createDeferred } from "./helpers/promise.js";
+import { createDeferred, withTestTimeout } from "./helpers/promise.js";
 import { listenProofProvider, useRuntimeProofFixture } from "./runtime-proof.test-support.js";
 
 const createFixture = useRuntimeProofFixture(afterEach);
@@ -18,20 +17,8 @@ type LaneSnapshot = {
   queuedCount: number;
 };
 
-async function within<T>(promise: Promise<T>, label: string, timeoutMs = 20_000): Promise<T> {
-  let timeout: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<never>((_, reject) => {
-        timeout = setTimeout(() => reject(new Error(`timed out while ${label}`)), timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timeout) {
-      clearTimeout(timeout);
-    }
-  }
+function within<T>(promise: Promise<T>, label: string, timeoutMs = 20_000): Promise<T> {
+  return withTestTimeout(promise, timeoutMs, `timed out while ${label}`);
 }
 
 function writeAssistantResponse(response: ServerResponse, text: string): void {
@@ -109,7 +96,6 @@ it(
             return;
           }
           providerOrder.push(kind);
-          console.log(`PR126853_PROVIDER_REQUEST ${kind}`);
           if (kind === "heartbeat") {
             heartbeatRequest.resolve();
           } else if (kind === "visible") {
@@ -123,27 +109,15 @@ it(
       });
       const providerUrl = await listenProofProvider(providerServer);
       const provider = buildMockOpenAiResponsesProvider(`${providerUrl}/v1`, "gpt-pr126853-proof");
-      const cfg = {
-        agents: {
-          defaults: {
-            workspace: workspaceDir,
-            skipBootstrap: true,
-            maxConcurrent: 1,
-            heartbeat: { every: "5m", target: "none" },
-            model: { primary: provider.modelRef },
-            models: {
-              [provider.modelRef]: { params: { transport: "sse", openaiWsWarmup: false } },
-            },
-          },
-          entries: { main: {} },
+      const cfg = fixture.config(
+        provider,
+        {
+          maxConcurrent: 1,
+          heartbeat: { every: "5m", target: "none" },
+          models: { [provider.modelRef]: { params: { transport: "sse", openaiWsWarmup: false } } },
         },
-        models: {
-          mode: "replace",
-          providers: { [provider.providerId]: provider.config },
-        },
-        gateway: { auth: { mode: "token", token } },
-        plugins: { slots: { memory: "none" } },
-      } satisfies OpenClawConfig;
+        { plugins: { slots: { memory: "none" } } },
+      );
       gateway = await within(
         startGatewayWithClient({
           cfg,
@@ -210,14 +184,6 @@ it(
         activeCount: 1,
         queuedCount: 0,
       });
-      console.log(
-        `PR126853_RUNTIME_TRACE ${JSON.stringify({
-          providerOrder: providerOrder.slice(0, 2),
-          lanes: [main, heartbeat],
-          heartbeatSessionKey,
-          visibleSessionKey,
-        })}`,
-      );
 
       providerResponses.resolve();
       await expect(

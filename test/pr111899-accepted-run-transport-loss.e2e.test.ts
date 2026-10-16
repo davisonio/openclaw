@@ -13,14 +13,7 @@ import { listenProofProvider, useRuntimeProofFixture } from "./runtime-proof.tes
 
 const createFixture = useRuntimeProofFixture(afterEach);
 
-/**
- * Starts a loopback WebSocket proxy in front of the real Gateway.
- *
- * The proxy forwards frames in both directions until it sees the Gateway
- * accept the CLI agent run (a `type: "res"` frame whose payload has
- * `status: "accepted"`). At that moment it severs the CLI-facing socket,
- * producing a real transport-loss event after a real Gateway acceptance.
- */
+// Sever the real transport only after the Gateway has accepted the CLI run.
 async function startAcceptedThenCloseProxy(targetUrl: string): Promise<{
   url: string;
   stop: () => void;
@@ -61,20 +54,15 @@ async function startAcceptedThenCloseProxy(targetUrl: string): Promise<{
             }
           }
         });
-        source.on("close", () => {
-          try {
-            destination.close();
-          } catch {
-            // ignore double-close
-          }
-        });
-        source.on("error", () => {
-          try {
-            destination.close();
-          } catch {
-            // ignore double-close
-          }
-        });
+        for (const event of ["close", "error"] as const) {
+          source.on(event, () => {
+            try {
+              destination.close();
+            } catch {
+              // ignore double-close
+            }
+          });
+        }
       };
 
       targetWs.once("open", () => {
@@ -104,7 +92,7 @@ it(
   { timeout: 120_000 },
   async () => {
     const fixture = await createFixture("openclaw-pr111899-proof-", "pr111899-proof-token");
-    const { stateDir, workspaceDir, configPath } = fixture;
+    const { stateDir, configPath } = fixture;
     let providerServer: ReturnType<typeof createServer> | undefined;
     let gateway: Awaited<ReturnType<typeof startGatewayWithClient>> | undefined;
     let proxy: { url: string; stop: () => void } | undefined;
@@ -117,22 +105,13 @@ it(
       const providerUrl = await listenProofProvider(providerServer);
       const provider = buildMockOpenAiResponsesProvider(providerUrl);
 
-      const cfg = {
-        agents: {
-          defaults: {
-            workspace: workspaceDir,
-            skipBootstrap: true,
-            model: { primary: provider.modelRef },
-            models: {
-              [provider.modelRef]: { params: { transport: "sse", openaiWsWarmup: false } },
-            },
-          },
-          entries: { main: {} },
+      const cfg = fixture.config(
+        provider,
+        {
+          models: { [provider.modelRef]: { params: { transport: "sse", openaiWsWarmup: false } } },
         },
-        models: { mode: "replace", providers: { [provider.providerId]: provider.config } },
-        session: { store: path.join(stateDir, "sessions.json"), mainKey: "main" },
-        gateway: { auth: { mode: "token", token: "pr111899-proof-token" } },
-      };
+        { session: { store: path.join(stateDir, "sessions.json"), mainKey: "main" } },
+      );
 
       gateway = await startGatewayWithClient({
         cfg,
@@ -141,11 +120,8 @@ it(
         clientDisplayName: "pr111899-proof-gateway",
       });
 
-      // Put the proxy between the CLI and the real Gateway so we can sever
-      // the transport exactly after the Gateway acceptance frame.
       proxy = await startAcceptedThenCloseProxy(`ws://127.0.0.1:${gateway.port}`);
       setTestEnvValue("OPENCLAW_GATEWAY_URL", proxy.url);
-      // Keep the same-process Gateway's published config alive while the CLI uses the proxy.
 
       const errorMessages: string[] = [];
       const runtime: RuntimeEnv = {
@@ -164,8 +140,6 @@ it(
         off: () => processLike,
       };
 
-      // The transport error propagates through the canonical CLI failure
-      // boundary instead of the command returning a bespoke result shape.
       const failure = await agentCliCommand(
         { message: "prove accepted-run transport-loss handling" },
         runtime,
@@ -177,7 +151,6 @@ it(
       expect(failure).toBeDefined();
       expect(isGatewayTransportError(failure)).toBe(true);
 
-      // The stderr hint names the accepted run so the operator can look it up.
       const hint = errorMessages.find((message) =>
         message.includes("the Gateway may still be running this turn"),
       );
@@ -185,9 +158,6 @@ it(
       const acceptedRunId = hint?.match(/accepted run ([^;)]+)/)?.[1];
       expect(acceptedRunId).toBeTruthy();
 
-      // The shared CLI failure renderer — the same owner the CLI entrypoint
-      // calls in JSON mode — keeps the documented failure envelope and adds
-      // the accepted run provenance; the boundary exits nonzero.
       expect(formatCliJsonFailure(failure, { env: {} })).toEqual({
         ok: false,
         runId: acceptedRunId,

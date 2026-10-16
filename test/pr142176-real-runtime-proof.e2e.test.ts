@@ -1,9 +1,4 @@
-/**
- * Real runtime proof for PR #142176: a loopback Anthropic-format provider rejects the
- * first turn with a truncated tool-call argument buffer (the transport fails closed and
- * discards the content), and the embedded runner's bounded empty-error retry resubmits
- * the same request and recovers with the provider's second, well-formed response.
- */
+// A truncated tool call must fail closed, then recover through the bounded empty-error retry.
 import { createServer } from "node:http";
 import { afterEach, expect, it } from "vitest";
 import type { ModelDefinitionConfig, ModelProviderConfig } from "../src/config/types.models.js";
@@ -17,69 +12,43 @@ const MODEL_ID = "claude-opus-5";
 const RECOVERED_MARKER = "PR142176_RECOVERED_AFTER_REJECTION";
 const TOKEN = "pr142176-proof-token";
 
-function anthropicSse(events: Record<string, unknown>[]): string {
-  return events
-    .map((event) => `event: ${String(event.type)}\ndata: ${JSON.stringify(event)}\n\n`)
-    .join("");
-}
-
-function messageStart(id: string): Record<string, unknown> {
-  return {
-    type: "message_start",
-    message: {
-      id,
-      type: "message",
-      role: "assistant",
-      model: MODEL_ID,
-      content: [],
-      stop_reason: null,
-      usage: { input_tokens: 640, output_tokens: 0 },
+function anthropicTurn(rejected: boolean): string {
+  const events = [
+    {
+      type: "message_start",
+      message: {
+        id: `msg_pr142176_${rejected ? "rejected" : "recovered"}`,
+        type: "message",
+        role: "assistant",
+        model: MODEL_ID,
+        content: [],
+        stop_reason: null,
+        usage: { input_tokens: 640, output_tokens: 0 },
+      },
     },
-  };
-}
-
-/** First turn: a sealed tool_use block whose argument buffer is truncated mid-string. */
-function rejectedToolCallTurn(): string {
-  return anthropicSse([
-    messageStart("msg_pr142176_rejected"),
     {
       type: "content_block_start",
       index: 0,
-      content_block: { type: "tool_use", id: "call_truncated", name: "read", input: {} },
+      content_block: rejected
+        ? { type: "tool_use", id: "call_truncated", name: "read", input: {} }
+        : { type: "text", text: "" },
     },
     {
       type: "content_block_delta",
       index: 0,
-      delta: { type: "input_json_delta", partial_json: '{"path":"/workspace/notes' },
+      delta: rejected
+        ? { type: "input_json_delta", partial_json: '{"path":"/workspace/notes' }
+        : { type: "text_delta", text: RECOVERED_MARKER },
     },
     { type: "content_block_stop", index: 0 },
     {
       type: "message_delta",
-      delta: { stop_reason: "tool_use", stop_sequence: null },
-      usage: { output_tokens: 1329 },
+      delta: { stop_reason: rejected ? "tool_use" : "end_turn", stop_sequence: null },
+      usage: { output_tokens: rejected ? 1329 : 12 },
     },
     { type: "message_stop" },
-  ]);
-}
-
-/** Second turn: a plain text answer carrying the recovery marker. */
-function recoveredTextTurn(): string {
-  return anthropicSse([
-    messageStart("msg_pr142176_recovered"),
-    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
-    {
-      type: "content_block_delta",
-      index: 0,
-      delta: { type: "text_delta", text: RECOVERED_MARKER },
-    },
-    { type: "content_block_stop", index: 0 },
-    {
-      type: "message_delta",
-      delta: { stop_reason: "end_turn", stop_sequence: null },
-      usage: { output_tokens: 12 },
-    },
-    { type: "message_stop" },
-  ]);
+  ];
+  return events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
 }
 
 function buildMockAnthropicProvider(baseUrl: string) {
@@ -107,7 +76,7 @@ it(
   { timeout: 90_000 },
   async () => {
     const fixture = await createFixture("openclaw-pr142176-proof-", TOKEN);
-    const { workspaceDir, configPath } = fixture;
+    const { configPath } = fixture;
     let providerServer: ReturnType<typeof createServer> | undefined;
     let gateway: Awaited<ReturnType<typeof startGatewayWithClient>> | undefined;
     const providerRequests: Array<{ method: string; url: string; stream: unknown }> = [];
@@ -130,26 +99,12 @@ it(
             "content-type": "text/event-stream; charset=utf-8",
             "cache-control": "no-cache",
           });
-          // Reject the first attempt, answer the resubmitted one.
-          response.end(
-            providerRequests.length === 1 ? rejectedToolCallTurn() : recoveredTextTurn(),
-          );
+          response.end(anthropicTurn(providerRequests.length === 1));
         });
       });
       const providerUrl = await listenProofProvider(providerServer);
       const provider = buildMockAnthropicProvider(providerUrl);
-      const cfg = {
-        agents: {
-          defaults: {
-            workspace: workspaceDir,
-            skipBootstrap: true,
-            model: { primary: provider.modelRef },
-          },
-          entries: { main: {} },
-        },
-        models: { mode: "replace", providers: { [provider.providerId]: provider.config } },
-        gateway: { auth: { mode: "token", token: TOKEN } },
-      };
+      const cfg = fixture.config(provider);
       const sessionKey = "agent:main:pr142176-proof";
       gateway = await startGatewayWithClient({
         cfg,
