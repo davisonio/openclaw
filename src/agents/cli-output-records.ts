@@ -142,6 +142,7 @@ function normalizeCliUsageRecord(raw: unknown): CliUsage | undefined {
     output: usage.output || undefined,
     cacheRead: usage.cacheRead || undefined,
     cacheWrite: usage.cacheWrite || undefined,
+    cacheWrite1h: usage.cacheWrite1h || undefined,
     total: usage.total || undefined,
   };
   return Object.values(cliUsage).some((value) => typeof value === "number" && value > 0)
