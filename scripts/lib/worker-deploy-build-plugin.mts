@@ -6,6 +6,10 @@ import {
   WORKER_BUNDLE_CHUNK_PATH_PATTERN,
   WORKER_BUNDLE_WINDOWS_SECURITY_HELPER_PATH,
 } from "../../src/shared/worker-bundle-hash.ts";
+import {
+  createFsSafeWindowsHelperAssetPlugin,
+  resolveFsSafeWindowsHelper,
+} from "./fs-safe-windows-helper-asset.mts";
 
 const WORKER_DEPLOY_BUILD_PLUGIN_NAME = "openclaw:worker-deploy";
 export const WORKER_DEPLOY_OPTIONAL_NATIVE_MODULE_ID = `${path.resolve("src/worker/worker-deploy-runtime.ts")}?optional-native`;
@@ -59,13 +63,7 @@ export function resolveWorkerDeployGeneratorInputs(rootDir = process.cwd()) {
   return [
     path.join(playwrightRoot, "package.json"),
     path.join(playwrightRoot, "browsers.json"),
-    fs.realpathSync(
-      path.resolve(
-        rootDir,
-        "node_modules/@openclaw/fs-safe/dist",
-        WORKER_BUNDLE_WINDOWS_SECURITY_HELPER_PATH,
-      ),
-    ),
+    resolveFsSafeWindowsHelper(rootDir),
     fs.realpathSync(path.resolve(rootDir, "node_modules/web-tree-sitter/web-tree-sitter.wasm")),
     fs.realpathSync(path.resolve(rootDir, "node_modules/tree-sitter-bash/tree-sitter-bash.wasm")),
     fs.realpathSync(
@@ -125,14 +123,8 @@ export function createWorkerDeployBuildPlugin(rootDir = process.cwd()) {
       "dist/windows-security-command.js",
     ),
   );
-  const [
-    packageJsonPath,
-    browsersJsonPath,
-    windowsSecurityHelperPath,
-    treeSitterWasmPath,
-    bashWasmPath,
-    photonWasmPath,
-  ] = resolveWorkerDeployGeneratorInputs(rootDir);
+  const [packageJsonPath, browsersJsonPath, , treeSitterWasmPath, bashWasmPath, photonWasmPath] =
+    resolveWorkerDeployGeneratorInputs(rootDir);
   const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8")) as {
     name: string;
     version: string;
@@ -143,16 +135,11 @@ export function createWorkerDeployBuildPlugin(rootDir = process.cwd()) {
     binPath = packageRoot;`;
 
   return {
+    ...createFsSafeWindowsHelperAssetPlugin(
+      rootDir,
+      `worker/${WORKER_BUNDLE_WINDOWS_SECURITY_HELPER_PATH}`,
+    ),
     name: WORKER_DEPLOY_BUILD_PLUGIN_NAME,
-    buildStart(this: {
-      emitFile(file: { type: "asset"; fileName: string; source: Uint8Array }): string;
-    }) {
-      this.emitFile({
-        type: "asset",
-        fileName: `worker/${WORKER_BUNDLE_WINDOWS_SECURITY_HELPER_PATH}`,
-        source: fs.readFileSync(windowsSecurityHelperPath),
-      });
-    },
     generateBundle(
       this: { error(message: string): never },
       _options: unknown,
