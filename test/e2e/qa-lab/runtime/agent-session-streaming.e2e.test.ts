@@ -463,7 +463,7 @@ describe("agent session streaming", () => {
                 return {
                   index,
                   model: typeof request.model === "string" ? request.model.slice(0, 128) : null,
-                  keys: Object.keys(request).sort().slice(0, 64),
+                  keys: Object.keys(request).toSorted().slice(0, 64),
                   inputShape: Array.isArray(request.input)
                     ? request.input.slice(0, 64).map((item) => ({
                         role: typeof item?.role === "string" ? item.role.slice(0, 64) : null,
