@@ -36,6 +36,7 @@ import { createBackupSqliteSnapshotPlan } from "../backup-sqlite-snapshot.js";
 import * as recovery from "../database-port-recovery.js";
 import { openNodeSqliteDatabase } from "../node-sqlite.js";
 import * as snapshots from "../sqlite-snapshot.js";
+import { runPluginDoctorStateMigrationPlans } from "../state-migrations.plugin-doctor.js";
 import { resolveDatabaseEngineSelection } from "./config.js";
 import { withDatabaseEngineSelection } from "./context.js";
 import { resolveDatabaseFamilyEngines } from "./registry.js";
@@ -116,6 +117,21 @@ describe.skipIf(!connection)("Matrix declared account-root database portability"
             "INSERT INTO plugin_state_entries (plugin_id, namespace, entry_key, value_json, created_at) VALUES ('matrix', 'idb-snapshot', ?, ?, 1)",
           ).run(`chunk-${index}`, cryptoValue);
         }
+        await closeOpenClawStateDatabaseAsync();
+        const migration = await runPluginDoctorStateMigrationPlans({
+          detected: {
+            stateDir: state.stateDir,
+            oauthDir: state.statePath("oauth"),
+            doctorOnlyStateMigrations: true,
+          },
+          config: {
+            ...config,
+            plugins: { allow: ["matrix"], entries: { matrix: { enabled: true } } },
+          },
+          env: state.env,
+        });
+        expect(migration.warnings).toEqual([]);
+        expect(migration.completedPluginIds).toContain("matrix");
         await closeOpenClawStateDatabaseAsync();
         await run(state, files, config);
       } finally {
