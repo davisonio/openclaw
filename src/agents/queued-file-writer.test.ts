@@ -1,11 +1,20 @@
 // Verifies ordered append logs retain restrictive permissions and reject symlinks.
 import fs from "node:fs";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { getQueuedFileWriter } from "./queued-file-writer.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const { warn } = vi.hoisted(() => ({ warn: vi.fn() }));
+
+vi.mock("../logging/subsystem.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../logging/subsystem.js")>()),
+  createSubsystemLogger: () => ({ warn }),
+}));
+beforeEach(() => {
+  warn.mockClear();
+});
 
 describe("getQueuedFileWriter", () => {
   it("flushes queued lines in order with restrictive permissions", async () => {
@@ -19,6 +28,7 @@ describe("getQueuedFileWriter", () => {
 
     expect(fs.readFileSync(filePath, "utf8")).toBe("line\nnext\n");
     expect(fs.statSync(filePath).mode & 0o777).toBe(0o600);
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it("refuses to append through a symlink", async () => {
@@ -30,9 +40,14 @@ describe("getQueuedFileWriter", () => {
     const writer = getQueuedFileWriter(new Map(), filePath);
 
     writer.write("after\n");
+    writer.write("still blocked\n");
     await writer.flush();
 
     expect(fs.readFileSync(targetPath, "utf8")).toBe("before\n");
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      "Diagnostic log write failed; check the configured log path",
+      { filePath, error: expect.anything() },
+    );
   });
 
   it("refuses to append through a symlinked parent directory", async () => {
@@ -45,8 +60,26 @@ describe("getQueuedFileWriter", () => {
     const writer = getQueuedFileWriter(new Map(), path.join(linkDir, "trace.jsonl"));
 
     writer.write("after\n");
+    writer.write("still blocked\n");
     await writer.flush();
 
     expect(fs.existsSync(path.join(targetDir, "trace.jsonl"))).toBe(false);
+    expect(warn).toHaveBeenCalledOnce();
+  });
+
+  it("reports failed directory preparation once without rejecting diagnostic flush", async () => {
+    const tmpDir = tempDirs.make("openclaw-queued-writer-");
+    const blockedDir = path.join(tmpDir, "not-a-directory");
+    fs.writeFileSync(blockedDir, "unchanged", "utf8");
+    const filePath = path.join(blockedDir, "trace.jsonl");
+    const writer = getQueuedFileWriter(new Map(), filePath);
+    writer.write("line\n");
+    writer.write("next\n");
+    await expect(writer.flush()).resolves.toBeUndefined();
+    expect(fs.readFileSync(blockedDir, "utf8")).toBe("unchanged");
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      "Diagnostic log write failed; check the configured log path",
+      { filePath, error: expect.anything() },
+    );
   });
 });
