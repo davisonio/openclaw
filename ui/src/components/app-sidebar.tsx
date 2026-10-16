@@ -19,8 +19,11 @@ import { PluginView } from "../plugins/control-ui-view.solid.tsx";
 import { appSidebarProperties, type AppSidebarProps } from "./app-sidebar-base.ts";
 import { AppSidebarOwner } from "./app-sidebar-owner.tsx";
 import { createSessionPullRequestIndicators } from "./app-sidebar-session-pr-indicators.ts";
+import { createSessionAttention } from "./session-attention.ts";
+import { createSessionOwnerFilterQuery } from "./session-owner-filter.ts";
 import { createSidebarScroll } from "./sidebar-context-controller.ts";
 import { createSidebarNavigationCatalog } from "./sidebar-navigation-catalog.ts";
+import { createSidebarPeople } from "./sidebar-people.ts";
 
 export { AppSidebarOwner } from "./app-sidebar-owner.tsx";
 
@@ -56,12 +59,22 @@ function AppSidebarContent(props: AppSidebarProps, host: HTMLElement): JSX.Eleme
   const owner = sidebarOwners.get(host) ?? new AppSidebarOwner(catalog, props, context, host);
   owner.navigationCatalog = catalog;
   owner.bindInputs(props, context);
+  owner.attention = createSessionAttention(
+    context,
+    owner.attentionQuestions,
+    host,
+    () => props.navigationVisible,
+  );
   const scroll = createSidebarScroll(owner);
   const projection = projectSource(owner, {
     read: (current) => current,
     subscribe: (current, notify) => current.subscribe(notify),
     equality: "revision",
   });
+  const people = (owner.peopleView = createSidebarPeople(owner, owner.people, () => {
+    Object.values(props);
+    return projection.read();
+  }));
   const prepared = createMemo(
     () => {
       projection.revision();
@@ -74,6 +87,9 @@ function AppSidebarContent(props: AppSidebarProps, host: HTMLElement): JSX.Eleme
       return owner;
     },
     { equals: false },
+  );
+  createSessionOwnerFilterQuery(owner.sessionOwnerFilter, prepared, () =>
+    context.sessions.listSnapshot(owner.sessionData.sessionListQuery(owner.expandedAgentId())),
   );
   const presentationRevision = createParkedProjection(
     () => {
@@ -145,11 +161,13 @@ function AppSidebarContent(props: AppSidebarProps, host: HTMLElement): JSX.Eleme
   createEffect(
     () => {
       prepared();
+      people.capture();
       scroll.capture();
     },
     () =>
       untrack(() => {
         owner.commitRender();
+        people.syncRendered();
         scroll.restore();
         // The projection owns the display deadline; this mounted view owns its timer.
         const deadline = owner.sessionProjection.subtitleDeadline;
