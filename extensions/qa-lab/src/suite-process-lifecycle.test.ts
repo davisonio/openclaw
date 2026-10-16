@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
 import { resolveTestNodeExecPath, withinTest } from "openclaw/plugin-sdk/test-fixtures";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, expect, it } from "vitest";
 import type { QaSuiteSummaryJson } from "./suite-summary.js";
 import { runQaWindowsTaskkill } from "./windows-system-tools.js";
 
@@ -17,11 +17,6 @@ const artifactsRoot = path.join(repoRoot, ".artifacts", "qa-e2e");
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 let activeRun: ReturnType<typeof startSuiteProcess> | undefined;
 const nodeExecPath = resolveTestNodeExecPath();
-
-const PROCESS_LIFECYCLE_SCENARIO = "channel-chat-baseline";
-// Keep the enclosing test budget; readiness and teardown use owned process signals.
-const SUITE_COMPLETION_TIMEOUT_MS = 420_000;
-const POST_SUMMARY_EXIT_TIMEOUT_MS = 45_000;
 
 function buildSuiteProcessEnv(outputDir: string) {
   const home = path.join(outputDir, "process-home");
@@ -61,22 +56,13 @@ function forceStopProcessTree(child: ChildProcess) {
   const rows = spawnSync("ps", ["-axo", "pid=,ppid="], { encoding: "utf8" })
     .stdout.trim()
     .split("\n")
-    .flatMap((line) => {
-      const [pidText, parentPidText] = line.trim().split(/\s+/u);
-      const pid = Number(pidText);
-      const parentPid = Number(parentPidText);
-      return Number.isSafeInteger(pid) && Number.isSafeInteger(parentPid)
-        ? [{ pid, parentPid }]
-        : [];
-    });
+    .map((line) => line.trim().split(/\s+/u).map(Number));
   const owned = new Set([child.pid]);
-  let foundDescendant = true;
-  while (foundDescendant) {
-    foundDescendant = false;
-    for (const { pid, parentPid } of rows) {
-      if (owned.has(parentPid) && !owned.has(pid)) {
+  // Set iteration also visits newly found children; reverse order kills descendants first.
+  for (const parentPid of owned) {
+    for (const [pid, parent] of rows) {
+      if (parent === parentPid && pid !== undefined && Number.isSafeInteger(pid)) {
         owned.add(pid);
-        foundDescendant = true;
       }
     }
   }
@@ -109,16 +95,12 @@ function startSuiteProcess(outputDir: string, scenarioIds: readonly string[]) {
       summaryWritten.resolve();
     }
   });
-  let stdout = "";
-  let stderr = "";
+  const output = { stderr: "" };
   const gatewayPorts = new Set<number>();
-  child.stdout?.setEncoding("utf8");
+  child.stdout?.resume();
   child.stderr?.setEncoding("utf8");
-  child.stdout?.on("data", (chunk: string) => {
-    stdout += chunk;
-  });
   child.stderr?.on("data", (chunk: string) => {
-    stderr += chunk;
+    output.stderr += chunk;
     for (const match of chunk.matchAll(/gateway ready: http:\/\/127\.0\.0\.1:(\d+)/gu)) {
       gatewayPorts.add(Number(match[1]));
     }
@@ -131,13 +113,7 @@ function startSuiteProcess(outputDir: string, scenarioIds: readonly string[]) {
       });
     },
   );
-  return {
-    child,
-    closed,
-    summaryWritten: summaryWritten.promise,
-    gatewayPorts,
-    output: () => ({ stderr, stdout }),
-  };
+  return { child, closed, summaryWritten: summaryWritten.promise, gatewayPorts, output };
 }
 
 async function isTcpPortOpen(port: number) {
@@ -153,61 +129,41 @@ async function isTcpPortOpen(port: number) {
   });
 }
 
-async function readCompletedSummary(outputDir: string) {
-  const summary = JSON.parse(
-    await fs.readFile(path.join(outputDir, "qa-suite-summary.json"), "utf8"),
-  ) as QaSuiteSummaryJson;
-  if (summary.run.status !== "completed") {
-    throw new Error(`QA suite summary is missing lifecycle status: ${summary.run.status}`);
-  }
-  return summary;
-}
+it(
+  "qa suite command exits after the terminal summary and leaves no gateway listener",
+  { timeout: 495_000 },
+  async ({ signal }) => {
+    await fs.mkdir(artifactsRoot, { recursive: true });
+    const outputDir = tempDirs.make("suite-process-lifecycle-", artifactsRoot);
+    const run = (activeRun = startSuiteProcess(outputDir, ["channel-chat-baseline"]));
+    const readSummary = async (): Promise<QaSuiteSummaryJson> =>
+      JSON.parse(await fs.readFile(path.join(outputDir, "qa-suite-summary.json"), "utf8"));
+    const heartbeat = setInterval(() => {
+      process.stderr.write(
+        `[qa-process-lifecycle] waiting for completed summary gatewayPorts=${run.gatewayPorts.size}\n`,
+      );
+    }, 30_000);
+    heartbeat.unref();
+    const summary = await withinTest(
+      Promise.race([
+        run.summaryWritten.then(readSummary),
+        // IPC and stdio close are separate signals; the durable summary decides
+        // when process close arrives before its publication receipt.
+        run.closed.then(readSummary),
+      ]),
+      signal,
+    ).finally(() => clearInterval(heartbeat));
+    const outcome = await withinTest(run.closed, signal);
+    const { output } = run;
 
-describe("qa suite command process lifecycle", () => {
-  it(
-    "exits after the terminal summary and leaves no gateway listener",
-    { timeout: SUITE_COMPLETION_TIMEOUT_MS + POST_SUMMARY_EXIT_TIMEOUT_MS + 30_000 },
-    async ({ signal }) => {
-      await fs.mkdir(artifactsRoot, { recursive: true });
-      const outputDir = tempDirs.make("suite-process-lifecycle-", artifactsRoot);
-      const run = (activeRun = startSuiteProcess(outputDir, [PROCESS_LIFECYCLE_SCENARIO]));
-      const startedWaitingAt = Date.now();
-      const heartbeat = setInterval(() => {
-        const output = run.output();
-        process.stderr.write(
-          `[qa-process-lifecycle] waiting for completed summary elapsedMs=${Date.now() - startedWaitingAt} gatewayPorts=${run.gatewayPorts.size} stderrBytes=${Buffer.byteLength(output.stderr)}\n`,
-        );
-      }, 30_000);
-      heartbeat.unref();
-      const summary = await withinTest(
-        Promise.race([
-          run.summaryWritten.then(() => readCompletedSummary(outputDir)),
-          // IPC and stdio close are separate signals; the durable summary decides
-          // when process close arrives before its publication receipt.
-          run.closed.then(async (outcome) => {
-            try {
-              return await readCompletedSummary(outputDir);
-            } catch (cause) {
-              const output = run.output();
-              throw new Error(
-                `QA suite process exited before writing a completed summary: ${JSON.stringify(outcome)}\nstdout:\n${output.stdout.slice(-8_000)}\nstderr:\n${output.stderr.slice(-8_000)}`,
-                { cause },
-              );
-            }
-          }),
-        ]),
-        signal,
-      ).finally(() => clearInterval(heartbeat));
-      const outcome = await withinTest(run.closed, signal);
-      const output = run.output();
-
-      expect(outcome, output.stderr).toEqual({ code: 0, signal: null });
-      expect(run.gatewayPorts.size, output.stderr).toBeGreaterThan(0);
-      expect(summary.run.status).toBe("completed");
-      expect(summary.counts).toEqual({ total: 1, passed: 1, failed: 0, skipped: 0 });
-      await expect(
-        Promise.all([...run.gatewayPorts].map((port) => isTcpPortOpen(port))),
-      ).resolves.toEqual([...run.gatewayPorts].map(() => false));
-    },
-  );
-});
+    expect(outcome, output.stderr).toEqual({ code: 0, signal: null });
+    expect(run.gatewayPorts.size, output.stderr).toBeGreaterThan(0);
+    expect(summary).toMatchObject({
+      run: { status: "completed" },
+      counts: { total: 1, passed: 1, failed: 0, skipped: 0 },
+    });
+    await expect(
+      Promise.all([...run.gatewayPorts].map((port) => isTcpPortOpen(port))),
+    ).resolves.toEqual([...run.gatewayPorts].map(() => false));
+  },
+);

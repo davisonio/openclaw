@@ -1,6 +1,7 @@
+import { setImmediate as nextTurn } from "node:timers/promises";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { QA_CHANNEL_DEFAULT_SUITE_CONCURRENCY } from "./qa-channel-transport.js";
+import { QA_CHANNEL_DEFAULT_SUITE_CONCURRENCY as channelConcurrency } from "./qa-channel-transport.js";
 import { mapQaSuiteWithConcurrency, normalizeQaSuiteConcurrency } from "./suite-planning.js";
 
 describe("qa suite concurrency", () => {
@@ -10,22 +11,15 @@ describe("qa suite concurrency", () => {
     vi.stubEnv("OPENCLAW_QA_SUITE_CONCURRENCY", undefined);
     expect(normalizeQaSuiteConcurrency(undefined, 10)).toBe(10);
     expect(normalizeQaSuiteConcurrency(undefined, 80)).toBe(64);
-    expect(normalizeQaSuiteConcurrency(undefined, 80, QA_CHANNEL_DEFAULT_SUITE_CONCURRENCY)).toBe(
-      4,
-    );
+    expect(normalizeQaSuiteConcurrency(undefined, 80, channelConcurrency)).toBe(4);
     expect(normalizeQaSuiteConcurrency(2.8, 10)).toBe(2);
     expect(normalizeQaSuiteConcurrency(20, 3)).toBe(3);
     expect(normalizeQaSuiteConcurrency(0, 3)).toBe(1);
 
-    vi.stubEnv("OPENCLAW_QA_SUITE_CONCURRENCY", "3");
-    expect(normalizeQaSuiteConcurrency(undefined, 10)).toBe(3);
-
-    vi.stubEnv("OPENCLAW_QA_SUITE_CONCURRENCY", "0");
-    expect(normalizeQaSuiteConcurrency(undefined, 10)).toBe(1);
-
-    for (const value of ["0x10", "1e2", "2.5"]) {
+    const envValues = { "3": 3, "0": 1, "0x10": 10, "1e2": 10, "2.5": 10 };
+    for (const [value, expected] of Object.entries(envValues)) {
       vi.stubEnv("OPENCLAW_QA_SUITE_CONCURRENCY", value);
-      expect(normalizeQaSuiteConcurrency(undefined, 10)).toBe(10);
+      expect(normalizeQaSuiteConcurrency(undefined, 10)).toBe(expected);
     }
   });
 
@@ -76,7 +70,7 @@ describe("qa suite concurrency", () => {
     const sibling = createDeferred<void>();
     const bothStarted = createDeferred<void>();
     const started: number[] = [];
-    let settled = false;
+    const settled = vi.fn((outcome: { rejected: boolean; error: unknown }) => outcome);
     const run = mapQaSuiteWithConcurrency([1, 2, 3], 2, async (item) => {
       started.push(item);
       if (item === 1) {
@@ -87,21 +81,13 @@ describe("qa suite concurrency", () => {
       await sibling.promise;
       throw new Error("later sibling failure");
     }).then(
-      () => {
-        settled = true;
-        return { rejected: false, error: undefined };
-      },
-      (error: unknown) => {
-        settled = true;
-        return { rejected: true, error };
-      },
+      () => settled({ rejected: false, error: undefined }),
+      (error: unknown) => settled({ rejected: true, error }),
     );
     await bothStarted.promise;
-    await new Promise<void>((resolve) => {
-      setImmediate(resolve);
-    });
+    await nextTurn();
     expect(started).toEqual([1, 2]);
-    expect(settled).toBe(false);
+    expect(settled).not.toHaveBeenCalled();
     sibling.resolve();
     expect(await run).toEqual({ rejected: true, error: undefined });
     expect(started).toEqual([1, 2]);
@@ -116,19 +102,14 @@ describe("qa suite concurrency", () => {
       throw failure;
     });
     const sleepImpl = vi.fn(() => stagger.promise);
-    let settled = false;
+    const settled = vi.fn((error: unknown) => error);
     const run = mapQaSuiteWithConcurrency([1, 2, 3], 3, mapper, {
       startStaggerMs: 25,
       sleepImpl,
-    }).catch((error: unknown) => {
-      settled = true;
-      return error;
-    });
+    }).catch(settled);
     await started.promise;
-    await new Promise<void>((resolve) => {
-      setImmediate(resolve);
-    });
-    expect(settled).toBe(false);
+    await nextTurn();
+    expect(settled).not.toHaveBeenCalled();
     expect(mapper).toHaveBeenCalledOnce();
     stagger.resolve();
     expect(await run).toBe(failure);
@@ -138,7 +119,7 @@ describe("qa suite concurrency", () => {
 
   it("staggers scenario starts without reducing mapped concurrency", async () => {
     const sleeps: number[] = [];
-    const releaseSleeps: Array<() => void> = [];
+    const releaseSleeps = Array.from({ length: 3 }, () => createDeferred<void>());
     const started: number[] = [];
     const waitForStarted = (expected: number[]) =>
       vi.waitFor(() => expect(started).toEqual(expected));
@@ -151,21 +132,19 @@ describe("qa suite concurrency", () => {
       },
       {
         startStaggerMs: 25,
-        sleepImpl: async (ms) => {
+        sleepImpl: (ms) => {
           sleeps.push(ms);
-          await new Promise<void>((resolve) => {
-            releaseSleeps.push(resolve);
-          });
+          return releaseSleeps[sleeps.length - 1]!.promise;
         },
       },
     );
 
     await waitForStarted([1]);
-    releaseSleeps.shift()?.();
+    releaseSleeps[0]!.resolve();
     await waitForStarted([1, 2]);
-    releaseSleeps.shift()?.();
+    releaseSleeps[1]!.resolve();
     await waitForStarted([1, 2, 3]);
-    releaseSleeps.shift()?.();
+    releaseSleeps[2]!.resolve();
     await waitForStarted([1, 2, 3, 4]);
 
     expect(await resultPromise).toEqual([1, 2, 3, 4]);

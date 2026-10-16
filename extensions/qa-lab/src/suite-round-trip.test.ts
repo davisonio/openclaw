@@ -23,9 +23,41 @@ describe("QA suite round-trip probe", () => {
     state = createQaBusState();
   });
   afterEach(() => state.reset(true));
-  const fromScenario = { fromScenario: true, senderId: "primary" } as const;
+  const observed = {
+    scenarioId: "selected-scenario",
+    maxFailures: 1,
+    input: { fromScenario: true, senderId: "primary" },
+  } as const;
   const addOutbound = (to: string, text: string, accountId = "sut") =>
     state.addOutboundMessage({ accountId, to, text });
+
+  function echoTransport() {
+    const replies: ReturnType<typeof state.addOutboundMessage>[] = [];
+    const sendInbound = vi.fn(async (input: QaBusInboundMessageInput) => {
+      const message = state.addInboundMessage(input);
+      replies.push(
+        state.addOutboundMessage({
+          accountId: "sut",
+          to: buildQaTarget({
+            chatType: input.conversation.kind,
+            conversationId: input.conversation.id,
+            threadId: input.threadId,
+          }),
+          text: input.text,
+          replyToId: message.id,
+        }),
+      );
+      return message;
+    });
+    const waitForOutbound = vi.fn(async () => {
+      const reply = replies.at(-1);
+      if (!reply) {
+        throw new Error("fixture did not record the probe reply");
+      }
+      return reply;
+    });
+    return { accountId: "sut", state, sendInbound, waitForOutbound, replies };
+  }
 
   it.each([
     { id: "telegram-reply-chain-dm", kind: "direct", outboundOnly: false },
@@ -54,46 +86,18 @@ describe("QA suite round-trip probe", () => {
       const deleted = addOutbound("group:deleted", "deleted");
       state.deleteMessage({ accountId: "sut", messageId: deleted.id });
       addOutbound("group:foreign", "foreign", "foreign");
-      const replies: string[] = [];
-      const sendInbound = vi.fn(async (input: QaBusInboundMessageInput) => {
-        const message = state.addInboundMessage(input);
-        const reply = state.addOutboundMessage({
-          accountId: "sut",
-          to: buildQaTarget({
-            chatType: input.conversation.kind,
-            conversationId: input.conversation.id,
-            threadId: input.threadId,
-          }),
-          text: input.text,
-          replyToId: message.id,
-        });
-        replies.push(reply.id);
-        return message;
-      });
-      const waitForOutbound = vi.fn(async () => {
-        const reply = state
-          .getSnapshot()
-          .messages.findLast((message) => message.direction === "outbound" && !message.deleted);
-        if (!reply) {
-          throw new Error("fixture did not record the probe reply");
-        }
-        return reply;
-      });
+      const transport = echoTransport();
+      const { replies, sendInbound, waitForOutbound } = transport;
       const result = await runQaSuiteRoundTripProbe({
-        probe: makeProbe({
-          scenarioId: "selected-scenario",
-          maxFailures: 1,
-          input: fromScenario,
-          chainReplies: true,
-        }),
-        transport: { accountId: "sut", state, sendInbound, waitForOutbound },
+        probe: makeProbe({ ...observed, chainReplies: true }),
+        transport,
         scenarioStartCursor,
       });
       expect(result).toMatchObject({ passed: 2, failed: 0 });
       const expectedInput = { accountId: "sut", conversation, threadId, senderId: "primary" };
       expect(sendInbound.mock.calls.map(([input]) => input)).toMatchObject([
         expectedInput,
-        { ...expectedInput, replyToId: replies[0] },
+        { ...expectedInput, replyToId: replies[0]!.id },
       ]);
       const first = sendInbound.mock.calls[0]?.[0];
       expect(first).not.toHaveProperty("replyToId");
@@ -114,12 +118,7 @@ describe("QA suite round-trip probe", () => {
     const sendInbound = vi.fn();
     await expect(
       runQaSuiteRoundTripProbe({
-        probe: makeProbe({
-          scenarioId: "selected-scenario",
-          count: 1,
-          maxFailures: 1,
-          input: fromScenario,
-        }),
+        probe: makeProbe({ ...observed, count: 1 }),
         transport: { accountId: "sut", state, sendInbound, waitForOutbound: vi.fn() },
         scenarioStartCursor,
       }),
@@ -128,27 +127,16 @@ describe("QA suite round-trip probe", () => {
   });
 
   it("collects requested samples and chains native replies", async () => {
-    const messages: Array<{ direction: "outbound"; id: string }> = [];
-    const sendInbound = vi.fn().mockResolvedValue({ id: "inbound" });
-    const waitForOutbound = vi.fn().mockImplementation(async () => {
-      const reply = { id: `out-${messages.length + 1}` };
-      messages.push({ direction: "outbound", id: reply.id });
-      return reply;
-    });
-
+    const transport = echoTransport();
     const result = await runQaSuiteRoundTripProbe({
       probe: makeProbe({ chainReplies: true }),
-      transport: {
-        state: {
-          getSnapshot: () => ({ messages }),
-        },
-        sendInbound,
-        waitForOutbound,
-      } as never,
+      transport,
     });
 
     expect(result).toMatchObject({ passed: 2, failed: 0, timing: { samples: 2 } });
-    expect(sendInbound.mock.calls[1]?.[0]).toMatchObject({ replyToId: "out-1" });
+    expect(transport.sendInbound.mock.calls[1]?.[0]).toMatchObject({
+      replyToId: transport.replies[0]!.id,
+    });
   });
 
   it.each(["timeout", "off-thread reply"])(
