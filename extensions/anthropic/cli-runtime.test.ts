@@ -130,6 +130,24 @@ async function collect(context: CliBackendExecuteContext) {
   return records;
 }
 
+async function startInjection(scenario: string, overrides: Partial<CliBackendExecuteContext> = {}) {
+  let injection: CliBackendMessageInjection | undefined;
+  const context = await createContext(scenario, {
+    ...overrides,
+    registerMessageInjection: (value) => {
+      injection = value;
+    },
+  });
+  const running = collect(context);
+  void running.catch(() => {});
+  await receipts.waitFor(path.join(context.cwd, "turn.ready"), "ready");
+  expect(injection?.isAvailable()).toBe(true);
+  if (!injection) {
+    throw new Error("Expected native message injection");
+  }
+  return { context, running, injection };
+}
+
 async function fixtureReadyBeforeSettlement(
   context: CliBackendExecuteContext,
   fileName: string,
@@ -652,23 +670,15 @@ describe("Claude native stdio boundary", () => {
   ])(
     "delivers same-turn input once native starts it and keeps the turn open ($scenario)",
     async ({ scenario, results }) => {
-      let injection: CliBackendMessageInjection | undefined;
-      const context = await createContext(scenario, {
-        liveSession: createLiveSession(),
+      const { running, injection } = await startInjection(scenario, {
         promptContext: { prependContext: "current private context" },
-        registerMessageInjection: (value) => {
-          injection = value;
-        },
       });
-      const running = collect(context);
-      await receipts.waitFor(path.join(context.cwd, "turn.ready"), "ready");
-      expect(injection?.isAvailable()).toBe(true);
       const withCurrent = vi.fn(async (submit: () => void) => submit());
       const notificationReplay = scenario.includes("notification-replay");
       const input = notificationReplay
         ? "<task-notification><task-id>background-agent</task-id></task-notification>"
         : "steering input";
-      await injection!.queueMessage(input, withCurrent);
+      await injection.queueMessage(input, withCurrent);
       expect(withCurrent).toHaveBeenCalledOnce();
       const records = await running;
       const resultRecords = records.filter((record) => record.type === "result");
@@ -694,7 +704,7 @@ describe("Claude native stdio boundary", () => {
       expect(detail.injectedRerunContext).toEqual(
         scenario.startsWith("steer-hook-") ? {} : undefined,
       );
-      expect(injection!.isAvailable()).toBe(false);
+      expect(injection.isAvailable()).toBe(false);
     },
   );
 
@@ -719,18 +729,10 @@ describe("Claude native stdio boundary", () => {
   });
 
   it("suppresses private context for injected input that repeats the admitted prompt", async () => {
-    let injection: CliBackendMessageInjection | undefined;
-    const context = await createContext("steer-merged", {
-      liveSession: createLiveSession(),
+    const { context, running, injection } = await startInjection("steer-merged", {
       promptContext: { prependContext: "current private context" },
-      registerMessageInjection: (value) => {
-        injection = value;
-      },
     });
-    const running = collect(context);
-    await receipts.waitFor(path.join(context.cwd, "turn.ready"), "ready");
-    expect(injection?.isAvailable()).toBe(true);
-    await injection!.queueMessage(context.prompt, async (submit) => submit());
+    await injection.queueMessage(context.prompt, async (submit) => submit());
     const records = await running;
 
     const detail = resultDetail(records);
@@ -740,19 +742,9 @@ describe("Claude native stdio boundary", () => {
   });
 
   it("rejects same-turn input the native process never started", async () => {
-    let injection: CliBackendMessageInjection | undefined;
-    const context = await createContext("steer-exit", {
-      liveSession: createLiveSession(),
-      registerMessageInjection: (value) => {
-        injection = value;
-      },
-    });
-    const running = collect(context);
-    void running.catch(() => {});
-    await receipts.waitFor(path.join(context.cwd, "turn.ready"), "ready");
-    expect(injection?.isAvailable()).toBe(true);
+    const { running, injection } = await startInjection("steer-exit");
     await expect(
-      injection!.queueMessage("lost input", async (submit) => submit()),
+      injection.queueMessage("lost input", async (submit) => submit()),
     ).rejects.toThrow();
     await expect(running).rejects.toThrow();
   });
@@ -760,17 +752,8 @@ describe("Claude native stdio boundary", () => {
   it.each(["cancelled", "discarded", "refused", "completed"])(
     "settles %s same-turn input and releases the held result",
     async (state) => {
-      let injection: CliBackendMessageInjection | undefined;
-      const context = await createContext(`steer-${state}`, {
-        liveSession: createLiveSession(),
-        registerMessageInjection: (value) => {
-          injection = value;
-        },
-      });
-      const running = collect(context);
-      await receipts.waitFor(path.join(context.cwd, "turn.ready"), "ready");
-      expect(injection?.isAvailable()).toBe(true);
-      const receipt = injection!.queueMessage("terminal input", async (submit) => submit());
+      const { running, injection } = await startInjection(`steer-${state}`);
+      const receipt = injection.queueMessage("terminal input", async (submit) => submit());
       if (state === "completed") {
         await expect(receipt).resolves.toBeUndefined();
       } else {
@@ -785,19 +768,9 @@ describe("Claude native stdio boundary", () => {
   );
 
   it("refuses same-turn input when the admitted authority fails at the write", async () => {
-    let injection: CliBackendMessageInjection | undefined;
-    const context = await createContext("steer-merged", {
-      liveSession: createLiveSession(),
-      registerMessageInjection: (value) => {
-        injection = value;
-      },
-    });
-    const running = collect(context);
-    void running.catch(() => {});
-    await receipts.waitFor(path.join(context.cwd, "turn.ready"), "ready");
-    expect(injection?.isAvailable()).toBe(true);
+    const { context, injection } = await startInjection("steer-merged");
     await expect(
-      injection!.queueMessage("revoked input", async () => {
+      injection.queueMessage("revoked input", async () => {
         throw new Error("revoked");
       }),
     ).rejects.toThrow("revoked");

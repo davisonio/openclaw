@@ -1,4 +1,3 @@
-// Anthropic tests cover cli shared plugin behavior.
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { describe, expect, it, vi } from "vitest";
 import { buildAnthropicCliBackend } from "./cli-backend.js";
@@ -28,6 +27,41 @@ type ClaudePreparedExecutionWithSecret = {
 const CLAUDE_CLI_DISALLOWED_TOOLS =
   "ScheduleWakeup,CronCreate,Bash(run_in_background:true),Monitor";
 const CLAUDE_CACHE_FLAG = "--exclude-dynamic-system-prompt-sections";
+
+const argv = (...parts: string[]) => parts.flatMap((part) => part.split(" "));
+
+type Backend = ReturnType<typeof buildAnthropicCliBackend>;
+type PrepareContext = Parameters<NonNullable<Backend["prepareExecution"]>>[0];
+type Credential =
+  | { type: "oauth"; provider: string; access: string; refresh: string; expires: number }
+  | { type: "token"; provider: string; token: string }
+  | { type: "api_key"; provider: string; key: string };
+function prepare(
+  backend: Backend,
+  overrides: Partial<PrepareContext> & {
+    authCredential?: Credential;
+    isolatedCompletionPrompt?: string;
+    isolatedCompletionSystemPrompt?: string;
+  } = {},
+) {
+  return backend.prepareExecution?.({
+    workspaceDir: "/tmp/openclaw-claude-cli",
+    provider: "claude-cli",
+    modelId: "claude-opus-4-7",
+    ...overrides,
+  });
+}
+
+function executionArgs(overrides: Partial<Parameters<typeof resolveClaudeCliExecutionArgs>[0]>) {
+  return resolveClaudeCliExecutionArgs({
+    workspaceDir: "/tmp",
+    provider: "claude-cli",
+    modelId: "claude-opus-4-8",
+    useResume: false,
+    baseArgs: ["-p"],
+    ...overrides,
+  });
+}
 
 describe("Claude CLI adapter equivalence", () => {
   const commonArgs = [
@@ -65,16 +99,11 @@ describe("Claude CLI adapter equivalence", () => {
 
   it("privately acknowledges isolated completion preparation", () => {
     const backend = buildAnthropicCliBackend();
-    const prepared = backend.prepareExecution?.({
-      workspaceDir: "/tmp/openclaw-claude-cli",
-      provider: "claude-cli",
+    const prepared = prepare(backend, {
       modelId: "claude-opus-4-8",
       isolatedCompletionPrompt: "TASK: return JSON",
       isolatedCompletionSystemPrompt: "Return JSON.",
-    } as Parameters<NonNullable<typeof backend.prepareExecution>>[0] & {
-      isolatedCompletionPrompt: string;
-      isolatedCompletionSystemPrompt: string;
-    }) as { env?: Record<string, string>; isolatedCompletionEnforced?: true };
+    });
 
     expect(prepared).toEqual({
       env: { CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS: "1" },
@@ -89,30 +118,20 @@ describe("Claude CLI adapter equivalence", () => {
     const compactingStatus = { type: "system", subtype: "status", status: "compacting" };
     const compactResult = { compact_result: "success" };
     const compactBoundary = { type: "system", subtype: "compact_boundary" };
+    const validate = (events: Record<string, unknown>[], suffix = "\n") =>
+      manualCompaction?.validateOutput(
+        events.map((event) => JSON.stringify(event)).join("\n") + suffix,
+      );
 
     expect(manualCompaction?.buildPrompt()).toBe("/compact");
     expect(manualCompaction?.buildPrompt(" keep operator decisions ")).toBe(
       "/compact keep operator decisions",
     );
     expect(manualCompaction?.input).toBe("arg");
-    expect(
-      manualCompaction?.validateOutput(
-        [compactingStatus, compactResult, compactBoundary]
-          .map((event) => JSON.stringify(event))
-          .join("\n"),
-      ),
-    ).toEqual({ ok: true });
-    expect(manualCompaction?.validateOutput(`${JSON.stringify(compactResult)}\n`)).toEqual({
-      ok: true,
-    });
-    expect(manualCompaction?.validateOutput(`${JSON.stringify(compactBoundary)}\n`)).toEqual({
-      ok: true,
-    });
-    expect(
-      manualCompaction?.validateOutput(
-        `${JSON.stringify(compactingStatus)}\n${JSON.stringify({ type: "system", subtype: "local_command" })}\n`,
-      ),
-    ).toEqual({
+    expect(validate([compactingStatus, compactResult, compactBoundary], "")).toEqual({ ok: true });
+    expect(validate([compactResult])).toEqual({ ok: true });
+    expect(validate([compactBoundary])).toEqual({ ok: true });
+    expect(validate([compactingStatus, { type: "system", subtype: "local_command" }])).toEqual({
       ok: false,
       reason: "Claude CLI did not confirm that native compaction ran.",
     });
@@ -191,37 +210,25 @@ describe("resolveClaudeCliExecutionArgs", () => {
       throw new Error("Anthropic CLI backend must expose resumed manual compaction");
     }
 
-    const argv = [
-      ...resolveClaudeCliExecutionArgs({
-        workspaceDir: "/tmp",
-        provider: "claude-cli",
-        modelId: "claude-opus-4-8",
+    const args = [
+      ...executionArgs({
         useResume: true,
         baseArgs,
       }),
       manualCompaction.buildPrompt(),
     ];
 
-    expect(argv).toContain("/compact");
-    expect(argv).not.toContain("--disable-slash-commands");
+    expect(args).toContain("/compact");
+    expect(args).not.toContain("--disable-slash-commands");
   });
 
   it("denies every configured MCP tool when the allowlist is empty", () => {
     expect(
-      resolveClaudeCliExecutionArgs({
-        workspaceDir: "/tmp",
-        provider: "claude-cli",
-        modelId: "claude-opus-4-8",
-        useResume: false,
-        baseArgs: [
-          "-p",
-          "--tools",
-          "Bash,Edit",
-          "--allowedTools",
-          "mcp__openclaw__*",
-          "--disallowedTools",
+      executionArgs({
+        baseArgs: argv(
+          "-p --tools Bash,Edit --allowedTools mcp__openclaw__* --disallowedTools",
           "mcp__other__*",
-        ],
+        ),
         toolAvailability: { native: [], openClaw: [] },
       }),
     ).toEqual([
@@ -246,12 +253,9 @@ describe("resolveClaudeCliExecutionArgs", () => {
       const baseArgs = ["-p", "--effort", "xhigh", "--effort=low"];
 
       expect(
-        resolveClaudeCliExecutionArgs({
-          workspaceDir: "/tmp",
-          provider: "claude-cli",
+        executionArgs({
           modelId: "claude-sonnet-4-6",
           thinkingLevel,
-          useResume: false,
           baseArgs,
         }),
       ).toEqual(baseArgs);
@@ -260,12 +264,9 @@ describe("resolveClaudeCliExecutionArgs", () => {
 
   it("defensively maps impossible Fable off requests to the lowest Claude effort", () => {
     expect(
-      resolveClaudeCliExecutionArgs({
-        workspaceDir: "/tmp",
-        provider: "claude-cli",
+      executionArgs({
         modelId: "claude-fable-5",
         thinkingLevel: "off",
-        useResume: false,
         baseArgs: ["-p", "--effort", "high"],
       }),
     ).toEqual(["-p", "--effort", "low"]);
@@ -276,12 +277,9 @@ describe("resolveClaudeCliExecutionArgs", () => {
     ["medium", "medium"],
   ] as const)("maps %s thinking to --effort %s", (thinkingLevel, effort) => {
     expect(
-      resolveClaudeCliExecutionArgs({
-        workspaceDir: "/tmp",
-        provider: "claude-cli",
+      executionArgs({
         modelId: "claude-opus-4-7",
         thinkingLevel,
-        useResume: false,
         baseArgs: ["-p"],
       }),
     ).toEqual(["-p", "--effort", effort]);
@@ -289,63 +287,32 @@ describe("resolveClaudeCliExecutionArgs", () => {
 
   it("strips configured effort args when thinking is adaptive", () => {
     expect(
-      resolveClaudeCliExecutionArgs({
-        workspaceDir: "/tmp",
-        provider: "claude-cli",
-        modelId: "claude-opus-4-8",
+      executionArgs({
         thinkingLevel: "adaptive",
         useResume: true,
-        baseArgs: [
-          "-p",
-          "--effort",
-          "xhigh",
-          "--output-format",
-          "stream-json",
-          "--effort=low",
-          "--verbose",
-          "--resume",
+        baseArgs: argv(
+          "-p --effort xhigh --output-format stream-json --effort=low --verbose --resume",
           "{sessionId}",
-        ],
+        ),
       }),
-    ).toEqual(["-p", "--output-format", "stream-json", "--verbose", "--resume", "{sessionId}"]);
+    ).toEqual(argv("-p --output-format stream-json --verbose --resume {sessionId}"));
   });
 
   it("forces isolated no-tool one-shot args for side-question execution", () => {
     expect(
-      resolveClaudeCliExecutionArgs({
-        workspaceDir: "/tmp",
-        provider: "claude-cli",
+      executionArgs({
         modelId: "claude-opus-4-7",
         thinkingLevel: "max",
         useResume: true,
         executionMode: "side-question",
-        baseArgs: [
-          "-p",
-          "--output-format",
-          "stream-json",
-          "--allowedTools=mcp__openclaw__*",
-          "--allowedTools",
-          "Read",
-          "Grep",
-          "--permission-mode",
-          "bypassPermissions",
-          "--session-id=abc",
-          "--resume",
-          "old-session",
-          "--resume-session-at",
-          "old-message",
-          "--resume-session-at=old-message-equals",
-          "--mcp-config",
-          "/tmp/side-question-mcp.json",
-          "--bare",
-          "--safe-mode",
-          "--strict-mcp-config",
-          "--no-session-persistence",
-          "--max-turns",
-          "4",
-          "--effort",
-          "high",
-        ],
+        baseArgs: argv(
+          "-p --output-format stream-json --allowedTools=mcp__openclaw__* --allowedTools",
+          "Read Grep --permission-mode bypassPermissions --session-id=abc --resume",
+          "old-session --resume-session-at old-message",
+          "--resume-session-at=old-message-equals --mcp-config /tmp/side-question-mcp.json",
+          "--bare --safe-mode --strict-mcp-config --no-session-persistence --max-turns 4",
+          "--effort high",
+        ),
       }),
     ).toEqual([
       "-p",
@@ -366,36 +333,49 @@ describe("resolveClaudeCliExecutionArgs", () => {
   });
 });
 
+function registeredBackend(
+  readRuntime: () => {
+    system: {
+      runCommandWithTimeout: () => Promise<{ code: number; stdout: string; stderr: string }>;
+    };
+  },
+) {
+  const registerCliBackend = vi.fn();
+  const registerHook = vi.fn();
+  registerAnthropicPlugin({
+    pluginConfig: { sessionCatalog: { enabled: false } },
+    get runtime() {
+      return readRuntime();
+    },
+    registerCliBackend,
+    registerHook,
+    registerProvider: vi.fn(),
+    registerMediaUnderstandingProvider: vi.fn(),
+    registerNodeInvokePolicy: vi.fn(),
+  } as unknown as Parameters<typeof registerAnthropicPlugin>[0]);
+  return { backend: registerCliBackend.mock.calls[0]?.[0] as Backend, registerHook };
+}
+
 describe("normalizeClaudeBackendConfig", () => {
   it("normalizes both args and resumeArgs for custom overrides", () => {
     const normalized = normalizeClaudeBackendConfig({
       command: "claude",
       args: ["-p", "--output-format", "stream-json", "--verbose"],
-      resumeArgs: ["-p", "--output-format", "stream-json", "--verbose", "--resume", "{sessionId}"],
+      resumeArgs: argv("-p --output-format stream-json --verbose --resume {sessionId}"),
     });
 
-    expect(normalized.args).toEqual([
-      "-p",
-      "--output-format",
-      "stream-json",
-      "--verbose",
-      "--setting-sources",
-      "user",
-      "--permission-mode",
-      "bypassPermissions",
-    ]);
-    expect(normalized.resumeArgs).toEqual([
-      "-p",
-      "--output-format",
-      "stream-json",
-      "--verbose",
-      "--resume",
-      "{sessionId}",
-      "--setting-sources",
-      "user",
-      "--permission-mode",
-      "bypassPermissions",
-    ]);
+    expect(normalized.args).toEqual(
+      argv(
+        "-p --output-format stream-json --verbose --setting-sources user --permission-mode",
+        "bypassPermissions",
+      ),
+    );
+    expect(normalized.resumeArgs).toEqual(
+      argv(
+        "-p --output-format stream-json --verbose --resume {sessionId} --setting-sources",
+        "user --permission-mode bypassPermissions",
+      ),
+    );
     expect(normalized.output).toBe("jsonl");
     expect(normalized.liveSession).toBe("claude-stdio");
     expect(normalized.input).toBe("stdin");
@@ -418,38 +398,17 @@ describe("normalizeClaudeBackendConfig", () => {
   });
 
   it("derives Claude bypass from per-agent OpenClaw exec policy", () => {
-    expect(
+    const forAgent = (agentId: string, globalMode: "ask" | "full", agentMode: "ask" | "full") =>
       normalizeClaudeArgs(["-p"], {
         backendId: "claude-cli",
-        agentId: "safe-agent",
+        agentId,
         config: {
-          tools: { exec: { mode: "full" } },
-          agents: {
-            entries: {
-              "safe-agent": {
-                tools: { exec: { mode: "ask" } },
-              },
-            },
-          },
+          tools: { exec: { mode: globalMode } },
+          agents: { entries: { [agentId]: { tools: { exec: { mode: agentMode } } } } },
         },
-      }),
-    ).not.toContain("bypassPermissions");
-    expect(
-      normalizeClaudeArgs(["-p"], {
-        backendId: "claude-cli",
-        agentId: "yolo-agent",
-        config: {
-          tools: { exec: { mode: "ask" } },
-          agents: {
-            entries: {
-              "yolo-agent": {
-                tools: { exec: { mode: "full" } },
-              },
-            },
-          },
-        },
-      }),
-    ).toContain("bypassPermissions");
+      });
+    expect(forAgent("safe-agent", "full", "ask")).not.toContain("bypassPermissions");
+    expect(forAgent("yolo-agent", "ask", "full")).toContain("bypassPermissions");
   });
 
   it("gates the Claude cache-control flag on the capability probe", () => {
@@ -482,24 +441,7 @@ describe("normalizeClaudeBackendConfig", () => {
     const version = createDeferred<{ code: number; stdout: string; stderr: string }>();
     const runCommandWithTimeout = vi.fn(() => version.promise);
     const readRuntime = vi.fn(() => ({ system: { runCommandWithTimeout } }));
-    const registerCliBackend = vi.fn();
-    const registerHook = vi.fn();
-    const api = {
-      pluginConfig: { sessionCatalog: { enabled: false } },
-      get runtime() {
-        return readRuntime();
-      },
-      registerCliBackend,
-      registerHook,
-      registerProvider: vi.fn(),
-      registerMediaUnderstandingProvider: vi.fn(),
-      registerNodeInvokePolicy: vi.fn(),
-    };
-
-    registerAnthropicPlugin(api as unknown as Parameters<typeof registerAnthropicPlugin>[0]);
-    const backend = registerCliBackend.mock.calls[0]?.[0] as ReturnType<
-      typeof buildAnthropicCliBackend
-    >;
+    const { backend, registerHook } = registeredBackend(readRuntime);
     expect(readRuntime).not.toHaveBeenCalled();
     expect(runCommandWithTimeout).not.toHaveBeenCalled();
     const context = {
@@ -538,22 +480,7 @@ describe("normalizeClaudeBackendConfig", () => {
 
   it("keeps the established argv when the version probe fails", async () => {
     const runCommandWithTimeout = vi.fn().mockRejectedValue(new Error("claude is unavailable"));
-    const registerCliBackend = vi.fn();
-    const registerHook = vi.fn();
-    const api = {
-      pluginConfig: { sessionCatalog: { enabled: false } },
-      runtime: { system: { runCommandWithTimeout } },
-      registerCliBackend,
-      registerHook,
-      registerProvider: vi.fn(),
-      registerMediaUnderstandingProvider: vi.fn(),
-      registerNodeInvokePolicy: vi.fn(),
-    };
-
-    registerAnthropicPlugin(api as unknown as Parameters<typeof registerAnthropicPlugin>[0]);
-    const backend = registerCliBackend.mock.calls[0]?.[0] as ReturnType<
-      typeof buildAnthropicCliBackend
-    >;
+    const { backend } = registeredBackend(() => ({ system: { runCommandWithTimeout } }));
     await backend.prepareExecution?.({
       workspaceDir: "/tmp",
       provider: "claude-cli",
@@ -610,10 +537,7 @@ describe("normalizeClaudeBackendConfig", () => {
     const backend = buildAnthropicCliBackend();
 
     expect(
-      backend.prepareExecution?.({
-        workspaceDir: "/tmp/openclaw-claude-cli",
-        provider: "claude-cli",
-        modelId: "claude-opus-4-7",
+      prepare(backend, {
         contextTokenBudget: 100_000,
       }),
     ).toEqual({
@@ -627,10 +551,7 @@ describe("normalizeClaudeBackendConfig", () => {
   it("forwards the selected OAuth profile through Claude's private descriptor", async () => {
     const backend = buildAnthropicCliBackend();
 
-    const prepared = backend.prepareExecution?.({
-      workspaceDir: "/tmp/openclaw-claude-cli",
-      provider: "claude-cli",
-      modelId: "claude-opus-4-7",
+    const prepared = prepare(backend, {
       authProfileId: "anthropic:claude-cli",
       authCredential: {
         type: "oauth",
@@ -639,14 +560,6 @@ describe("normalizeClaudeBackendConfig", () => {
         refresh: "selected-refresh-token",
         expires: Date.now() + 60_000,
       },
-    } as Parameters<NonNullable<typeof backend.prepareExecution>>[0] & {
-      authCredential: {
-        type: "oauth";
-        provider: string;
-        access: string;
-        refresh: string;
-        expires: number;
-      };
     }) as ClaudePreparedExecutionWithSecret;
 
     expect(prepared.env).toEqual({
@@ -660,29 +573,19 @@ describe("normalizeClaudeBackendConfig", () => {
     expect(prepared.secretInput.fingerprint).not.toContain("selected-access-token");
     expect(prepared.secretInput.createData().toString("utf8")).toBe("selected-access-token");
 
-    const sameToken = backend.prepareExecution?.({
-      workspaceDir: "/tmp/openclaw-claude-cli",
-      provider: "claude-cli",
-      modelId: "claude-opus-4-7",
+    const sameToken = prepare(backend, {
       authCredential: {
         type: "token",
         provider: "claude-cli",
         token: "selected-access-token",
       },
-    } as Parameters<NonNullable<typeof backend.prepareExecution>>[0] & {
-      authCredential: { type: "token"; provider: string; token: string };
     }) as ClaudePreparedExecutionWithSecret;
-    const rotatedToken = backend.prepareExecution?.({
-      workspaceDir: "/tmp/openclaw-claude-cli",
-      provider: "claude-cli",
-      modelId: "claude-opus-4-7",
+    const rotatedToken = prepare(backend, {
       authCredential: {
         type: "token",
         provider: "claude-cli",
         token: "rotated-access-token",
       },
-    } as Parameters<NonNullable<typeof backend.prepareExecution>>[0] & {
-      authCredential: { type: "token"; provider: string; token: string };
     }) as ClaudePreparedExecutionWithSecret;
     expect(sameToken.secretInput.fingerprint).toBe(prepared.secretInput.fingerprint);
     expect(rotatedToken.secretInput.fingerprint).not.toBe(prepared.secretInput.fingerprint);
@@ -699,10 +602,7 @@ describe("normalizeClaudeBackendConfig", () => {
     const backend = buildAnthropicCliBackend();
 
     expect(() =>
-      backend.prepareExecution?.({
-        workspaceDir: "/tmp/openclaw-claude-cli",
-        provider: "claude-cli",
-        modelId: "claude-opus-4-7",
+      prepare(backend, {
         authProfileId: "anthropic:claude-cli",
         authCredential: {
           type: "oauth",
@@ -711,14 +611,6 @@ describe("normalizeClaudeBackendConfig", () => {
           refresh: "expired-refresh-token",
           expires: Date.now() - 60_000,
         },
-      } as Parameters<NonNullable<typeof backend.prepareExecution>>[0] & {
-        authCredential: {
-          type: "oauth";
-          provider: string;
-          access: string;
-          refresh: string;
-          expires: number;
-        };
       }),
     ).toThrow("Selected Claude CLI OAuth credential is expired or invalid");
   });
@@ -726,10 +618,7 @@ describe("normalizeClaudeBackendConfig", () => {
   it("runs native Claude login through the CLI transport without forwarding credentials", () => {
     const backend = buildAnthropicCliBackend();
 
-    const prepared = backend.prepareExecution?.({
-      workspaceDir: "/tmp/openclaw-claude-cli",
-      provider: "claude-cli",
-      modelId: "claude-opus-4-7",
+    const prepared = prepare(backend, {
       executionMode: "agent",
     });
 
@@ -742,22 +631,13 @@ describe("normalizeClaudeBackendConfig", () => {
   it("forwards a selected API-key profile through Claude's private descriptor", async () => {
     const backend = buildAnthropicCliBackend();
 
-    const prepared = backend.prepareExecution?.({
-      workspaceDir: "/tmp/openclaw-claude-cli",
-      provider: "claude-cli",
-      modelId: "claude-opus-4-7",
+    const prepared = prepare(backend, {
       authProfileId: "claude-cli:api",
       authCredential: {
         type: "api_key",
         provider: "claude-cli",
         key: "selected-api-key",
       },
-    } as Parameters<NonNullable<typeof backend.prepareExecution>>[0] & {
-      authCredential: {
-        type: "api_key";
-        provider: string;
-        key: string;
-      };
     }) as ClaudePreparedExecutionWithSecret;
 
     expect(prepared.env).toEqual({

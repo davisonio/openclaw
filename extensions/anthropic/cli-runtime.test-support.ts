@@ -22,6 +22,17 @@ const scenario = process.env.CLAUDE_FIXTURE_SCENARIO;
 const replayReceipts = process.env.CLAUDE_FIXTURE_REPLAY_RECEIPTS !== "0";
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\n");
 const request = (id, request) => send({ type: "control_request", request_id: id, request });
+const system = (subtype, detail = {}) => send({ type: "system", subtype, ...detail });
+const lifecycle = (state, command_uuid) => send({ type: "command_lifecycle", state, command_uuid });
+const tasks = (tasks) => system("background_tasks_changed", { tasks });
+const ready = (name) => {
+  writeFileSync(name, "ready");
+  sendReceipt(path.join(process.cwd(), name), "ready");
+};
+const promptHook = (id, prompt) => request(id, {
+  subtype: "hook_callback", callback_id: hooks.UserPromptSubmit[0].hookCallbackIds[0],
+  input: { hook_event_name: "UserPromptSubmit", prompt },
+});
 let hooks;
 let initialize;
 let turn = 0;
@@ -86,8 +97,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     initialize = message.request;
     hooks = initialize.hooks;
     if (scenario === "revoked-initialize") {
-      writeFileSync("initialize.ready", "ready");
-      sendReceipt(path.join(process.cwd(), "initialize.ready"), "ready");
+      ready("initialize.ready");
       while (!existsSync("initialize.release")) await delay(5);
     }
     assert.ok(hooks.PreToolUse[0].hookCallbackIds[0]);
@@ -101,11 +111,11 @@ for await (const line of createInterface({ input: process.stdin })) {
     user = message.message.content;
     writeFileSync("user.received", user);
     if (scenario === "credential-tree") {
-      send({ type: "system", subtype: "fixture_credential", pid: process.pid, ...credentialProof });
+      system("fixture_credential", { pid: process.pid, ...credentialProof });
       continue;
     }
     if (scenario === "shutdown-ignore" || scenario === "shutdown-eof") {
-      send({ type: "system", subtype: "fixture_shutdown", pid: process.pid, descendantPid: shutdownDescendant });
+      system("fixture_shutdown", { pid: process.pid, descendantPid: shutdownDescendant });
       continue;
     }
     if (scenario === "mcp-elicitation") {
@@ -116,38 +126,36 @@ for await (const line of createInterface({ input: process.stdin })) {
     if (scenario?.startsWith("steer-")) {
       if (turn === 1) {
         firstInputUuid = message.uuid;
-        send({ type: "command_lifecycle", state: "started", command_uuid: message.uuid });
-        send({ type: "system", subtype: "init", capabilities: ["msg_lifecycle_v1"] });
+        lifecycle("started", message.uuid);
+        system("init", { capabilities: ["msg_lifecycle_v1"] });
         if (scenario === "steer-prompt-pending") continue;
-        request("admitted-context", { subtype: "hook_callback", callback_id: hooks.UserPromptSubmit[0].hookCallbackIds[0],
-          input: { hook_event_name: "UserPromptSubmit", prompt: user } });
+        promptHook("admitted-context", user);
         continue;
       }
       pendingInputUuid = message.uuid;
       if (scenario === "steer-after-result") {
         result({ interim: true });
-        send({ type: "command_lifecycle", state: "completed", command_uuid: firstInputUuid });
+        lifecycle("completed", firstInputUuid);
       }
-      if (scenario !== "steer-refused") send({ type: "command_lifecycle", state: "queued", command_uuid: message.uuid });
+      if (scenario !== "steer-refused") lifecycle("queued", message.uuid);
       if (scenario === "steer-exit") {
         process.exit(1);
       }
       if (["steer-cancelled", "steer-discarded", "steer-refused", "steer-completed"].includes(scenario)) {
         // Terminal receipts may omit started; only completed proves consumption.
         result();
-        send({ type: "command_lifecycle", state: "completed", command_uuid: firstInputUuid });
-        send({ type: "command_lifecycle", state: scenario.slice("steer-".length), command_uuid: message.uuid });
+        lifecycle("completed", firstInputUuid);
+        lifecycle(scenario.slice("steer-".length), message.uuid);
         continue;
       }
-      request("injected-context", { subtype: "hook_callback", callback_id: hooks.UserPromptSubmit[0].hookCallbackIds[0],
-        input: { hook_event_name: "UserPromptSubmit", prompt: user } });
+      promptHook("injected-context", user);
       continue;
     }
     if (scenario === "input-lifecycle") {
       if (turn > 1) {
         pendingInputUuid = message.uuid;
         send({ type: "result", subtype: "success", user_message_uuid: "prior-turn", result: "stale replay", session_id: "fixture-session" });
-        send({ type: "command_lifecycle", state: "started", command_uuid: "unrelated-uuid" });
+        lifecycle("started", "unrelated-uuid");
         send({ type: "stream_event", user_message_uuid: "prior-turn", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "stale text" } } });
         send({ type: "assistant", user_message_uuid: "prior-turn", message: { role: "assistant", content: [{ type: "text", text: "stale text" }] } });
         request("prior-pre", { subtype: "hook_callback", callback_id: hooks.PreToolUse[0].hookCallbackIds[0],
@@ -155,17 +163,16 @@ for await (const line of createInterface({ input: process.stdin })) {
           tool_use_id: "prior-tool" });
         request("prior-permission", { subtype: "can_use_tool", tool_name: "Read",
           input: { file_path: "prior-turn.txt" }, tool_use_id: "prior-tool" });
-        request("prior-context", { subtype: "hook_callback", callback_id: hooks.UserPromptSubmit[0].hookCallbackIds[0],
-          input: { hook_event_name: "UserPromptSubmit", prompt: "prior user input" } });
+        promptHook("prior-context", "prior user input");
       } else {
-        send({ type: "command_lifecycle", state: "started", command_uuid: message.uuid });
-        send({ type: "system", subtype: "init", capabilities: ["msg_lifecycle_v1"] });
+        lifecycle("started", message.uuid);
+        system("init", { capabilities: ["msg_lifecycle_v1"] });
         result({ matchedInputUuid: message.uuid });
       }
       continue;
     }
     if (scenario === "background-bash-late-approval" && turn > 1) {
-      send({ type: "system", subtype: "fixture_second_turn" });
+      system("fixture_second_turn");
       if (lateDecision) result({ lateDecision });
       continue;
     }
@@ -175,12 +182,10 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
     if (scenario === "background-success" || scenario === "background-agent-subagent-bash") {
       const subagentBash = scenario === "background-agent-subagent-bash";
-      send({ type: "system", subtype: "background_tasks_changed",
-        tasks: [{ task_id: "background-agent", task_type: "local_agent" }] });
+      tasks([{ task_id: "background-agent", task_type: "local_agent" }]);
       send({ type: "result", subtype: "success", is_error: false, result: "", session_id: "fixture-session" });
       // Claude Code 2.1.289: the agent's own Bash reports on the main stream, owner field only on its start.
-      if (subagentBash) send({ type: "system", subtype: "task_started", task_id: "subagent-bash",
-        task_type: "local_bash", is_backgrounded: false, owned_by_subagent: true, tool_use_id: "tool-subagent-bash" });
+      if (subagentBash) system("task_started", { task_id: "subagent-bash", task_type: "local_bash", is_backgrounded: false, owned_by_subagent: true, tool_use_id: "tool-subagent-bash" });
       request("background-release", { subtype: "can_use_tool", tool_name: "Read",
         input: { file_path: "fixture.txt" }, tool_use_id: "background-release" });
       continue;
@@ -193,9 +198,8 @@ for await (const line of createInterface({ input: process.stdin })) {
       const taskIds = overlap ? ["background-bash", "second-bash"] : batched ? ["background-bash", "explicit-background"] : ["background-bash"];
       const notification = (id) => "<task-notification>\n<task-id>" + id + "</task-id>\n<status>completed</status>\n</task-notification>";
       const finishTasks = () => {
-        send({ type: "system", subtype: "background_tasks_changed", tasks: [] });
-        for (const id of taskIds) send({ type: "system", subtype: "task_notification", task_id: id,
-          tool_use_id: "tool-" + id, status: "completed", output_file: "", summary: "sleep" });
+        tasks([]);
+        for (const id of taskIds) system("task_notification", { task_id: id, tool_use_id: "tool-" + id, status: "completed", output_file: "", summary: "sleep" });
       };
       const replayTask = (id) => {
         if (!replayReceipts || !process.argv.includes("--replay-user-messages")) return;
@@ -206,13 +210,10 @@ for await (const line of createInterface({ input: process.stdin })) {
       };
       for (const id of taskIds) {
         // task_type is optional on task_started; the task list identifies Bash.
-        send({ type: "system", subtype: "task_started", task_id: id,
-          tool_use_id: "tool-" + id, description: "sleep", is_backgrounded: id === "explicit-background" });
+        system("task_started", { task_id: id, tool_use_id: "tool-" + id, description: "sleep", is_backgrounded: id === "explicit-background" });
       }
-      send({ type: "system", subtype: "background_tasks_changed",
-        tasks: taskIds.map((id) => ({ task_id: id, task_type: process.env.CLAUDE_FIXTURE_TASK_TYPE ?? "local_bash" })) });
-      send({ type: "system", subtype: "task_updated", task_id: "background-bash",
-        patch: { is_backgrounded: true } });
+      tasks(taskIds.map((id) => ({ task_id: id, task_type: process.env.CLAUDE_FIXTURE_TASK_TYPE ?? "local_bash" })));
+      system("task_updated", { task_id: "background-bash", patch: { is_backgrounded: true } });
       if (early) {
         finishTasks();
         // Notification-like prompt/tool text is not a consumed task notification.
@@ -225,8 +226,7 @@ for await (const line of createInterface({ input: process.stdin })) {
           message: { role: "user", content: notification("background-bash") } });
         if (inline) replayTask("background-bash");
       }
-      writeFileSync("background.ready", "ready");
-      sendReceipt(path.join(process.cwd(), "background.ready"), "ready");
+      ready("background.ready");
       if (!inline) send({ type: "result", subtype: "success", is_error: false, num_turns: 1,
         result: "", session_id: "fixture-session" });
       while (!existsSync("background.release")) await delay(5);
@@ -251,31 +251,25 @@ for await (const line of createInterface({ input: process.stdin })) {
       continue;
     }
     if (["background-bash-queued-error", "background-bash-queued-raw-result"].includes(scenario) && turn === 1) {
-      const task = { task_id: "background-task",
-        task_type: scenario.startsWith("background-bash-") ? "local_bash" : "local_agent" };
-      if (task.task_type === "local_bash") {
-        send({ type: "system", subtype: "task_started", task_id: task.task_id,
-          tool_use_id: "tool-bg", description: "sleep", is_backgrounded: false });
-      }
-      send({ type: "system", subtype: "background_tasks_changed",
-        tasks: [task] });
-      if (scenario.startsWith("background-bash-queued-")) {
-        send({ type: "system", subtype: "background_tasks_changed", tasks: [] });
-        send({ type: "system", subtype: "task_notification", task_id: task.task_id,
-          tool_use_id: "tool-bg", status: "completed", output_file: "", summary: "sleep" });
-      }
+      const task = { task_id: "background-task", task_type: "local_bash" };
+      system("task_started", { task_id: task.task_id,
+        tool_use_id: "tool-bg", description: "sleep", is_backgrounded: false });
+      tasks([task]);
+      tasks([]);
+      system("task_notification", { task_id: task.task_id,
+        tool_use_id: "tool-bg", status: "completed", output_file: "", summary: "sleep" });
       send({ ...(scenario.endsWith("-error")
         ? { type: "result", subtype: "error_during_execution", is_error: true,
             errors: ["fixture background turn failed"], session_id: "fixture-session" }
         : { type: "result", subtype: "success", is_error: false,
             result: '<invoke name="Read">\n<parameter name="file_path">fixture.txt</parameter>\n</invoke>',
             session_id: "fixture-session" }),
-        ...(scenario.startsWith("background-bash-queued-") ? { origin: { kind: "task-notification" } } : {}),
+        origin: { kind: "task-notification" },
       });
       continue;
     }
     if (["background-bash-queued-error", "background-bash-queued-raw-result"].includes(scenario)) {
-      send({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+      tasks([]);
       result();
       continue;
     }
@@ -292,74 +286,65 @@ for await (const line of createInterface({ input: process.stdin })) {
       result();
       continue;
     }
-    request("prompt-" + turn, { subtype: "hook_callback",
-      callback_id: hooks.UserPromptSubmit[0].hookCallbackIds[0],
-      input: { hook_event_name: "UserPromptSubmit", prompt: user } });
+    promptHook("prompt-" + turn, user);
   } else if (message.type === "control_response") {
     assert.equal(message.response.subtype, "success");
     const { request_id: id, response } = message.response;
     if (id === "admitted-context") {
       privateContext = response.hookSpecificOutput?.additionalContext;
       if (scenario.startsWith("steer-hook-")) {
-        request("admitted-rerun", { subtype: "hook_callback", callback_id: hooks.UserPromptSubmit[0].hookCallbackIds[0],
-          input: { hook_event_name: "UserPromptSubmit", prompt: user + " rewritten" } });
+        promptHook("admitted-rerun", user + " rewritten");
         continue;
       }
-      writeFileSync("turn.ready", "ready");
-      sendReceipt(path.join(process.cwd(), "turn.ready"), "ready");
+      ready("turn.ready");
     } else if (id === "admitted-rerun") {
       assert.equal(response.hookSpecificOutput?.additionalContext, privateContext);
-      writeFileSync("turn.ready", "ready");
-      sendReceipt(path.join(process.cwd(), "turn.ready"), "ready");
+      ready("turn.ready");
     } else if (id === "injected-context" || id === "injected-rerun") {
       if (id === "injected-context") {
         injectedContext = response;
         if (scenario.startsWith("steer-hook-")) {
-          request("injected-rerun", { subtype: "hook_callback", callback_id: hooks.UserPromptSubmit[0].hookCallbackIds[0],
-            input: { hook_event_name: "UserPromptSubmit", prompt: scenario === "steer-hook-rewrite" ? user + " rewritten" : user } });
+          promptHook("injected-rerun", scenario === "steer-hook-rewrite" ? user + " rewritten" : user);
           continue;
         }
       } else {
         injectedRerunContext = response;
       }
-      send({ type: "command_lifecycle", state: "started", command_uuid: pendingInputUuid });
+      lifecycle("started", pendingInputUuid);
       if (scenario === "steer-after-result") {
-        send({ type: "system", subtype: "init", capabilities: ["msg_lifecycle_v1"] });
+        system("init", { capabilities: ["msg_lifecycle_v1"] });
       }
       send({ type: "stream_event", user_message_uuid: pendingInputUuid, event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "steered" } } });
       send({ type: "assistant", user_message_uuid: pendingInputUuid, message: { role: "assistant", content: [{ type: "text", text: "steered" }] } });
       if (scenario.includes("notification-replay")) {
-        send({ type: "system", subtype: "background_tasks_changed",
-          tasks: [{ task_id: "background-agent", task_type: "local_agent" }] });
-        send({ type: "system", subtype: "background_tasks_changed", tasks: [] });
-        send({ type: "system", subtype: "task_notification", task_id: "background-agent", status: "completed" });
+        tasks([{ task_id: "background-agent", task_type: "local_agent" }]);
+        tasks([]);
+        system("task_notification", { task_id: "background-agent", status: "completed" });
         const completedFirst = scenario === "steer-completed-notification-replay";
-        if (completedFirst) send({ type: "command_lifecycle", state: "completed", command_uuid: pendingInputUuid });
+        if (completedFirst) lifecycle("completed", pendingInputUuid);
         // Native replays host input without origin; notification-looking text is still user input.
         send({ type: "user", isReplay: true, parent_tool_use_id: null, uuid: pendingInputUuid,
           message: { role: "user", content: user } });
         result({ injectedContext });
-        if (!completedFirst) send({ type: "command_lifecycle", state: "completed", command_uuid: pendingInputUuid });
+        if (!completedFirst) lifecycle("completed", pendingInputUuid);
         send({ type: "user", isReplay: true, parent_tool_use_id: null, uuid: "real-background-receipt",
           origin: { kind: "task-notification" }, message: { role: "user", content: user } });
         result({ injectedContext, finalBackgroundAnswer: true });
       } else if (scenario === "steer-merged") {
-        send({ type: "command_lifecycle", state: "completed", command_uuid: pendingInputUuid });
+        lifecycle("completed", pendingInputUuid);
         result({ injectedContext });
-        send({ type: "command_lifecycle", state: "completed", command_uuid: firstInputUuid });
+        lifecycle("completed", firstInputUuid);
       } else {
         result({ injectedContext });
         if (scenario === "steer-idle-trailer") {
-          send({ type: "system", subtype: "session_state_changed", state: "idle" });
+          system("session_state_changed", { state: "idle" });
         }
-        send({ type: "command_lifecycle", state: "completed", command_uuid: pendingInputUuid });
+        lifecycle("completed", pendingInputUuid);
       }
     } else if (id === "background-release") {
-      if (scenario === "background-agent-subagent-bash") send({ type: "system", subtype: "task_notification", task_id: "subagent-bash",
-        tool_use_id: "tool-subagent-bash", status: "completed", output_file: "", summary: "sleep" });
-      send({ type: "system", subtype: "background_tasks_changed", tasks: [] });
-      send({ type: "system", subtype: "task_notification", task_id: "background-agent",
-        status: "completed", output_file: "", summary: "agent finished" });
+      if (scenario === "background-agent-subagent-bash") system("task_notification", { task_id: "subagent-bash", tool_use_id: "tool-subagent-bash", status: "completed", output_file: "", summary: "sleep" });
+      tasks([]);
+      system("task_notification", { task_id: "background-agent", status: "completed", output_file: "", summary: "agent finished" });
       send({ type: "result", subtype: "success", is_error: false,
         origin: { kind: "task-notification" }, result: JSON.stringify({ finalBackgroundAnswer: true }),
         session_id: "fixture-session" });
@@ -368,7 +353,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     } else if (id.startsWith("prior-")) {
       priorResponses[id] = response;
       if (Object.keys(priorResponses).length === 3) {
-        send({ type: "command_lifecycle", state: "started", command_uuid: pendingInputUuid });
+        lifecycle("started", pendingInputUuid);
         result({ matchedInputUuid: pendingInputUuid, priorResponses });
       }
     } else if (id === "late-approval") {
@@ -386,14 +371,10 @@ for await (const line of createInterface({ input: process.stdin })) {
         request("late-approval", { subtype: "can_use_tool", tool_name: "Bash",
           input: { command: "echo late" }, tool_use_id: "late-tool" });
       }
-      send({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+      tasks([]);
       result({ finalBackgroundAnswer: true, notificationDecision: response });
     } else if (id === "pre-" + turn) {
-      if (scenario === "revoked-approval") {
-        result({ hookDecision: response });
-        continue;
-      }
-      if (scenario === "mcp-hook") {
+      if (scenario === "revoked-approval" || scenario === "mcp-hook") {
         result({ hookDecision: response });
         continue;
       }
@@ -407,12 +388,12 @@ for await (const line of createInterface({ input: process.stdin })) {
       if (firstSeenBackground) {
         const task = { task_id: "first-seen-" + turn, task_type: "local_bash" };
         // Native can first publish an automatic timeout as already backgrounded.
-        send({ type: "system", subtype: "background_tasks_changed", tasks: [task] });
-        send({ type: "system", subtype: "task_started", ...task, tool_use_id: "tool-" + turn, is_backgrounded: true });
+        tasks([task]);
+        system("task_started", { ...task, tool_use_id: "tool-" + turn, is_backgrounded: true });
         result({ firstSeenBackground: true });
         if (!explicitBackground) {
-          send({ type: "system", subtype: "background_tasks_changed", tasks: [] });
-          send({ type: "system", subtype: "task_notification", task_id: task.task_id, status: "completed" });
+          tasks([]);
+          system("task_notification", { task_id: task.task_id, status: "completed" });
           send({ type: "result", subtype: "success", is_error: false, origin: { kind: "task-notification" },
             num_turns: 1, result: JSON.stringify({ pid: process.pid, turn, finalBackgroundAnswer: true }), session_id: "fixture-session" });
         }

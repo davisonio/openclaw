@@ -28,6 +28,16 @@ const validOptions = [
   { label: "B", description: "Second option." },
 ];
 
+function question(overrides: Record<string, unknown> = {}) {
+  return {
+    header: "Stack",
+    question: "Q?",
+    options: validOptions,
+    multiSelect: false,
+    ...overrides,
+  };
+}
+
 const input = {
   questions: [
     {
@@ -92,12 +102,10 @@ describe("Claude CLI user input adapter", () => {
 
   it("returns actionable denial guidance when the operator skips", async () => {
     const authorizer = createClaudeCliUserInputAuthorizer(
-      createContext(
-        vi.fn(async () => ({
-          status: "cancelled" as const,
-          message: "The operator skipped this question.",
-        })),
-      ),
+      createContext(async () => ({
+        status: "cancelled",
+        message: "The operator skipped this question.",
+      })),
     );
 
     await expect(
@@ -151,51 +159,29 @@ describe("Claude CLI user input adapter", () => {
     ["missing questions array", {}, "questions must be an array of 1 to 4 questions"],
     [
       "too many questions",
-      {
-        questions: [
-          { header: "A", question: "Q?", options: validOptions, multiSelect: false },
-          { header: "B", question: "Q?", options: validOptions, multiSelect: false },
-          { header: "C", question: "Q?", options: validOptions, multiSelect: false },
-          { header: "D", question: "Q?", options: validOptions, multiSelect: false },
-          { header: "E", question: "Q?", options: validOptions, multiSelect: false },
-        ],
-      },
+      { questions: ["A", "B", "C", "D", "E"].map((header) => question({ header })) },
       "questions must be an array of 1 to 4 questions",
     ],
     [
       "non-boolean multiSelect",
-      {
-        questions: [{ header: "Stack", question: "Q?", options: validOptions, multiSelect: "no" }],
-      },
+      { questions: [question({ multiSelect: "no" })] },
       "questions[0].multiSelect must be a boolean",
     ],
     [
       "too few options",
-      {
-        questions: [
-          {
-            header: "Stack",
-            question: "Q?",
-            options: [{ label: "A", description: "a" }],
-            multiSelect: false,
-          },
-        ],
-      },
+      { questions: [question({ options: [{ label: "A", description: "a" }] })] },
       "questions[0].options must be an array of 2 to 4 options",
     ],
     [
       "empty option description",
       {
         questions: [
-          {
-            header: "Stack",
-            question: "Q?",
+          question({
             options: [
               { label: "A", description: "a" },
               { label: "B", description: "" },
             ],
-            multiSelect: false,
-          },
+          }),
         ],
       },
       "questions[0].options[1].description must not be empty",
@@ -204,12 +190,7 @@ describe("Claude CLI user input adapter", () => {
       "missing option label",
       {
         questions: [
-          {
-            header: "Stack",
-            question: "Q?",
-            options: validOptions.map((option) => ({ description: option.description })),
-            multiSelect: false,
-          },
+          question({ options: validOptions.map(({ description }) => ({ description })) }),
         ],
       },
       "questions[0].options[0].label must be a string",

@@ -789,26 +789,18 @@ async function discoverFromNativeMenu(models: unknown[]) {
 
 it("discovers deduplicated native model IDs through initialize without a turn", async () => {
   expect(
-    await discoverFromNativeMenu([
-      {
-        value: "default",
-        resolvedModel: "claude-future[1m]",
-        displayName: "Default (recommended)",
+    await discoverFromNativeMenu(
+      [
+        ["default", "claude-future[1m]", "Default (recommended)"],
+        ["future", "claude-future[1m]", "Future"],
+        ["opus", "claude-opus-5-5", "Opus"],
+      ].map(([value, resolvedModel, displayName]) => ({
+        value,
+        resolvedModel,
+        displayName,
         supportedEffortLevels: ["low", "max"],
-      },
-      {
-        value: "future",
-        resolvedModel: "claude-future[1m]",
-        displayName: "Future",
-        supportedEffortLevels: ["low", "max"],
-      },
-      {
-        value: "opus",
-        resolvedModel: "claude-opus-5-5",
-        displayName: "Opus",
-        supportedEffortLevels: ["low", "max"],
-      },
-    ]),
+      })),
+    ),
   ).toEqual([
     expect.objectContaining({
       id: "claude-future[1m]",
