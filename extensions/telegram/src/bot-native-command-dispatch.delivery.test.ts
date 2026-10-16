@@ -82,6 +82,21 @@ function sentMenu(): MenuPayload {
   return call[1] as MenuPayload;
 }
 
+function expectSend(payload: Record<string, unknown>) {
+  expect(apiCalls).toHaveBeenCalledWith("sendMessage", expect.objectContaining(payload));
+}
+
+async function dispatchCommand(
+  cfg: OpenClawConfig,
+  text: string,
+  updateId: number,
+  message: Partial<ReturnType<typeof groupCommand>> = {},
+  dmTopics = false,
+) {
+  const bot = await createBot(true, true, cfg, dmTopics);
+  await bot.handleUpdate({ update_id: updateId, message: { ...commandMessage(text), ...message } });
+}
+
 beforeEach(() => {
   loadPreparedModelCatalog.mockReset().mockImplementation(async (params) => {
     if (!params?.readOnly) {
@@ -138,14 +153,11 @@ describe("Telegram typed command delivery", () => {
       ReplyToBody: expect.stringContaining("Photo to check"),
       media: expect.arrayContaining([expect.objectContaining({ path: "/tmp/replied-photo.jpg" })]),
     });
-    expect(apiCalls).toHaveBeenCalledWith(
-      "sendMessage",
-      expect.objectContaining({
-        chat_id: String(chat.id),
-        text: "Checked the photo.",
-        reply_parameters: expect.objectContaining({ message_id: 100, quote: "Photo to check" }),
-      }),
-    );
+    expectSend({
+      chat_id: String(chat.id),
+      text: "Checked the photo.",
+      reply_parameters: expect.objectContaining({ message_id: 100, quote: "Photo to check" }),
+    });
   });
 
   it("records a quoted command once when native quoting requires fallback delivery", async () => {
@@ -183,13 +195,10 @@ describe("Telegram typed command delivery", () => {
         quote: { text: "Earlier answer", position: 0 },
       },
     });
-    expect(apiCalls).toHaveBeenCalledWith(
-      "sendMessage",
-      expect.objectContaining({
-        text: "Thinking level set to low.",
-        reply_parameters: expect.objectContaining({ message_id: 100, quote: "Earlier answer" }),
-      }),
-    );
+    expectSend({
+      text: "Thinking level set to low.",
+      reply_parameters: expect.objectContaining({ message_id: 100, quote: "Earlier answer" }),
+    });
     const messages = (await readVisibleSessionTranscriptMessageEntries(scope)).map(
       ({ message }) => message,
     );
@@ -308,12 +317,7 @@ describe("Telegram native argument menus", () => {
           },
         });
       }
-      await (
-        await createBot(true, true, cfg, true)
-      ).handleUpdate({
-        update_id: 3101,
-        message: { ...commandMessage("/think"), message_thread_id: 77 },
-      });
+      await dispatchCommand(cfg, "/think", 3101, { message_thread_id: 77 }, true);
       if (inherited) {
         expect(sentMenu().reply_markup.inline_keyboard.flat()).toContainEqual({
           text: "max",
@@ -322,10 +326,7 @@ describe("Telegram native argument menus", () => {
       } else {
         expect(sentMenu().text).toContain(`Current thinking level: ${thinking}.\n`);
       }
-      expect(apiCalls).toHaveBeenCalledWith(
-        "sendMessage",
-        expect.objectContaining({ message_thread_id: 77 }),
-      );
+      expectSend({ message_thread_id: 77 });
     },
   );
 });
@@ -462,6 +463,16 @@ describe("Telegram registered plugin delivery", () => {
     );
   }
 
+  function expectMethods(...methods: string[]) {
+    expect(effects().map(({ method }) => method)).toEqual(methods);
+  }
+
+  function expectOnlyMessage(payload: Record<string, unknown>) {
+    expect(effects()).toEqual([
+      { method: "sendMessage", payload: expect.objectContaining(payload) },
+    ]);
+  }
+
   it.each([false, true])("settles a progress edit once (rejected: %s)", async (rejected) => {
     rejectEdit = rejected;
     const cfg = pluginConfig();
@@ -477,13 +488,11 @@ describe("Telegram registered plugin delivery", () => {
             channelData: { telegram: { buttons: [[{ text: "Deploy", callback_data: "deploy" }]] } },
           },
     );
-    await (
-      await createBot(true, true, cfg)
-    ).handleUpdate({ update_id: 3200, message: commandMessage("/plug") });
-    expect(effects().map(({ method }) => method)).toEqual(
-      rejected
+    await dispatchCommand(cfg, "/plug", 3200);
+    expectMethods(
+      ...(rejected
         ? ["sendMessage", "editMessageText", "deleteMessage", "sendMessage"]
-        : ["sendMessage", "editMessageText"],
+        : ["sendMessage", "editMessageText"]),
     );
     if (rejected) {
       expect(effects()[2]?.payload).toMatchObject({ message_id: 701 });
@@ -535,11 +544,7 @@ describe("Telegram registered plugin delivery", () => {
     registerCommand(async () => ({ text: "Workspace report", mediaUrl }));
     const bot = await createBot(true, true, cfg);
     await bot.handleUpdate({ update_id: 3210, message: groupCommand("/plug", 77) });
-    expect(effects().map(({ method }) => method)).toEqual([
-      "sendMessage",
-      "deleteMessage",
-      "sendDocument",
-    ]);
+    expectMethods("sendMessage", "deleteMessage", "sendDocument");
     const payload = effects()[2]!.payload;
     const reference = String(payload.document);
     expect(reference).toMatch(/^attach:\/\//u);
@@ -584,17 +589,12 @@ describe("Telegram registered plugin delivery", () => {
               },
             };
       registerCommand(async () => result);
-      await (
-        await createBot(true, true, cfg)
-      ).handleUpdate({
-        update_id: 3201,
-        message: { ...commandMessage("/plug"), message_id: 32101 },
-      });
-      expect(effects().map(({ method }) => method)).toEqual([
+      await dispatchCommand(cfg, "/plug", 3201, { message_id: 32101 });
+      expectMethods(
         "sendMessage",
         "deleteMessage",
         kind === "reaction" ? "setMessageReaction" : "sendRichMessage",
-      ]);
+      );
       expect(effects()[1]?.payload).toMatchObject({ message_id: 701 });
       const delivered = effects()[2]?.payload;
       if (kind === "reaction") {
@@ -637,9 +637,7 @@ describe("Telegram registered plugin delivery", () => {
                 },
         { progress: suppressed },
       );
-      await (
-        await createBot(true, true, cfg)
-      ).handleUpdate({ update_id: 3203, message: commandMessage("/plug") });
+      await dispatchCommand(cfg, "/plug", 3203);
       if (suppressed) {
         expect(effects()).toMatchObject([
           { method: "sendMessage" },
@@ -665,10 +663,7 @@ describe("Telegram registered plugin delivery", () => {
       async () => {
         throw new Error("Unmatched arguments must not execute");
       },
-      {
-        progress: false,
-        acceptsArgs: false,
-      },
+      { progress: false, acceptsArgs: false },
     );
     const message = groupCommand("/plug unexpected");
     await (
@@ -682,14 +677,7 @@ describe("Telegram registered plugin delivery", () => {
         is_topic_message: false,
       },
     });
-    expect(effects()).toEqual([
-      {
-        method: "sendMessage",
-        payload: expect.objectContaining({
-          text: "Command not found.",
-        }),
-      },
-    ]);
+    expectOnlyMessage({ text: "Command not found." });
     expect([groupChat.id, String(groupChat.id)]).toContain(effects()[0]?.payload.chat_id);
     expect(effects()[0]?.payload).not.toHaveProperty("message_thread_id");
     expect(harness.replySpy).not.toHaveBeenCalled();
@@ -733,20 +721,7 @@ describe("Telegram registered plugin delivery", () => {
       },
       { progress: false },
     );
-    await (
-      await createBot(true, true, cfg)
-    ).handleUpdate({
-      update_id: 3206,
-      message: groupCommand("/plug", 77),
-    });
-    expect(effects()).toEqual([
-      {
-        method: "sendMessage",
-        payload: expect.objectContaining({
-          text: "Bound forum transcript answer",
-          message_thread_id: 77,
-        }),
-      },
-    ]);
+    await dispatchCommand(cfg, "/plug", 3206, groupCommand("/plug", 77));
+    expectOnlyMessage({ text: "Bound forum transcript answer", message_thread_id: 77 });
   });
 });

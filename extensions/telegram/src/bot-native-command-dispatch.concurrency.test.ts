@@ -20,14 +20,18 @@ function expectStopAcknowledged(threadId: number) {
   );
 }
 
-async function createDebouncedBot(native: boolean, commandSender = String(from.id)) {
+async function createDebouncedBot(
+  native: boolean,
+  commandSender = String(from.id),
+  groupAllowFrom = [String(from.id)],
+) {
   return await createBot(native, true, {
     commands: { native, text: true, allowFrom: { telegram: [commandSender] } },
     messages: { inbound: { byChannel: { telegram: DEBOUNCE_MS } } },
     channels: {
       telegram: {
         groupPolicy: "open",
-        groupAllowFrom: [String(from.id)],
+        groupAllowFrom,
         groups: { "*": { requireMention: false } },
         streaming: { mode: "off" },
       },
@@ -52,6 +56,47 @@ function takeDebounceFlush(): () => void {
   return () => callback();
 }
 
+function bufferedHarness(
+  context: Parameters<typeof createTestLifetime>[0],
+  bot: Awaited<ReturnType<typeof createBot>>,
+  release = createDeferred<void>(),
+) {
+  const timer = vi.spyOn(globalThis, "setTimeout");
+  const work: Promise<unknown>[] = [];
+  const flushes: Array<() => void> = [];
+  const lifetime = createTestLifetime(context, async () => {
+    release.resolve();
+    for (const flush of flushes) {
+      flush();
+    }
+    await Promise.allSettled(work);
+    timer.mockRestore();
+  });
+  let updateId = 5000;
+  const dispatch = (message: ReturnType<typeof groupCommand>, spooled = false) => {
+    const update = { update_id: ++updateId, message };
+    const pending = spooled
+      ? runWithTelegramSpooledReplayUpdate(update, () => bot.handleUpdate(update))
+      : bot.handleUpdate(update);
+    work.push(pending);
+    return pending;
+  };
+  const buffer = async (text: string, threadId: number) => {
+    const update = { update_id: ++updateId, message: ordinaryMessage(text, threadId) };
+    const pending = runWithTelegramSpooledReplayUpdate(update, () => bot.handleUpdate(update));
+    work.push(pending);
+    const participant = (await pending).deferredWork;
+    if (!participant) {
+      throw new Error("Expected a durable participant for buffered Telegram input");
+    }
+    work.push(participant.task);
+    const flush = takeDebounceFlush();
+    flushes.push(flush);
+    return { participant, flush };
+  };
+  return { lifetime, dispatch, buffer };
+}
+
 describe("Telegram commands during buffered message processing", () => {
   it.for([
     { native: true, command: "/status" },
@@ -72,35 +117,7 @@ describe("Telegram commands during buffered message processing", () => {
         return undefined;
       });
       const bot = await createDebouncedBot(native);
-      const timer = vi.spyOn(globalThis, "setTimeout");
-      const work: Promise<unknown>[] = [];
-      const flushes: Array<() => void> = [];
-      const lifetime = createTestLifetime(context, async () => {
-        release.resolve();
-        for (const flush of flushes) {
-          flush();
-        }
-        await Promise.allSettled(work);
-        timer.mockRestore();
-      });
-      let updateId = 5000;
-      const dispatch = (message: ReturnType<typeof groupCommand>) => {
-        const update = { update_id: ++updateId, message };
-        const pending = runWithTelegramSpooledReplayUpdate(update, () => bot.handleUpdate(update));
-        work.push(pending);
-        return pending;
-      };
-      const buffer = async (text: string, threadId: number) => {
-        const result = await dispatch(ordinaryMessage(text, threadId));
-        const participant = result.deferredWork;
-        if (!participant) {
-          throw new Error("Expected a durable participant for buffered Telegram input");
-        }
-        work.push(participant.task);
-        const flush = takeDebounceFlush();
-        flushes.push(flush);
-        return { participant, flush };
-      };
+      const { lifetime, dispatch, buffer } = bufferedHarness(context, bot, release);
 
       try {
         const active = await buffer("ordinary run", 99);
@@ -109,11 +126,9 @@ describe("Telegram commands during buffered message processing", () => {
         const sameTopic = await buffer("same-topic follow-up", 99);
         const otherTopic = await buffer("cancel this topic", 100);
 
-        // These updates traverse the real grammY command and message handlers. A
-        // status stuck behind the active debounce flush also stalls the shared
-        // control lane, including a stop targeting another topic.
-        const control = dispatch(groupCommand(command, 99));
-        const stop = dispatch(groupCommand("/stop", 100));
+        // A blocked control lane also stalls /stop targeting another topic.
+        const control = dispatch(groupCommand(command, 99), true);
+        const stop = dispatch(groupCommand("/stop", 100), true);
         await lifetime.wait(Promise.all([controlEntered.promise, stop]));
         expect(harness.replySpy.mock.calls.map(([ctx]) => ctx.RawBody ?? "").toSorted()).toEqual(
           ["ordinary run", command].toSorted(),
@@ -165,48 +180,18 @@ describe("Telegram commands during buffered message processing", () => {
       }
       return undefined;
     });
-    const bot = await createBot(false, true, {
-      commands: { native: false, text: true, allowFrom: { telegram: [String(from.id)] } },
-      messages: { inbound: { byChannel: { telegram: DEBOUNCE_MS } } },
-      channels: {
-        telegram: {
-          groupPolicy: "open",
-          groupAllowFrom: [String(from.id), String(guest.id)],
-          groups: { "*": { requireMention: false } },
-          streaming: { mode: "off" },
-        },
-      },
-    });
-    const timer = vi.spyOn(globalThis, "setTimeout");
-    const work: Promise<unknown>[] = [];
-    let flush: (() => void) | undefined;
-    const lifetime = createTestLifetime(context, async () => {
-      release.resolve();
-      flush?.();
-      await Promise.allSettled(work);
-      timer.mockRestore();
-    });
+    const bot = await createDebouncedBot(false, String(from.id), [
+      String(from.id),
+      String(guest.id),
+    ]);
+    const { lifetime, dispatch, buffer } = bufferedHarness(context, bot, release);
     try {
-      const update = { update_id: 6101, message: ordinaryMessage("ordinary run", 99) };
-      const active = await runWithTelegramSpooledReplayUpdate(update, () =>
-        bot.handleUpdate(update),
-      );
-      const participant = active.deferredWork;
-      if (!participant) {
-        throw new Error("Expected a durable participant for buffered Telegram input");
-      }
-      work.push(participant.task);
-      flush = takeDebounceFlush();
+      const { participant, flush } = await buffer("ordinary run", 99);
       flush();
       await lifetime.wait(started.promise);
 
-      const help = bot.handleUpdate({
-        update_id: 6102,
-        message: { ...groupCommand("/help", 99), from: guest },
-      });
-      work.push(help);
-      const stop = bot.handleUpdate({ update_id: 6103, message: groupCommand("/stop", 100) });
-      work.push(stop);
+      const help = dispatch({ ...groupCommand("/help", 99), from: guest });
+      const stop = dispatch(groupCommand("/stop", 100));
       await lifetime.wait(stop);
       expect(harness.replySpy.mock.calls.map(([ctx]) => ctx.RawBody)).toEqual(["ordinary run"]);
       await lifetime.wait(Promise.all([help, stop]));
@@ -221,22 +206,11 @@ describe("Telegram commands during buffered message processing", () => {
     }
   });
 
-  it("does not let an unauthorized native stop cancel buffered input", async () => {
+  it("does not let an unauthorized native stop cancel buffered input", async (context) => {
     const bot = await createDebouncedBot(true, "99999");
-    const timer = vi.spyOn(globalThis, "setTimeout");
-    let flush: (() => void) | undefined;
-    let sourceWork: Promise<unknown> | undefined;
+    const { lifetime, buffer } = bufferedHarness(context, bot);
     try {
-      const update = { update_id: 6001, message: ordinaryMessage("keep this input", 99) };
-      const pending = await runWithTelegramSpooledReplayUpdate(update, () =>
-        bot.handleUpdate(update),
-      );
-      const participant = pending.deferredWork;
-      if (!participant) {
-        throw new Error("Expected a durable participant for buffered Telegram input");
-      }
-      sourceWork = participant.task;
-      flush = takeDebounceFlush();
+      const { participant, flush } = await buffer("keep this input", 99);
 
       await bot.handleUpdate({ update_id: 6002, message: groupCommand("/stop", 99) });
 
@@ -246,9 +220,7 @@ describe("Telegram commands during buffered message processing", () => {
       await expect(participant.task).resolves.toEqual({ kind: "completed" });
       expect(harness.replySpy.mock.calls.map(([ctx]) => ctx.RawBody)).toEqual(["keep this input"]);
     } finally {
-      flush?.();
-      await sourceWork;
-      timer.mockRestore();
+      await lifetime.close();
     }
   });
 });

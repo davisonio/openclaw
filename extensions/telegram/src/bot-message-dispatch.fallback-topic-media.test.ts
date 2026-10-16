@@ -52,6 +52,21 @@ function expectPresentation(
   }
   expect(text).not.toBe("Gateway status as plain text");
 }
+function createMessageToolOnlyGroupContext(): TelegramMessageContext {
+  const chat = { id: -1001234, type: "supergroup" };
+  return createContext({
+    chatId: chat.id,
+    isGroup: true,
+    ctxPayload: {
+      SessionKey: "agent:test:telegram:group:-1001234",
+      ChatType: "group",
+    } as TelegramMessageContext["ctxPayload"],
+    primaryCtx: { message: { chat } } as TelegramMessageContext["primaryCtx"],
+    msg: { chat, message_id: 456 } as TelegramMessageContext["msg"],
+    threadSpec: { id: undefined, scope: "none" },
+    replyThreadId: undefined,
+  });
+}
 describeTelegramDispatch("dispatchTelegramMessage draft-finalization", () => {
   it("respects richMessages=true on the finalized status preview", async () => {
     const finalUpdate = await dispatchPresentationFinal({
@@ -64,29 +79,22 @@ describeTelegramDispatch("dispatchTelegramMessage draft-finalization", () => {
     expect(finalUpdate).toContain("<table><caption>Status</caption>");
     expect(finalUpdate).toContain("<td>running</td>");
   });
-  it.each<{
-    name: string;
-    payload: ReplyPayload;
-    labels: string[];
-    authoredText?: string;
-    context?: () => TelegramMessageContext;
-    contains?: string[];
-  }>([
-    ...(["Status summary\n\n- Legacy\n- Presentation"] as const).map((text) => ({
-      name: `unset mixed ${text || "empty"}`,
+  it("keeps dropped labels: unset mixed", async () => {
+    const finalUpdate = await dispatchPresentationFinal({
       payload: {
-        text,
+        text: "Status summary\n\n- Legacy\n- Presentation",
         presentation: { blocks: [statusTable(), droppedButtons("Presentation")] },
         interactive: { blocks: [droppedButtons("Legacy")] },
       },
-      labels: ["Presentation", "Legacy"],
-      authoredText: text.split("\n\n")[0],
-    })),
-    {
-      name: "group web-app control",
+    });
+    expect(finalUpdate).toContain("Status summary");
+    expectPresentation(finalUpdate, ["Presentation", "Legacy"]);
+  });
+  it("keeps dropped labels: group web-app control", async () => {
+    const finalUpdate = await dispatchPresentationFinal({
       payload: {
         text: "Gateway status as plain text",
-        presentationTextMode: "fallback" as const,
+        presentationTextMode: "fallback",
         presentation: {
           blocks: [
             statusTable(0),
@@ -99,51 +107,20 @@ describeTelegramDispatch("dispatchTelegramMessage draft-finalization", () => {
           ],
         },
       },
-      context: () =>
-        createContext({
-          chatId: -1001234,
-          isGroup: true,
-          msg: {
-            chat: { id: -1001234, type: "supergroup" },
-            message_id: 456,
-            message_thread_id: 777,
-          } as TelegramMessageContext["msg"],
-          threadSpec: { id: 777, scope: "forum" },
-        }),
-      labels: ["Launch"],
-      contains: ["Launch: https://example.com/app"],
-    },
-  ])(
-    "keeps dropped labels: $name",
-    async ({ payload, labels, authoredText, context, contains }) => {
-      const finalUpdate = await dispatchPresentationFinal({ payload, context: context?.() });
-      if (authoredText) {
-        expect(finalUpdate).toContain(authoredText);
-      }
-      expectPresentation(finalUpdate, labels, contains);
-    },
-  );
-});
-
-function createMessageToolOnlyGroupContext(): TelegramMessageContext {
-  return createContext({
-    chatId: -1001234,
-    isGroup: true,
-    ctxPayload: {
-      SessionKey: "agent:test:telegram:group:-1001234",
-      ChatType: "group",
-    } as TelegramMessageContext["ctxPayload"],
-    primaryCtx: {
-      message: { chat: { id: -1001234, type: "supergroup" } },
-    } as TelegramMessageContext["primaryCtx"],
-    msg: {
-      chat: { id: -1001234, type: "supergroup" },
-      message_id: 456,
-    } as TelegramMessageContext["msg"],
-    threadSpec: { id: undefined, scope: "none" },
-    replyThreadId: undefined,
+      context: createContext({
+        chatId: -1001234,
+        isGroup: true,
+        msg: {
+          chat: { id: -1001234, type: "supergroup" },
+          message_id: 456,
+          message_thread_id: 777,
+        } as TelegramMessageContext["msg"],
+        threadSpec: { id: 777, scope: "forum" },
+      }),
+    });
+    expectPresentation(finalUpdate, ["Launch"], ["Launch: https://example.com/app"]);
   });
-}
+});
 
 describeTelegramDispatch("dispatchTelegramMessage fallback send policy", () => {
   it("honors send-policy denial when final delivery fails", async () => {
@@ -170,7 +147,6 @@ describeTelegramDispatch("dispatchTelegramMessage fallback send policy", () => {
 describeTelegramDispatch("dispatchTelegramMessage room-event failure policy", () => {
   it("does not send visible error fallbacks for room events", async () => {
     dispatchReplyWithBufferedBlockDispatcher.mockRejectedValue(new Error("provider down"));
-
     await dispatchWithContext({
       context: createContext({
         ctxPayload: {
