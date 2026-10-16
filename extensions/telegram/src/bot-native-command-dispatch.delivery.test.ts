@@ -44,6 +44,7 @@ import {
   photo,
 } from "./bot.create-telegram-bot.native-pipeline.test-support.js";
 import { resetTelegramClientOptionsCacheForTests } from "./send.js";
+import { resolveTelegramTestUpload } from "./send.telegram-http.test-support.js";
 
 const { loadPreparedModelCatalog } = vi.hoisted(() => ({
   loadPreparedModelCatalog: vi.fn<typeof AgentRuntime.loadPreparedModelCatalog>(),
@@ -84,6 +85,20 @@ function sentMenu(): MenuPayload {
 
 function expectSend(payload: Record<string, unknown>) {
   expect(apiCalls).toHaveBeenCalledWith("sendMessage", expect.objectContaining(payload));
+}
+
+function quotedReply(text: string, media = false) {
+  return {
+    reply_to_message: {
+      message_id: 100,
+      date: 1736380790,
+      chat,
+      from,
+      ...(media ? { photo, caption: text } : { text }),
+      reply_to_message: undefined,
+    },
+    quote: { text, position: 0 },
+  };
 }
 
 async function dispatchCommand(
@@ -134,16 +149,7 @@ describe("Telegram typed command delivery", () => {
       message: {
         ...commandMessage("/btw check this pls"),
         message_id: 30101,
-        reply_to_message: {
-          message_id: 100,
-          date: 1736380790,
-          chat,
-          from,
-          photo,
-          caption: "Photo to check",
-          reply_to_message: undefined,
-        },
-        quote: { text: "Photo to check", position: 0 },
+        ...quotedReply("Photo to check", true),
       },
     });
     expect(harness.replySpy).toHaveBeenCalledTimes(1);
@@ -184,15 +190,7 @@ describe("Telegram typed command delivery", () => {
       message: {
         ...commandMessage("/think low"),
         message_id: 30102,
-        reply_to_message: {
-          message_id: 100,
-          date: 1736380790,
-          chat,
-          from,
-          text: "Earlier answer",
-          reply_to_message: undefined,
-        },
-        quote: { text: "Earlier answer", position: 0 },
+        ...quotedReply("Earlier answer"),
       },
     });
     expectSend({
@@ -275,35 +273,31 @@ describe("Telegram native argument menus", () => {
     "uses the %s model settings for a DM-topic keyboard",
     async (thinking) => {
       const inherited = thinking === "parent";
-      const cfg = commandConfig(
-        inherited
-          ? {
-              agents: {
-                defaults: {
-                  model: "native-test/plain",
-                  thinkingDefault: "low",
-                  models: { "native-test/reasoner": {} },
-                },
-              },
-            }
-          : {
-              agents: {
-                ownership: "explicit",
-                defaults: {
-                  model: "native-test/reasoner",
-                  thinkingDefault: "medium",
-                  models: { "native-test/reasoner": { params: { thinking: "low" } } },
-                },
+      const cfg = commandConfig({
+        agents: {
+          defaults: {
+            model: inherited ? "native-test/plain" : "native-test/reasoner",
+            thinkingDefault: inherited ? "low" : "medium",
+            models: { "native-test/reasoner": inherited ? {} : { params: { thinking: "low" } } },
+          },
+          ...(inherited
+            ? {}
+            : {
+                ownership: "explicit" as const,
                 entries: {
                   main: {},
                   alpha: { models: { "native-test/reasoner": { params: { thinking } } } },
                 },
-              },
+              }),
+        },
+        ...(inherited
+          ? {}
+          : {
               bindings: [
                 { agentId: "alpha", match: { channel: "telegram", accountId: "default" } },
               ],
-            },
-      );
+            }),
+      });
       if (inherited) {
         await upsertSessionEntry({
           storePath: cfg.session!.store!,
@@ -546,12 +540,7 @@ describe("Telegram registered plugin delivery", () => {
     await bot.handleUpdate({ update_id: 3210, message: groupCommand("/plug", 77) });
     expectMethods("sendMessage", "deleteMessage", "sendDocument");
     const payload = effects()[2]!.payload;
-    const reference = String(payload.document);
-    expect(reference).toMatch(/^attach:\/\//u);
-    const upload = payload[reference.slice("attach://".length)];
-    if (!(upload instanceof File)) {
-      throw new Error("Telegram document did not reference its uploaded multipart file");
-    }
+    const upload = resolveTelegramTestUpload(payload, "document");
     expect(await upload.text()).toBe(content);
     expect(payload.message_thread_id).toBe("77");
     const previousRequests = requests.length;

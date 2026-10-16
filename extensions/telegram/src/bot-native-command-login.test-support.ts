@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
@@ -30,13 +31,18 @@ export type TelegramLoginFlow =
   typeof import("openclaw/plugin-sdk/provider-auth-login-flow-runtime").runModelsAuthLoginFlow;
 
 let loginAccountIndex = 0;
-const fixtureProvider = "ux-catalog-fixture";
+const fixtureId = "ux-catalog-fixture";
 const defaultModel = "openai/gpt-5.4";
 const modelButtons = ["Show all Fixture models", "Keep current restrictions"];
 const methodChoices = ["", "-alternate"].map((suffix) => ({
   method: `device-code${suffix}`,
   choiceId: `device${suffix}`,
   choiceLabel: suffix ? "Fixture alternate device login" : "Fixture device login",
+  provider: fixtureId,
+  groupLabel: "Fixture",
+  appGuidedAuth: "device-code",
+  credentialOnly: true,
+  channelLogin: {},
 }));
 
 export function createLoginResult(
@@ -131,9 +137,7 @@ export async function registerLoginCommand(params: {
     () => registerTelegramNativeCommands(nativeParams),
   );
   const handler = botHarness.commandHandlers.get("login");
-  if (!handler) {
-    throw new Error("expected login command handler to be registered");
-  }
+  assert(handler, "expected login command handler to be registered");
   return {
     ...botHarness,
     accountId,
@@ -143,7 +147,7 @@ export async function registerLoginCommand(params: {
   };
 }
 
-export async function exerciseDeferredModelAccess(choice: "all" | "keep" | "cancel") {
+export async function exerciseDeferredModelAccess(choice: "all" | "cancel") {
   clearRuntimeConfigSnapshot();
   try {
     await withTempHome((home) => exerciseModelAccess(home, choice), {
@@ -154,32 +158,19 @@ export async function exerciseDeferredModelAccess(choice: "all" | "keep" | "canc
   }
 }
 
-async function exerciseModelAccess(home: string, choice: "all" | "keep" | "cancel") {
-  const pluginDir = path.join(home, fixtureProvider);
+async function exerciseModelAccess(home: string, choice: "all" | "cancel") {
+  const pluginDir = path.join(home, fixtureId);
   await fs.mkdir(pluginDir);
+  const writeJson = (file: string, data: unknown) =>
+    fs.writeFile(path.join(pluginDir, file), JSON.stringify(data));
   await Promise.all([
     fs.writeFile(path.join(pluginDir, "index.js"), "export default { register() {} };\n"),
-    fs.writeFile(
-      path.join(pluginDir, "package.json"),
-      JSON.stringify({ type: "module", openclaw: { extensions: ["./index.js"] } }),
-    ),
-    fs.writeFile(
-      path.join(pluginDir, "openclaw.plugin.json"),
-      JSON.stringify({
-        id: fixtureProvider,
-        configSchema: { type: "object", additionalProperties: false, properties: {} },
-        providerAuthChoices: methodChoices.map(({ method, choiceId, choiceLabel }) => ({
-          method,
-          choiceId,
-          choiceLabel,
-          provider: fixtureProvider,
-          groupLabel: "Fixture",
-          appGuidedAuth: "device-code",
-          credentialOnly: true,
-          channelLogin: {},
-        })),
-      }),
-    ),
+    writeJson("package.json", { type: "module", openclaw: { extensions: ["./index.js"] } }),
+    writeJson("openclaw.plugin.json", {
+      id: fixtureId,
+      configSchema: { type: "object", additionalProperties: false, properties: {} },
+      providerAuthChoices: methodChoices,
+    }),
   ]);
   const delivery = await vi.importActual<typeof import("./bot/delivery.replies.js")>(
     "./bot/delivery.replies.js",
@@ -187,11 +178,9 @@ async function exerciseModelAccess(home: string, choice: "all" | "keep" | "cance
   deliverReplies.mockImplementation(delivery.deliverReplies);
   const loginFlow = vi.fn<TelegramLoginFlow>(async (params) => {
     await params.prompter.deviceCode?.({ title: "Sign in", code: "MODEL-ACCESS" });
-    if (!params.onModelAccessRequested) {
-      throw new Error("expected deferred model access");
-    }
+    assert(params.onModelAccessRequested, "expected deferred model access");
     params.onModelAccessRequested({
-      provider: fixtureProvider,
+      provider: fixtureId,
       providerLabel: "Fixture",
       agentId: "main",
       policy: { path: "agents.defaults.modelPolicy.allow", refs: [defaultModel] },
@@ -204,13 +193,13 @@ async function exerciseModelAccess(home: string, choice: "all" | "keep" | "cance
         ],
       },
     });
-    return createLoginResult("ux-catalog-fixture:consent", "refreshed", fixtureProvider);
+    return createLoginResult("ux-catalog-fixture:consent", "refreshed", fixtureId);
   });
   const cfg: OpenClawConfig = {
     commands: { native: true, ownerAllowFrom: ["200"] },
     plugins: {
       load: { paths: [pluginDir] },
-      entries: { [fixtureProvider]: { enabled: true } },
+      entries: { [fixtureId]: { enabled: true } },
     },
     agents: {
       defaults: { model: defaultModel, modelPolicy: { allow: [defaultModel] } },
@@ -230,7 +219,7 @@ async function exerciseModelAccess(home: string, choice: "all" | "keep" | "cance
       const markup = call[2]?.reply_markup;
       return markup && "inline_keyboard" in markup ? markup.inline_keyboard.flat() : [];
     });
-  await first.handler(createPrivateCommandContext({ match: fixtureProvider, userId: 200 }));
+  await first.handler(createPrivateCommandContext({ match: fixtureId, userId: 200 }));
   const methods = deliveredButtons(vi.mocked(first.bot.api).sendMessage.mock.calls);
   expect(methods).toHaveLength(2);
   expect(methods).toEqual(
@@ -258,9 +247,7 @@ async function exerciseModelAccess(home: string, choice: "all" | "keep" | "cance
   const buttons = deliveredButtons(vi.mocked(first.bot.api).sendMessage.mock.calls);
   expect(buttons.map((button) => button.text)).toEqual(modelButtons);
   const decodeButton = (button: (typeof buttons)[number]) => {
-    if (!("callback_data" in button)) {
-      throw new Error("expected a native command callback");
-    }
+    assert("callback_data" in button, "expected a native command callback");
     expect(Buffer.byteLength(button.callback_data, "utf8")).toBeLessThanOrEqual(64);
     return parseTelegramNativeCommandCallbackData(button.callback_data);
   };
@@ -270,10 +257,8 @@ async function exerciseModelAccess(home: string, choice: "all" | "keep" | "cance
     }
     return decodeButton(button);
   });
-  const commandText = commands[choice === "keep" ? 1 : 0];
-  if (!commandText) {
-    throw new Error("expected a delivered model-access command");
-  }
+  const commandText = commands[0];
+  assert(commandText, "expected a delivered model-access command");
   expect(await readPolicy()).toEqual([defaultModel]);
   const fresh = await registerLoginCommand({
     cfg,
@@ -282,10 +267,8 @@ async function exerciseModelAccess(home: string, choice: "all" | "keep" | "cance
     accountId: first.accountId,
   });
   const dispatch = fresh.nativeCommandCallbackDispatcher;
-  if (!dispatch) {
-    throw new Error("expected native callback dispatcher");
-  }
-  const expectedModels = choice === "all" ? [defaultModel, `${fixtureProvider}/*`] : [defaultModel];
+  assert(dispatch, "expected native callback dispatcher");
+  const expectedModels = choice === "all" ? [defaultModel, `${fixtureId}/*`] : [defaultModel];
   let callbackId = 0;
   const click = (chatId: number) =>
     dispatch({
@@ -316,11 +299,7 @@ async function exerciseModelAccess(home: string, choice: "all" | "keep" | "cance
     expect(await readPolicy()).toEqual(expectedModels);
     expect(fresh.sendMessage).toHaveBeenLastCalledWith(
       100,
-      expect.stringContaining(
-        choice === "all"
-          ? "Application by the running Gateway is not confirmed."
-          : "Current model restrictions kept.",
-      ),
+      expect.stringContaining("Application by the running Gateway is not confirmed."),
       {},
     );
   }

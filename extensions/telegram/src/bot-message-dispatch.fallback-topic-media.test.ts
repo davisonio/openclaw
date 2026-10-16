@@ -21,17 +21,14 @@ const droppedButtons = (...labels: string[]) => ({
   type: "buttons" as const,
   buttons: labels.map((label) => ({ label, value: "x".repeat(65) })),
 });
-async function dispatchPresentationFinal(params: {
-  payload: ReplyPayload;
-  context?: TelegramMessageContext;
-}) {
+async function dispatchPresentationFinal(payload: ReplyPayload, context = createContext()) {
   const { answerDraftStream } = setupDraftStreams({ answerMessageId: 2001 });
   dispatchReplyWithBufferedBlockDispatcher.mockImplementation(async ({ dispatcherOptions }) => {
-    await dispatcherOptions.deliver(params.payload, { kind: "final" });
+    await dispatcherOptions.deliver(payload, { kind: "final" });
     return { queuedFinal: true };
   });
   await dispatchWithContext({
-    context: params.context ?? createContext(),
+    context,
     streamMode: "partial",
     telegramCfg: { richMessages: true, streaming: { mode: "partial" } },
   });
@@ -67,32 +64,28 @@ function createMessageToolOnlyGroupContext(): TelegramMessageContext {
     replyThreadId: undefined,
   });
 }
-describeTelegramDispatch("dispatchTelegramMessage draft-finalization", () => {
+describeTelegramDispatch("dispatchTelegramMessage presentation and fallback policy", () => {
   it("respects richMessages=true on the finalized status preview", async () => {
     const finalUpdate = await dispatchPresentationFinal({
-      payload: {
-        text: "Gateway status as plain text",
-        presentationTextMode: "fallback",
-        presentation: { blocks: [statusTable(0)] },
-      },
+      text: "Gateway status as plain text",
+      presentationTextMode: "fallback",
+      presentation: { blocks: [statusTable(0)] },
     });
     expect(finalUpdate).toContain("<table><caption>Status</caption>");
     expect(finalUpdate).toContain("<td>running</td>");
   });
   it("keeps dropped labels: unset mixed", async () => {
     const finalUpdate = await dispatchPresentationFinal({
-      payload: {
-        text: "Status summary\n\n- Legacy\n- Presentation",
-        presentation: { blocks: [statusTable(), droppedButtons("Presentation")] },
-        interactive: { blocks: [droppedButtons("Legacy")] },
-      },
+      text: "Status summary\n\n- Legacy\n- Presentation",
+      presentation: { blocks: [statusTable(), droppedButtons("Presentation")] },
+      interactive: { blocks: [droppedButtons("Legacy")] },
     });
     expect(finalUpdate).toContain("Status summary");
     expectPresentation(finalUpdate, ["Presentation", "Legacy"]);
   });
   it("keeps dropped labels: group web-app control", async () => {
-    const finalUpdate = await dispatchPresentationFinal({
-      payload: {
+    const finalUpdate = await dispatchPresentationFinal(
+      {
         text: "Gateway status as plain text",
         presentationTextMode: "fallback",
         presentation: {
@@ -107,22 +100,17 @@ describeTelegramDispatch("dispatchTelegramMessage draft-finalization", () => {
           ],
         },
       },
-      context: createContext({
+      createContext({
         chatId: -1001234,
         isGroup: true,
         msg: {
           chat: { id: -1001234, type: "supergroup" },
-          message_id: 456,
-          message_thread_id: 777,
         } as TelegramMessageContext["msg"],
         threadSpec: { id: 777, scope: "forum" },
       }),
-    });
+    );
     expectPresentation(finalUpdate, ["Launch"], ["Launch: https://example.com/app"]);
   });
-});
-
-describeTelegramDispatch("dispatchTelegramMessage fallback send policy", () => {
   it("honors send-policy denial when final delivery fails", async () => {
     dispatchReplyWithBufferedBlockDispatcher.mockImplementation(async ({ dispatcherOptions }) => {
       dispatcherOptions.onSkip?.({}, { kind: "final", reason: "empty" });
@@ -142,9 +130,6 @@ describeTelegramDispatch("dispatchTelegramMessage fallback send policy", () => {
 
     expect(deliverReplies).not.toHaveBeenCalled();
   });
-});
-
-describeTelegramDispatch("dispatchTelegramMessage room-event failure policy", () => {
   it("does not send visible error fallbacks for room events", async () => {
     dispatchReplyWithBufferedBlockDispatcher.mockRejectedValue(new Error("provider down"));
     await dispatchWithContext({

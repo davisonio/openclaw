@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -39,7 +40,25 @@ import type * as TelegramDraft from "./draft-stream.js";
 import type { TelegramDraftStream } from "./draft-stream.js";
 import type * as TelegramSendEdit from "./send-edit.js";
 
-describeTelegramDispatch("dispatchTelegramMessage delivery-transcript", () => {
+const assistant = (text: string) =>
+  makeAgentAssistantMessage({ content: [{ type: "text", text }] });
+function recoveryDraft() {
+  const context = createContext();
+  context.ctxPayload.SessionKey = "agent:default:telegram:direct:123";
+  context.ctxPayload.MessageSid = "456";
+  return { context, ...setupDraftStreams({ answerMessageId: 2001 }) };
+}
+function expectInboundPayload(payload: Record<string, unknown>, params = {}) {
+  expect(deliverInboundReplyWithMessageSendContext).toHaveBeenCalledWith(
+    expect.objectContaining({ ...params, payload: expect.objectContaining(payload) }),
+  );
+}
+const visibleDelivery = () => ({
+  status: "handled_visible" as const,
+  delivery: { messageIds: ["2002"], visibleReplySent: true },
+});
+
+describeTelegramDispatch("dispatchTelegramMessage transcript delivery", () => {
   it.each(["ordinary", "command"] as const)(
     "stores accepted %s finals without competing mirrors",
     async (kind) => {
@@ -94,9 +113,7 @@ describeTelegramDispatch("dispatchTelegramMessage delivery-transcript", () => {
         return { chat, message_id, text, date: 1 };
       });
       vi.spyOn(bot.api, "editMessageText").mockImplementation(async (_chatId, messageId, text) => {
-        if (typeof text !== "string") {
-          throw new Error("Expected a text edit, not a rich-message edit");
-        }
+        assert(typeof text === "string", "Expected a text edit, not a rich-message edit");
         visible.set(messageId, text);
         return { chat, message_id: messageId, text, date: 1, edit_date: 2 };
       });
@@ -128,9 +145,7 @@ describeTelegramDispatch("dispatchTelegramMessage delivery-transcript", () => {
           replyOptions?.onPreparedAgentRunStart?.({ runId, transcriptStart: null });
           const manager = SessionManager.open(scope, root);
           const sourceAssistant = {
-            ...makeAgentAssistantMessage({
-              content: [{ type: "text", text: "Final answer" }],
-            }),
+            ...assistant("Final answer"),
             __openclaw: { runId },
           };
           sourceMessageIds.push(manager.appendMessage(sourceAssistant));
@@ -238,9 +253,6 @@ describeTelegramDispatch("dispatchTelegramMessage delivery-transcript", () => {
       }
     },
   );
-});
-
-describeTelegramDispatch("dispatchTelegramMessage directive delivery", () => {
   it("recovers persisted delivery facts without replacing the current-message target", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "telegram-persisted-recovery-"));
     const scope = {
@@ -270,27 +282,14 @@ describeTelegramDispatch("dispatchTelegramMessage directive delivery", () => {
       readLatestAssistantTextByIdentity.mockImplementation(
         transcript.readLatestAssistantTextByIdentity,
       );
-      const { answerDraftStream } = setupDraftStreams({ answerMessageId: 2001 });
-      const context = createContext();
-      context.ctxPayload.SessionKey = scope.sessionKey;
-      context.ctxPayload.MessageSid = "456";
-      deliverInboundReplyWithMessageSendContext.mockResolvedValue({
-        status: "handled_visible",
-        delivery: { messageIds: ["2002"], visibleReplySent: true },
-      });
+      const { context, answerDraftStream } = recoveryDraft();
+      deliverInboundReplyWithMessageSendContext.mockResolvedValue(visibleDelivery());
       dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
         async ({ dispatcherOptions, replyOptions }) => {
           await replyOptions?.onPartialReply?.({ text: prefix });
           manager.appendMessage({
-            ...makeAgentAssistantMessage({
-              content: [
-                {
-                  type: "text",
-                  text: `${fullText} [[reply_to:999]] [[audio_as_voice]]`,
-                },
-              ],
-              timestamp: Date.now(),
-            }),
+            ...assistant(`${fullText} [[reply_to:999]] [[audio_as_voice]]`),
+            timestamp: Date.now(),
             openclawDelivery: { mediaUrls: [recordedMedia] },
           });
           const payload = setReplyPayloadMetadata(
@@ -307,9 +306,7 @@ describeTelegramDispatch("dispatchTelegramMessage directive delivery", () => {
             },
           );
           const [plan] = createStructuredOutboundPayloadPlan([payload]);
-          if (!plan || !dispatcherOptions.deliverPrepared) {
-            throw new Error("Prepared delivery missing");
-          }
+          assert(plan && dispatcherOptions.deliverPrepared, "Prepared delivery missing");
           await dispatcherOptions.deliverPrepared(plan, { kind: "final" });
           return { queuedFinal: true };
         },
@@ -324,19 +321,15 @@ describeTelegramDispatch("dispatchTelegramMessage directive delivery", () => {
           getSessionEntryAsync: async () => entry,
         },
       });
-      expect(deliverInboundReplyWithMessageSendContext).toHaveBeenCalledWith(
-        expect.objectContaining({
-          payload: expect.objectContaining({
-            text: fullText,
-            replyToId: "456",
-            replyToCurrent: true,
-            replyToTag: true,
-            audioAsVoice: true,
-            mediaUrls: [...mediaUrls, recordedMedia],
-            attachments: [{}, aliasRecord, {}],
-          }),
-        }),
-      );
+      expectInboundPayload({
+        text: fullText,
+        replyToId: "456",
+        replyToCurrent: true,
+        replyToTag: true,
+        audioAsVoice: true,
+        mediaUrls: [...mediaUrls, recordedMedia],
+        attachments: [{}, aliasRecord, {}],
+      });
       expect(answerDraftStream.update).not.toHaveBeenCalledWith(fullText);
     } finally {
       await drainSessionDiskBudgetWorkers();
@@ -352,10 +345,7 @@ describeTelegramDispatch("dispatchTelegramMessage directive delivery", () => {
   ] as const)("retains delivery intent with %s", async (recovery) => {
     const current = recovery !== "longer preview";
     const initialTarget = recovery === "initial current-message target";
-    const { answerDraftStream } = setupDraftStreams({ answerMessageId: 2001 });
-    const context = createContext();
-    context.ctxPayload.SessionKey = "agent:default:telegram:direct:123";
-    context.ctxPayload.MessageSid = "456";
+    const { context, answerDraftStream } = recoveryDraft();
     mockDefaultSessionEntry();
     const prefix = "The recovered answer includes the remaining explanation after this opening";
     const fullText = `${prefix} paragraph with the complete explanation.`;
@@ -367,10 +357,7 @@ describeTelegramDispatch("dispatchTelegramMessage directive delivery", () => {
       timestamp: Date.now() + 1_000,
     });
     if (current) {
-      deliverInboundReplyWithMessageSendContext.mockResolvedValue({
-        status: "handled_visible",
-        delivery: { messageIds: ["2002"], visibleReplySent: true },
-      });
+      deliverInboundReplyWithMessageSendContext.mockResolvedValue(visibleDelivery());
     }
     dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
       async ({ dispatcherOptions, replyOptions }) => {
@@ -380,9 +367,7 @@ describeTelegramDispatch("dispatchTelegramMessage directive delivery", () => {
             ? { text: fullText, replyToId: "456", replyToTag: true, replyToCurrent: true }
             : { text: `${prefix}...` },
         ]);
-        if (!plan || !dispatcherOptions.deliverPrepared) {
-          throw new Error("Prepared Telegram delivery operation missing");
-        }
+        assert(plan && dispatcherOptions.deliverPrepared, "Prepared delivery missing");
         await dispatcherOptions.deliverPrepared(plan, { kind: "final" });
         return { queuedFinal: true };
       },
@@ -391,16 +376,9 @@ describeTelegramDispatch("dispatchTelegramMessage directive delivery", () => {
     expect(answerDraftStream.update).toHaveBeenCalledWith(previewText);
     if (current) {
       expectDraftStreamParams({ replyToMessageId: undefined, replyToMode: "off" });
-      expect(deliverInboundReplyWithMessageSendContext).toHaveBeenCalledWith(
-        expect.objectContaining({
-          replyToMode: "off",
-          payload: expect.objectContaining({
-            text: fullText,
-            replyToId: "456",
-            replyToTag: true,
-            replyToCurrent: true,
-          }),
-        }),
+      expectInboundPayload(
+        { text: fullText, replyToId: "456", replyToTag: true, replyToCurrent: true },
+        { replyToMode: "off" },
       );
       expect(answerDraftStream.update).not.toHaveBeenCalledWith(fullText);
     } else {

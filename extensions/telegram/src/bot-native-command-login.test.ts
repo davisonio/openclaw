@@ -1,6 +1,6 @@
+import assert from "node:assert/strict";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
-import type { ModelsAuthLoginFlowOptions } from "openclaw/plugin-sdk/provider-auth-login-flow-runtime";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 import type {
   getSessionEntryAsync,
@@ -29,6 +29,7 @@ import {
 import { telegramBotInfoForTest } from "./bot.create-telegram-bot.test-support.js";
 
 const sessionDirs = useSessionStoreTempDirs(afterAll, "telegram-login-worker-");
+let sessionStore: Record<string, SessionEntry>;
 const completed = "OpenAI login complete. Try your request again now.";
 const kept =
   "OpenAI login complete. This chat kept its previous account. Send /models to review the available models.";
@@ -36,13 +37,20 @@ const failed =
   "OpenAI login did not complete. Send `/login openai/openai-device-code` to try again.";
 const ownerContext = (match = "codex", chatId = 100, userId = 200) =>
   createPrivateCommandContext({ match, chatId, userId });
-const messages = (send: Awaited<ReturnType<typeof registerLoginCommand>>["sendMessage"]) =>
-  send.mock.calls.map((call) => String(call[1]));
-function expectKept(send: Awaited<ReturnType<typeof registerLoginCommand>>["sendMessage"]) {
+type Send = Awaited<ReturnType<typeof registerLoginCommand>>["sendMessage"];
+const expectSent = (send: Send, text: unknown, options: unknown = {}) =>
+  expect(send).toHaveBeenCalledWith(100, text, options);
+const expectMenu = (text: string) =>
+  expect(deliverReplies).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      replies: [expect.objectContaining({ text: expect.stringContaining(text) })],
+    }),
+  );
+const messages = (send: Send) => send.mock.calls.map((call) => String(call[1]));
+function expectKept(send: Send) {
   expect(send).toHaveBeenCalledWith(100, kept, {});
   expect(send).not.toHaveBeenCalledWith(100, completed, expect.any(Object));
 }
-type SessionRead = Parameters<typeof getSessionEntryAsync>[0];
 type SessionWrite = Parameters<typeof prepareSessionEntryPatch>[0];
 const sessionEntry = (overrides: Partial<SessionEntry> = {}): SessionEntry => ({
   sessionId: "sess-main",
@@ -62,14 +70,20 @@ function pendingLogin(
   });
   return { finish, loginFlow };
 }
+const savedLogin = (profile: string) =>
+  vi.fn<TelegramLoginFlow>(async () => createLoginResult(profile));
 const registerOwnedLogin = (
   loginFlow: TelegramLoginFlow,
   overrides: Partial<Parameters<typeof registerLoginCommand>[0]> = {},
 ) => registerLoginCommand({ cfg: createOwnerLoginConfig(), loginFlow, ...overrides });
+const registerSessionLogin = (loginFlow: TelegramLoginFlow) =>
+  registerOwnedLogin(loginFlow, {
+    accountId: "default",
+    cfg: { commands: { native: true, ownerAllowFrom: ["200"] } },
+  });
 
-const loginSessionMocks = vi.hoisted(() => ({
+const sessionMocks = vi.hoisted(() => ({
   getSessionEntry: vi.fn<typeof getSessionEntryAsync>(),
-  loadSessionStore: vi.fn(),
   resolveStorePath: vi.fn(),
   prepareSessionEntryPatch: vi.fn(),
   recordDeliveredCommandExchange: vi.fn(async () => ({
@@ -83,9 +97,9 @@ vi.mock("./bot-native-commands.runtime.js", () => ({
   ensureConfiguredBindingRouteReady: vi.fn(async () => ({ ok: true })),
   finalizeInboundContext: vi.fn((ctx: unknown) => ctx),
   getAgentScopedMediaLocalRoots: vi.fn(() => []),
-  getSessionEntryAsync: async (params: SessionRead) => loginSessionMocks.getSessionEntry(params),
-  resolveStorePath: loginSessionMocks.resolveStorePath,
-  recordDeliveredCommandExchange: loginSessionMocks.recordDeliveredCommandExchange,
+  getSessionEntryAsync: sessionMocks.getSessionEntry,
+  resolveStorePath: sessionMocks.resolveStorePath,
+  recordDeliveredCommandExchange: sessionMocks.recordDeliveredCommandExchange,
   resolveChunkMode: vi.fn(() => "length"),
   resolveThreadSessionKeys: vi.fn(
     ({
@@ -103,25 +117,22 @@ vi.mock("openclaw/plugin-sdk/session-store-runtime", async () => {
   );
   return {
     ...actual,
-    getSessionEntryAsync: async (params: SessionRead) => loginSessionMocks.getSessionEntry(params),
-    resolveStorePath: loginSessionMocks.resolveStorePath,
-    prepareSessionEntryPatch: loginSessionMocks.prepareSessionEntryPatch,
+    getSessionEntryAsync: sessionMocks.getSessionEntry,
+    resolveStorePath: sessionMocks.resolveStorePath,
+    prepareSessionEntryPatch: sessionMocks.prepareSessionEntryPatch,
   };
 });
 
 function resetLoginCommandMocks() {
   resetNativeCommandMenuMocks();
-  loginSessionMocks.recordDeliveredCommandExchange.mockClear();
-  loginSessionMocks.loadSessionStore.mockReset().mockReturnValue({});
-  loginSessionMocks.getSessionEntry
+  sessionMocks.recordDeliveredCommandExchange.mockClear();
+  sessionStore = {};
+  sessionMocks.getSessionEntry
     .mockReset()
-    .mockImplementation(
-      async ({ storePath, sessionKey }) =>
-        loginSessionMocks.loadSessionStore(storePath)[sessionKey],
-    );
-  loginSessionMocks.resolveStorePath.mockReset().mockReturnValue("/tmp/openclaw-sessions.json");
-  loginSessionMocks.prepareSessionEntryPatch.mockReset().mockImplementation(async (params) => {
-    const current = loginSessionMocks.loadSessionStore(params.storePath)[params.sessionKey];
+    .mockImplementation(async ({ sessionKey }) => sessionStore[sessionKey]);
+  sessionMocks.resolveStorePath.mockReset().mockReturnValue("/tmp/openclaw-sessions.json");
+  sessionMocks.prepareSessionEntryPatch.mockReset().mockImplementation(async (params) => {
+    const current = sessionStore[params.sessionKey];
     if (!current) {
       return null;
     }
@@ -143,11 +154,7 @@ describe("registerTelegramNativeCommands /login", () => {
       loginFlow,
     });
     await handler(ownerContext(""));
-    expect(deliverReplies).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        replies: [expect.objectContaining({ text: expect.stringContaining("Choose a provider") })],
-      }),
-    );
+    expectMenu("Choose a provider");
     expect(loginFlow).not.toHaveBeenCalled();
     await nativeCommandCallbackDispatcher?.({
       botUser: telegramBotInfoForTest,
@@ -163,13 +170,7 @@ describe("registerTelegramNativeCommands /login", () => {
       },
       commandText: "/login oauth/openai/openai",
     });
-    expect(deliverReplies).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        replies: [
-          expect.objectContaining({ text: expect.stringContaining("Choose how to connect") }),
-        ],
-      }),
-    );
+    expectMenu("Choose how to connect");
     expect(loginFlow).not.toHaveBeenCalled();
   });
 
@@ -177,12 +178,10 @@ describe("registerTelegramNativeCommands /login", () => {
     const allowDeviceCode = createDeferred<void>();
     const finishLogin = createDeferred<void>();
     let loginCompleted = false;
-    const loginFlow = vi.fn(async (params: ModelsAuthLoginFlowOptions) => {
+    const loginFlow = vi.fn<TelegramLoginFlow>(async (params) => {
       await params.prompter.note("Preparing Codex login…");
       await allowDeviceCode.promise;
-      if (!params.prompter.deviceCode) {
-        throw new Error("expected structured device-code delivery");
-      }
+      assert(params.prompter.deviceCode, "expected structured device-code delivery");
       await params.prompter.deviceCode({
         title: "OpenAI Codex device code",
         code: "PENDING-CODE",
@@ -206,8 +205,8 @@ describe("registerTelegramNativeCommands /login", () => {
     await handlerTask;
 
     expect(loginCompleted).toBe(false);
-    expect(sendMessage).toHaveBeenCalledWith(
-      100,
+    expectSent(
+      sendMessage,
       expect.stringContaining("Code: <code>PENDING-CODE</code>"),
       expect.objectContaining({ parse_mode: "HTML" }),
     );
@@ -288,7 +287,7 @@ describe("registerTelegramNativeCommands /login", () => {
   });
 
   it("rejects group /login codex without sending the device code publicly", async () => {
-    const loginFlow = vi.fn(async (params: ModelsAuthLoginFlowOptions) => {
+    const loginFlow = vi.fn<TelegramLoginFlow>(async (params) => {
       await params.prompter.note("URL: https://auth.openai.com/codex/device\nCode: SECRET");
       return createLoginResult("openai:codex");
     });
@@ -331,7 +330,7 @@ describe("registerTelegramNativeCommands /login", () => {
 
   it("names the active provider when another provider is requested in the same Telegram thread", async () => {
     const deferred = createDeferred<void>();
-    const loginFlow = vi.fn(async (params: ModelsAuthLoginFlowOptions) => {
+    const loginFlow = vi.fn<TelegramLoginFlow>(async (params) => {
       await params.prompter.deviceCode?.({
         title: "OpenAI Codex device code",
         code: "FIRST-CODE",
@@ -359,9 +358,7 @@ describe("registerTelegramNativeCommands /login", () => {
     const signals: AbortSignal[] = [];
     let settled = 0;
     const loginFlow = vi.fn<TelegramLoginFlow>(async (params) => {
-      if (!params.signal) {
-        throw new Error("Expected login cancellation signal.");
-      }
+      assert(params.signal, "Expected login cancellation signal.");
       signals.push(params.signal);
       try {
         await params.openUrl?.("https://openrouter.ai/auth?code_challenge=fixture");
@@ -393,18 +390,14 @@ describe("registerTelegramNativeCommands /login", () => {
       expect(signals[1]?.aborted).toBe(false);
       expect(sendMessage).toHaveBeenCalledWith(100, "Provider login cancelled for this chat.", {});
       await command("cancel");
-      expect(sendMessage).toHaveBeenCalledWith(
-        100,
-        "No provider login is active in this chat.",
-        {},
-      );
+      expectSent(sendMessage, "No provider login is active in this chat.");
     } finally {
       await command("cancel");
       await command("cancel", 101);
       finish.resolve();
       await vi.waitFor(() => expect(settled).toBe(signals.length));
     }
-    expect(loginSessionMocks.prepareSessionEntryPatch).not.toHaveBeenCalled();
+    expect(sessionMocks.prepareSessionEntryPatch).not.toHaveBeenCalled();
   });
 
   it("rejects credential persistence after the command owner is removed", async () => {
@@ -444,19 +437,17 @@ describe("registerTelegramNativeCommands /login", () => {
       authProfileOverrideSource: "user",
     });
     const store = { "agent:main:main": previous };
-    loginSessionMocks.loadSessionStore.mockReturnValue(store);
-    loginSessionMocks.prepareSessionEntryPatch.mockImplementationOnce(
-      async (write: SessionWrite) => {
-        const patch = await write.prepare({ ...previous }, { existingEntry: previous });
-        commands.ownerAllowFrom = ["999"];
-        if (write.authority?.kind === "host") {
-          write.authority.assertCurrent();
-        }
-        store["agent:main:main"] = patch ? { ...previous, ...patch } : previous;
-        return store["agent:main:main"];
-      },
-    );
-    const loginFlow = vi.fn<TelegramLoginFlow>(async () => createLoginResult("openai:saved"));
+    sessionStore = store;
+    sessionMocks.prepareSessionEntryPatch.mockImplementationOnce(async (write: SessionWrite) => {
+      const patch = await write.prepare({ ...previous }, { existingEntry: previous });
+      commands.ownerAllowFrom = ["999"];
+      if (write.authority?.kind === "host") {
+        write.authority.assertCurrent();
+      }
+      store["agent:main:main"] = patch ? { ...previous, ...patch } : previous;
+      return store["agent:main:main"];
+    });
+    const loginFlow = savedLogin("openai:saved");
     const { handler, sendMessage } = await registerLoginCommand({ cfg: { commands }, loginFlow });
 
     await handler(ownerContext());
@@ -489,7 +480,7 @@ describe("registerTelegramNativeCommands /login", () => {
 
   it("does not report auth failure when only the terminal notification fails", async () => {
     const runtime: RuntimeEnv = { error: vi.fn(), exit: vi.fn(), log: vi.fn() };
-    const loginFlow = vi.fn(async (params: ModelsAuthLoginFlowOptions) => {
+    const loginFlow = vi.fn<TelegramLoginFlow>(async (params) => {
       await params.prompter.deviceCode?.({ title: "Codex login", code: "SUCCESS-CODE" });
       return createLoginResult("openai:codex");
     });
@@ -511,24 +502,14 @@ describe("registerTelegramNativeCommands /login", () => {
   it("blocks provider prompts and terminal messages after Telegram stops", async () => {
     const shutdown = new AbortController();
     let loginSettled = false;
-    const loginFlow = vi.fn(async (params: ModelsAuthLoginFlowOptions) => {
+    const loginFlow = vi.fn<TelegramLoginFlow>(async (params) => {
       await params.prompter.deviceCode?.({ title: "Codex login", code: "ABORT-CODE" });
-      if (!params.signal) {
-        throw new Error("expected login owner signal");
-      }
+      assert(params.signal, "expected login owner signal");
       const signal = params.signal;
       try {
         await new Promise<void>((_resolve, reject) => {
-          signal.addEventListener(
-            "abort",
-            () =>
-              reject(
-                signal.reason instanceof Error ? signal.reason : new Error("Telegram stopped"),
-              ),
-            { once: true },
-          );
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
         });
-        throw new Error("unreachable");
       } catch {
         await params.prompter.note("Trouble with device code login?", "OAuth help");
         throw new Error("Telegram stopped");
@@ -574,12 +555,12 @@ describe("registerTelegramNativeCommands /login", () => {
   it("persists the Telegram login account without caller-thread entry SQL", async () => {
     const { store, scope } = await prepareTelegramLoginSessionStore(
       sessionDirs.make(),
-      loginSessionMocks,
+      sessionMocks,
     );
     const { handler } = await registerLoginCommand({
       accountId: "default",
       cfg: createOwnerLoginConfig(),
-      loginFlow: vi.fn<TelegramLoginFlow>(async () => createLoginResult("openai:saved")),
+      loginFlow: savedLogin("openai:saved"),
     });
     const sql = observeHostDataSql();
     try {
@@ -587,8 +568,8 @@ describe("registerTelegramNativeCommands /login", () => {
     } finally {
       sql.restore();
     }
-    expect(loginSessionMocks.prepareSessionEntryPatch).toHaveBeenCalledOnce();
-    expect(loginSessionMocks.prepareSessionEntryPatch).toHaveBeenCalledWith(
+    expect(sessionMocks.prepareSessionEntryPatch).toHaveBeenCalledOnce();
+    expect(sessionMocks.prepareSessionEntryPatch).toHaveBeenCalledWith(
       expect.objectContaining({ sessionKey: scope.sessionKey, storePath: scope.storePath }),
     );
     expect(store.getSessionEntry(scope)?.authProfileOverride).toBe("openai:saved");
@@ -599,134 +580,97 @@ describe("registerTelegramNativeCommands /login", () => {
     ).toEqual([]);
   });
 
-  it("moves a session created while Telegram login is pending to the returned profile", async () => {
-    const { finish: finishLogin, loginFlow: runModelsAuthLoginFlow } = pendingLogin(
-      "NEW-SESSION",
-      "openai:new-owner@example.com",
-    );
-    let sessionStore: Record<string, SessionEntry> = {};
-    loginSessionMocks.loadSessionStore.mockImplementation(() => sessionStore);
-    const { handler, sendMessage } = await registerOwnedLogin(runModelsAuthLoginFlow, {
-      accountId: "default",
-      cfg: { commands: { native: true, ownerAllowFrom: ["200"] } },
-    });
-
+  it.each([
+    {
+      name: "moves a session created during login",
+      code: "NEW-SESSION",
+      profile: "openai:new-owner@example.com",
+      laterProfile: undefined,
+    },
+    {
+      name: "preserves a later user-selected profile",
+      code: "LATER-USER-SELECTION",
+      profile: "openai:login-profile",
+      laterProfile: "openai:later-user-profile",
+    },
+  ])("$name", async ({ code, profile, laterProfile }) => {
+    const { finish, loginFlow } = pendingLogin(code, profile);
+    const { handler, sendMessage } = await registerSessionLogin(loginFlow);
     await handler(ownerContext());
+    const created = sessionEntry({ sessionId: "sess-created-during-login", updatedAt: 2 });
     sessionStore = {
-      "agent:main:main": sessionEntry({ sessionId: "sess-created-during-login", updatedAt: 2 }),
+      "agent:main:main": laterProfile
+        ? { ...created, authProfileOverride: laterProfile, authProfileOverrideSource: "user" }
+        : created,
     };
-    finishLogin.resolve();
-
-    await vi.waitFor(() =>
-      expect(loginSessionMocks.prepareSessionEntryPatch).toHaveBeenCalledTimes(1),
-    );
-    const update = (
-      loginSessionMocks.prepareSessionEntryPatch.mock.calls[0]?.[0] as {
-        prepare?: (entry: SessionEntry) => Partial<SessionEntry> | null;
-      }
-    )?.prepare;
-    expect(
-      update?.(sessionEntry({ sessionId: "sess-created-during-login", updatedAt: 2 })),
-    ).toEqual({
-      authProfileOverride: "openai:new-owner@example.com",
-      authProfileOverrideSource: "user",
-      authProfileOverrideCompactionCount: undefined,
-    });
-    await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledWith(100, completed, {}));
-  });
-
-  it("preserves a later user-selected profile on a session created during Telegram login", async () => {
-    const { finish: finishLogin, loginFlow: runModelsAuthLoginFlow } = pendingLogin(
-      "LATER-USER-SELECTION",
-      "openai:login-profile",
-    );
-    let sessionStore: Record<string, SessionEntry> = {};
-    loginSessionMocks.loadSessionStore.mockImplementation(() => sessionStore);
-    const { handler, sendMessage } = await registerOwnedLogin(runModelsAuthLoginFlow, {
-      accountId: "default",
-      cfg: { commands: { native: true, ownerAllowFrom: ["200"] } },
-    });
-
-    await handler(ownerContext());
-    sessionStore = {
-      "agent:main:main": {
-        authProfileOverride: "openai:later-user-profile",
+    finish.resolve();
+    if (laterProfile) {
+      await vi.waitFor(() => expectSent(sendMessage, kept));
+      expect(sendMessage).not.toHaveBeenCalledWith(100, completed, expect.any(Object));
+    } else {
+      await vi.waitFor(() =>
+        expect(sessionMocks.prepareSessionEntryPatch).toHaveBeenCalledTimes(1),
+      );
+      const update = (
+        sessionMocks.prepareSessionEntryPatch.mock.calls[0]?.[0] as {
+          prepare?: (entry: SessionEntry) => Partial<SessionEntry> | null;
+        }
+      )?.prepare;
+      expect(update?.(created)).toEqual({
+        authProfileOverride: "openai:new-owner@example.com",
         authProfileOverrideSource: "user",
-        sessionId: "sess-created-during-login",
-        updatedAt: 2,
-      },
-    };
-    finishLogin.resolve();
-
-    await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledWith(100, kept, {}));
-    expect(sendMessage).not.toHaveBeenCalledWith(100, completed, expect.any(Object));
+        authProfileOverrideCompactionCount: undefined,
+      });
+      await vi.waitFor(() => expectSent(sendMessage, completed));
+    }
   });
 
-  it("preserves refreshed auth when Telegram cannot persist the returned session profile", async () => {
-    const message =
-      'OpenAI login complete. This chat kept its previous account. To use the new sign-in, send `/model "openai/test-model"@"openai:new-owner@example.com" -s`.';
-    loginSessionMocks.loadSessionStore.mockReturnValue({
-      "agent:main:main": {
-        authProfileOverride: "openai:old-owner@example.com",
-        modelOverride: "test-model",
-        sessionId: "sess-main",
-        updatedAt: 1,
-      },
+  it.each([
+    {
+      name: "preserves refreshed auth when session persistence fails",
+      writeFailed: true,
+      prior: "openai:old-owner@example.com",
+      profile: "openai:new-owner@example.com",
+    },
+    {
+      name: "revalidates an unchanged profile against a concurrent selection",
+      writeFailed: false,
+      prior: "openai:owner@example.com",
+      profile: "openai:owner@example.com",
+    },
+  ])("$name", async ({ writeFailed, prior, profile }) => {
+    const previous = sessionEntry({
+      authProfileOverride: prior,
+      ...(writeFailed ? { modelOverride: "test-model" } : { authProfileOverrideSource: "user" }),
     });
-    loginSessionMocks.prepareSessionEntryPatch.mockRejectedValueOnce(new Error("write failed"));
-    const runModelsAuthLoginFlow = vi.fn<TelegramLoginFlow>(async () =>
-      createLoginResult("openai:new-owner@example.com"),
-    );
-    const { handler, sendMessage } = await registerLoginCommand({
-      accountId: "default",
-      cfg: {
-        commands: { native: true, ownerAllowFrom: ["200"] },
-      } as OpenClawConfig,
-      allowFrom: ["200"],
-      loginFlow: runModelsAuthLoginFlow,
-    });
-
+    sessionStore = { "agent:main:main": previous };
+    if (writeFailed) {
+      sessionMocks.prepareSessionEntryPatch.mockRejectedValueOnce(new Error("write failed"));
+    } else {
+      sessionMocks.prepareSessionEntryPatch.mockImplementationOnce(async (params) => {
+        const current = {
+          ...previous,
+          authProfileOverride: "openai:concurrent-owner@example.com",
+          updatedAt: 2,
+        };
+        const patch = await params.prepare({ ...current });
+        if (params.authority?.kind === "host") {
+          params.authority.assertCurrent();
+        }
+        return patch ? { ...current, ...patch } : current;
+      });
+    }
+    const { handler, sendMessage } = await registerSessionLogin(savedLogin(profile));
     await handler(ownerContext());
-
-    expect(sendMessage).toHaveBeenCalledWith(100, message, {});
-    expect(sendMessage).toHaveBeenCalledWith(
-      100,
-      expect.stringContaining("kept its previous account"),
-      {},
-    );
-    expect(sendMessage).not.toHaveBeenCalledWith(100, completed, expect.any(Object));
-  });
-
-  it("revalidates an unchanged Telegram profile after device login", async () => {
-    const previousEntry = sessionEntry({
-      authProfileOverride: "openai:owner@example.com",
-      authProfileOverrideSource: "user",
-    });
-    loginSessionMocks.loadSessionStore.mockReturnValue({
-      "agent:main:main": previousEntry,
-    });
-    loginSessionMocks.prepareSessionEntryPatch.mockImplementationOnce(async (params) => {
-      const concurrentEntry = {
-        ...previousEntry,
-        authProfileOverride: "openai:concurrent-owner@example.com",
-        updatedAt: 2,
-      };
-      const patch = await params.prepare({ ...concurrentEntry });
-      if (params.authority?.kind === "host") {
-        params.authority.assertCurrent();
-      }
-      return patch ? { ...concurrentEntry, ...patch } : concurrentEntry;
-    });
-    const runModelsAuthLoginFlow = vi.fn<TelegramLoginFlow>(async () =>
-      createLoginResult("openai:owner@example.com"),
-    );
-    const { handler, sendMessage } = await registerOwnedLogin(runModelsAuthLoginFlow, {
-      accountId: "default",
-      cfg: { commands: { native: true, ownerAllowFrom: ["200"] } },
-    });
-
-    await handler(ownerContext());
-
-    expectKept(sendMessage);
+    if (writeFailed) {
+      expectSent(
+        sendMessage,
+        'OpenAI login complete. This chat kept its previous account. To use the new sign-in, send `/model "openai/test-model"@"openai:new-owner@example.com" -s`.',
+      );
+      expectSent(sendMessage, expect.stringContaining("kept its previous account"));
+      expect(sendMessage).not.toHaveBeenCalledWith(100, completed, expect.any(Object));
+    } else {
+      expectKept(sendMessage);
+    }
   });
 });
