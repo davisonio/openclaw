@@ -71,9 +71,7 @@ describe("memory search config", () => {
     registerBaseMemoryEmbeddingProviders();
   });
 
-  afterEach(() => {
-    setActiveDegradedSecretOwners([]);
-  });
+  afterEach(() => setActiveDegradedSecretOwners([]));
 
   function searchConfig(
     search: NonNullable<OpenClawConfig["memory"]>["search"],
@@ -85,31 +83,6 @@ describe("memory search config", () => {
       ...(overrides && {
         agents: { defaults: {}, entries: { [agentId]: { memory: { search: overrides } } } },
       }),
-    });
-  }
-
-  function configWithRemoteDefaults(remote: Record<string, unknown>) {
-    return searchConfig(
-      { provider: "openai", remote },
-      { remote: { baseUrl: "https://agent.example/v1" } },
-    );
-  }
-
-  function expectMergedRemoteConfig(
-    resolved: ReturnType<typeof resolveMemorySearchConfig>,
-    apiKey: unknown,
-  ) {
-    expect(resolved?.remote).toEqual({
-      baseUrl: "https://agent.example/v1",
-      apiKey,
-      headers: { "X-Default": "on" },
-      batch: {
-        enabled: false,
-        wait: true,
-        concurrency: 2,
-        pollIntervalMs: 2000,
-        timeoutMinutes: 60,
-      },
     });
   }
 
@@ -423,17 +396,28 @@ describe("memory search config", () => {
   });
 
   it("preserves SecretRef remote apiKey when merging defaults with agent overrides", () => {
-    const cfg = configWithRemoteDefaults({
-      apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" }, // pragma: allowlist secret
+    const cfg = searchConfig(
+      {
+        provider: "openai",
+        remote: {
+          apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" }, // pragma: allowlist secret
+          headers: { "X-Default": "on" },
+        },
+      },
+      { remote: { baseUrl: "https://agent.example/v1" } },
+    );
+
+    expect(resolveMemorySearchConfig(cfg, "main")?.remote).toEqual({
+      baseUrl: "https://agent.example/v1",
+      apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" },
       headers: { "X-Default": "on" },
-    });
-
-    const resolved = resolveMemorySearchConfig(cfg, "main");
-
-    expectMergedRemoteConfig(resolved, {
-      source: "env",
-      provider: "default",
-      id: "OPENAI_API_KEY",
+      batch: {
+        enabled: false,
+        wait: true,
+        concurrency: 2,
+        pollIntervalMs: 2000,
+        timeoutMinutes: 60,
+      },
     });
   });
 

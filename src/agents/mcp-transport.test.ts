@@ -34,41 +34,22 @@ const {
   sseTransportConstructorMock: vi.fn<(url: URL, options?: SseTransportOptions) => void>(),
 }));
 
-vi.mock("./mcp-oauth-fetch.js", () => ({
-  withMcpOAuthBearer: oauthBearerMock,
-}));
-
-vi.mock("node:dns/promises", () => ({
-  lookup: lookupMock,
-}));
+vi.mock("./mcp-oauth-fetch.js", () => ({ withMcpOAuthBearer: oauthBearerMock }));
+vi.mock("node:dns/promises", () => ({ lookup: lookupMock }));
 
 vi.mock("../infra/net/undici-runtime.js", () => ({
   createHttp1Agent: (options: unknown) => ({ options }),
   createHttp1EnvHttpProxyAgent: (options: unknown) => ({ options }),
   createHttp1ProxyAgent: (options: unknown) => ({ options }),
-  loadUndiciRuntimeDeps: () => ({
-    fetch: runtimeFetchMock,
-  }),
+  loadUndiciRuntimeDeps: () => ({ fetch: runtimeFetchMock }),
 }));
 
 vi.mock("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
-  StreamableHTTPClientTransport: function MockStreamableHTTPClientTransport(
-    this: unknown,
-    url: URL,
-    options?: StreamableTransportOptions,
-  ) {
-    streamableTransportConstructorMock(url, options);
-  },
+  StreamableHTTPClientTransport: streamableTransportConstructorMock,
 }));
 
 vi.mock("@modelcontextprotocol/sdk/client/sse.js", () => ({
-  SSEClientTransport: function MockSSEClientTransport(
-    this: unknown,
-    url: URL,
-    options?: SseTransportOptions,
-  ) {
-    sseTransportConstructorMock(url, options);
-  },
+  SSEClientTransport: sseTransportConstructorMock,
 }));
 
 function redirectResponse(location: string, status = 302): Response {
@@ -79,20 +60,8 @@ function latestStreamableTransportOptions(): StreamableTransportOptions {
   return streamableTransportConstructorMock.mock.calls.at(-1)![1]!;
 }
 
-function latestStreamableFetch() {
-  return latestStreamableTransportOptions().fetch!;
-}
-
-function latestSseEventSourceFetch() {
-  return sseTransportConstructorMock.mock.calls.at(-1)![1]!.eventSourceInit!.fetch!;
-}
-
 function runtimeFetchCall(index: number) {
   return runtimeFetchMock.mock.calls[index]!;
-}
-
-function latestOAuthBearerParams(): OAuthBearerParams {
-  return oauthBearerMock.mock.calls.at(-1)![0];
 }
 
 const resourceUrl = "https://mcp.example.com/mcp";
@@ -150,7 +119,7 @@ describe("resolveMcpTransport", () => {
 
     resolveHttp();
 
-    await expect(latestStreamableFetch()(resourceUrl)).rejects.toThrow(
+    await expect(latestStreamableTransportOptions().fetch!(resourceUrl)).rejects.toThrow(
       "Blocked hostname or private/internal/special-use IP address",
     );
 
@@ -236,7 +205,7 @@ describe("resolveMcpTransport", () => {
     await options.fetch?.(resourceUrl);
     await options.fetch?.("https://auth.example.com/token");
 
-    const oauthParams = latestOAuthBearerParams();
+    const oauthParams = oauthBearerMock.mock.calls.at(-1)![0];
     await oauthParams.authFetchFn("https://mcp.example.com/.well-known/oauth-protected-resource");
     await oauthParams.authFetchFn("https://auth.example.com/token");
 
@@ -253,7 +222,7 @@ describe("resolveMcpTransport", () => {
 
     resolveHttp({ auth: "oauth" });
 
-    const oauthParams = latestOAuthBearerParams();
+    const oauthParams = oauthBearerMock.mock.calls.at(-1)![0];
     const tokenBody = new URLSearchParams({
       code: "synthetic-code",
       code_verifier: "synthetic-verifier",
@@ -279,7 +248,7 @@ describe("resolveMcpTransport", () => {
       headers: { Authorization: "Bearer operator" },
     });
 
-    const sseFetch = latestSseEventSourceFetch();
+    const sseFetch = sseTransportConstructorMock.mock.calls.at(-1)![1]!.eventSourceInit!.fetch!;
     await sseFetch("https://mcp.example.com/sse", {
       headers: { authorization: "Bearer sdk" },
     });

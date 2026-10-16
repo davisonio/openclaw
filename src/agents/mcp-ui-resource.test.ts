@@ -15,13 +15,10 @@ import {
 } from "./mcp-ui-resource.js";
 import { testing as mcpUiResourceTesting } from "./mcp-ui-resource.test-support.js";
 
-const MCP_APP_RESOURCE_MIME_TYPE = "text/html;profile=mcp-app";
-const MCP_APP_RESOURCE_MAX_BYTES = 2 * 1024 * 1024;
+const APP_MIME = "text/html;profile=mcp-app";
+const MAX_BYTES = 2 * 1024 * 1024;
 
-function runtime(
-  readResource: SessionMcpRuntime["readResource"] = async () => html(),
-  overrides: Partial<SessionMcpRuntime> = {},
-): SessionMcpRuntime {
+function runtime(overrides: Partial<SessionMcpRuntime> = {}): SessionMcpRuntime {
   return {
     sessionId: "session-1",
     sessionKey: "agent:main:main",
@@ -29,14 +26,12 @@ function runtime(
     configFingerprint: "fingerprint",
     createdAt: 0,
     lastUsedAt: 0,
-    mcpAppsEnabled: true,
-    activeLeases: 0,
     acquireLease: vi.fn(() => vi.fn()),
     markUsed: () => {},
     getCatalog: async () => ({ version: 1, generatedAt: 0, servers: {}, tools: [] }),
     peekCatalog: () => null,
     callTool: vi.fn(),
-    readResource,
+    readResource: async () => html(),
     dispose: async () => {},
     ...overrides,
   };
@@ -56,22 +51,21 @@ function fetchView(params: Pick<ViewParams, "runtime"> & Partial<Omit<ViewParams
 }
 
 function html(text = "<html>demo</html>", _meta?: Record<string, unknown>) {
-  return {
-    contents: [{ uri: "ui://demo/app", mimeType: MCP_APP_RESOURCE_MIME_TYPE, text, _meta }],
-  };
+  return { contents: [{ uri: "ui://demo/app", mimeType: APP_MIME, text, _meta }] };
 }
 
-async function createView(params: Partial<ViewParams> = {}) {
-  const active = params.runtime ?? runtime();
+async function createView({
+  content = html(),
+  ...params
+}: Partial<ViewParams> & { content?: ReturnType<typeof html> } = {}) {
+  const active = params.runtime ?? runtime({ readResource: async () => content });
   const descriptor = await fetchView({ ...params, runtime: active });
   const viewId = descriptor!.viewId;
   return { active, viewId, view: getView(viewId, active)! };
 }
 
 describe("MCP App UI resources", () => {
-  beforeEach(() => {
-    mcpUiResourceTesting.clearViewStore();
-  });
+  beforeEach(() => mcpUiResourceTesting.clearViewStore());
 
   afterEach(() => {
     mcpUiResourceTesting.clearViewStore();
@@ -85,11 +79,9 @@ describe("MCP App UI resources", () => {
     "selects an advertised initial display mode ($expected)",
     async ({ preferred, requested, available, expected }) => {
       const { view } = await createView({
-        runtime: runtime(async () =>
-          html("<p>app</p>", {
-            "openai/ui": { preferredDisplayMode: preferred, availableDisplayModes: available },
-          }),
-        ),
+        content: html("<p>app</p>", {
+          "openai/ui": { preferredDisplayMode: preferred, availableDisplayModes: available },
+        }),
         displayMode: requested,
       });
       expect(view.displayMode).toBe(expected);
@@ -121,15 +113,13 @@ describe("MCP App UI resources", () => {
 
   it("does not infer a Gateway profile from transport requester scope", async () => {
     const { active, view } = await createView({
-      runtime: runtime(undefined, {
+      runtime: runtime({
         requesterScope: { requesterSenderId: "channel-user", messageChannel: "discord" },
       }),
     });
     expect(view.requesterId).toBeUndefined();
     view.allowedAppToolNames = new Set();
-    updateContext(active, view, {
-      content: [{ type: "text", text: "shared selection" }],
-    });
+    updateContext(active, view, { content: [{ type: "text", text: "shared selection" }] });
     const context = await leaseContext({
       sessionId: active.sessionId,
       sessionKey: active.sessionKey,
@@ -142,16 +132,10 @@ describe("MCP App UI resources", () => {
   it("leases HTML and tool data only in memory", async () => {
     const authorizeAppInteraction = vi.fn(async () => true);
     const { active, viewId, view } = await createView({
-      runtime: runtime(async () =>
-        html(undefined, {
-          ui: {
-            csp: { connectDomains: ["https://api.example.com"] },
-            permissions: { geolocation: {} },
-          },
-        }),
-      ),
+      content: html(undefined, {
+        ui: { permissions: { geolocation: {} } },
+      }),
       toolInput: { city: "Paris" },
-      toolResult: { content: [{ type: "text", text: "ok" }] },
       authorizeAppInteraction,
     });
 
@@ -162,12 +146,7 @@ describe("MCP App UI resources", () => {
       permissions: { geolocation: {} },
       authorizeAppInteraction,
     });
-    expect(
-      getView(
-        viewId,
-        runtime(async () => ({ contents: [] })),
-      ),
-    ).toBeUndefined();
+    expect(getView(viewId, runtime())).toBeUndefined();
     expect(getSessionView(viewId, "agent:main:main", "main")).toMatchObject({
       html: "<html>demo</html>",
       runtime: active,
@@ -178,7 +157,7 @@ describe("MCP App UI resources", () => {
 
   it("isolates live views by agent when bare session keys collide", async () => {
     const { viewId } = await createView({
-      runtime: runtime(async () => html("<html>ops</html>"), { sessionKey: "global" }),
+      runtime: runtime({ sessionKey: "global" }),
       agentId: "ops",
     });
 
@@ -188,7 +167,7 @@ describe("MCP App UI resources", () => {
 
   it("keeps valid Apps when optional listing metadata fails", async () => {
     const readResource = vi.fn(async () => html());
-    const sessionRuntime = runtime(readResource);
+    const sessionRuntime = runtime({ readResource });
     sessionRuntime.listResources = vi.fn(async () => {
       throw new Error("resources/list unavailable");
     });
@@ -207,42 +186,36 @@ describe("MCP App UI resources", () => {
   it("rejects oversized and incorrectly typed resources", async () => {
     for (const content of [
       { ...html("<html></html>").contents[0], mimeType: "text/html" },
-      html("x".repeat(MCP_APP_RESOURCE_MAX_BYTES + 1)).contents[0],
+      html("x".repeat(MAX_BYTES + 1)).contents[0],
     ]) {
       const result = await fetchView({
-        runtime: runtime(async () => ({ contents: [content] })),
+        runtime: runtime({ readResource: async () => ({ contents: [content] }) }),
       });
       expect(result).toBeUndefined();
     }
   });
 
-  it("bounds concurrent app bridge requests", () => {
-    const view = {
-      requestWindowStartedAtMs: 0,
-      requestCount: 0,
-      toolCallCount: 0,
-      activeRequests: 0,
-    } as Parameters<typeof acquireMcpAppViewRequest>[0];
-    const releases = Array.from({ length: 4 }, () => acquireMcpAppViewRequest(view, "read", 1));
-    expect(() => acquireMcpAppViewRequest(view, "read", 1)).toThrow("concurrency limit");
+  it("bounds concurrent app bridge requests", async () => {
+    const { view } = await createView();
+    const now = view.requestWindowStartedAtMs + 1;
+    const releases = Array.from({ length: 4 }, () => acquireMcpAppViewRequest(view, "read", now));
+    expect(() => acquireMcpAppViewRequest(view, "read", now)).toThrow("concurrency limit");
     releases[0]?.();
-    const release = acquireMcpAppViewRequest(view, "read", 1);
+    const release = acquireMcpAppViewRequest(view, "read", now);
     release();
     releases.slice(1).forEach((entry) => entry());
   });
 
   it("normalizes CSP before retaining the view", async () => {
     const { view } = await createView({
-      runtime: runtime(async () =>
-        html("<!doctype html><script>globalThis.ready = true</script>", {
-          ui: {
-            csp: {
-              connectDomains: ["https://api.example.com", "javascript:alert(1)"],
-              resourceDomains: ["https://cdn.example.com"],
-            },
+      content: html("<!doctype html>", {
+        ui: {
+          csp: {
+            connectDomains: ["https://api.example.com", "javascript:alert(1)"],
+            resourceDomains: ["https://cdn.example.com"],
           },
-        }),
-      ),
+        },
+      }),
     });
     expect(view?.csp).toEqual({
       connectDomains: ["https://api.example.com"],
@@ -255,15 +228,13 @@ describe("MCP App UI resources", () => {
   it("deletes sensitive view data when the lease expires without later activity", async () => {
     vi.useFakeTimers();
     const { active, viewId, view } = await createView({
-      runtime: runtime(async () => html("<html>secret</html>")),
+      content: html("<html>secret</html>"),
       toolInput: { token: "secret" },
     });
     expect(view).toBeDefined();
     const changed = vi.fn();
     view!.disposeCallbacks = new Set([subscribeMcpAppModelContext(view!, changed)]);
-    updateContext(active, view!, {
-      content: [{ type: "text", text: "ephemeral context" }],
-    });
+    updateContext(active, view, { content: [{ type: "text", text: "ephemeral context" }] });
     expect(getContext(active, view!)).not.toBeNull();
 
     await vi.advanceTimersByTimeAsync(10 * 60_000);
@@ -287,7 +258,7 @@ describe("MCP App UI resources", () => {
 
     const domains = Array.from(
       { length: 64 },
-      (_, index) => `https://${"a".repeat(120)}-${index}.example.com`,
+      (_, i) => `https://${"a".repeat(120)}-${i}.example.com`,
     );
     expect(() =>
       buildMcpAppSandboxPath({
@@ -302,12 +273,9 @@ describe("MCP App UI resources", () => {
   it("derives a distinct listener port without wrapping", () => {
     expect(resolveMcpAppSandboxPort(18789)).toBe(18790);
     expect(resolveMcpAppSandboxPort(18789, 29000)).toBe(29000);
-    expect(() => resolveMcpAppSandboxPort(65535)).toThrow(
-      "MCP Apps require distinct valid Gateway and sandbox ports",
-    );
-    expect(() => resolveMcpAppSandboxPort(18789, 18789)).toThrow(
-      "MCP Apps require distinct valid Gateway and sandbox ports",
-    );
+    const error = "MCP Apps require distinct valid Gateway and sandbox ports";
+    expect(() => resolveMcpAppSandboxPort(65535)).toThrow(error);
+    expect(() => resolveMcpAppSandboxPort(18789, 18789)).toThrow(error);
   });
 
   it("replaces a reconstructed view id without leaking the previous runtime lease", async () => {
@@ -328,8 +296,6 @@ describe("MCP App UI resources", () => {
 
     expect(releases[0]).toHaveBeenCalledOnce();
     expect(releases[1]).not.toHaveBeenCalled();
-    expect(getView("mcp-app-restored", sessionRuntime)?.toolInput).toEqual({
-      version: 2,
-    });
+    expect(getView("mcp-app-restored", sessionRuntime)?.toolInput).toEqual({ version: 2 });
   });
 });

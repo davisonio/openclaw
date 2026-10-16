@@ -82,6 +82,8 @@ function completedImage(name: string, createdAt: number, endedAt: number) {
 
 const findImageRequest = (requestKey: string) =>
   findDuplicateGuardImageGenerationTaskForSession("agent:main", { requestKey });
+const findImagePrompt = (prompt: string) =>
+  findDuplicateGuardImageGenerationTaskForSession("agent:main", { prompt });
 
 it.each([
   [
@@ -153,9 +155,7 @@ describe("image generation task status", () => {
   });
 
   it("observes a newly admitted operation on the next owner lookup", async () => {
-    expect(
-      await findDuplicateGuardImageGenerationTaskForSession("agent:main", { prompt: "new image" }),
-    ).toBeUndefined();
+    expect(await findImagePrompt("new image")).toBeUndefined();
     mediaActivityMocks.listOperations.mockReturnValue([
       makeTask({
         taskId: "task-newly-started",
@@ -164,9 +164,10 @@ describe("image generation task status", () => {
       }),
     ]);
     recordRecentImageStart("newly-started", { taskLabel: "new image", requestKey: undefined });
-    expect(
-      await findDuplicateGuardImageGenerationTaskForSession("agent:main", { prompt: "new image" }),
-    ).toMatchObject({ taskId: "task-newly-started", status: "running" });
+    expect(await findImagePrompt("new image")).toMatchObject({
+      taskId: "task-newly-started",
+      status: "running",
+    });
   });
 
   it("does not use a completion older than two minutes as a duplicate guard", async () => {
@@ -203,16 +204,11 @@ describe("image generation task status", () => {
       progressSummary: "Generating first image",
     });
 
-    expect(
-      await findDuplicateGuardImageGenerationTaskForSession("agent:main", {
-        prompt: "first prompt",
-      }),
-    ).toMatchObject({ taskId: "task-first", status: "running" });
-    expect(
-      await findDuplicateGuardImageGenerationTaskForSession("agent:main", {
-        prompt: "second prompt",
-      }),
-    ).toBeUndefined();
+    expect(await findImagePrompt("first prompt")).toMatchObject({
+      taskId: "task-first",
+      status: "running",
+    });
+    expect(await findImagePrompt("second prompt")).toBeUndefined();
   });
 
   it("uses a recent persisted completion instead of pruning a stale recent-start cache", async () => {
