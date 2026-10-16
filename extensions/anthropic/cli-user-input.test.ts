@@ -2,10 +2,8 @@ import type { CliBackendExecuteContext } from "openclaw/plugin-sdk/cli-backend";
 import { describe, expect, it, vi } from "vitest";
 import { createClaudeCliUserInputAuthorizer } from "./cli-user-input.js";
 
-function createContext(
-  requestUserInput: CliBackendExecuteContext["requestUserInput"],
-): CliBackendExecuteContext {
-  return {
+function authorizerFor(requestUserInput: CliBackendExecuteContext["requestUserInput"]) {
+  return createClaudeCliUserInputAuthorizer({
     command: "/usr/local/bin/claude",
     args: [],
     cwd: "/tmp",
@@ -15,62 +13,44 @@ function createContext(
     systemPrompt: "test",
     useResume: false,
     timeoutMs: 30_000,
-    requestToolPermission: vi.fn(async () => ({
-      behavior: "allow" as const,
-      updatedInput: {},
-    })),
+    requestToolPermission: async () => ({ behavior: "allow", updatedInput: {} }),
     requestUserInput,
-  };
+  });
 }
 
-const validOptions = [
-  { label: "A", description: "First option." },
-  { label: "B", description: "Second option." },
-];
-
-function question(overrides: Record<string, unknown> = {}) {
-  return {
-    header: "Stack",
-    question: "Q?",
-    options: validOptions,
-    multiSelect: false,
-    ...overrides,
-  };
-}
-
+const options = (...labels: string[]) =>
+  labels.map((label) => ({ label, description: "Use " + label }));
+const validOptions = options("A", "B");
+const question = (overrides: Record<string, unknown> = {}) => ({
+  header: "Stack",
+  question: "Q?",
+  options: validOptions,
+  multiSelect: false,
+  ...overrides,
+});
+const malformed = (overrides: Record<string, unknown>) => ({ questions: [question(overrides)] });
+const mappedAnswers = (proof: string) => ({ "Runner?": "Vitest", "Proof?": proof });
+const answered = (...proof: string[]) =>
+  vi.fn<CliBackendExecuteContext["requestUserInput"]>(async () => ({
+    status: "answered",
+    answers: { question_1: ["Vitest"], question_2: proof },
+  }));
 const input = {
   questions: [
-    {
-      header: "Test stack",
-      question: "Which test runner should we use?",
-      options: [
-        { label: "Vitest", description: "Use the existing test stack." },
-        { label: "Node test", description: "Use the built-in runner." },
-      ],
-      multiSelect: false,
-    },
-    {
+    question({ question: "Runner?", options: options("Vitest", "Node test") }),
+    question({
       header: "Proof",
-      question: "Which proof should we collect?",
-      options: [
-        { label: "Unit tests", description: "Exercise the adapter." },
-        { label: "UI proof", description: "Capture the Control UI." },
-      ],
+      question: "Proof?",
+      options: options("Unit tests", "UI proof"),
       multiSelect: true,
-    },
+    }),
   ],
 };
 
 describe("Claude CLI user input adapter", () => {
   it("maps Claude questions and answers while deduplicating the CLI callbacks", async () => {
-    const requestUserInput = vi.fn(async () => ({
-      status: "answered" as const,
-      answers: {
-        question_1: ["Vitest"],
-        question_2: ["Unit tests", "UI proof"],
-      },
-    }));
-    const authorizer = createClaudeCliUserInputAuthorizer(createContext(requestUserInput));
+    const requestUserInput = answered("Unit tests", "UI proof");
+    const authorizer = authorizerFor(requestUserInput);
     const signal = new AbortController().signal;
 
     const first = authorizer.authorize({ input, signal, toolUseId: "claude-question-1" });
@@ -80,10 +60,7 @@ describe("Claude CLI user input adapter", () => {
       behavior: "allow",
       updatedInput: {
         ...input,
-        answers: {
-          "Which test runner should we use?": "Vitest",
-          "Which proof should we collect?": "Unit tests, UI proof",
-        },
+        answers: mappedAnswers("Unit tests, UI proof"),
       },
     });
     await expect(second).resolves.toEqual(await first);
@@ -101,12 +78,10 @@ describe("Claude CLI user input adapter", () => {
   });
 
   it("returns actionable denial guidance when the operator skips", async () => {
-    const authorizer = createClaudeCliUserInputAuthorizer(
-      createContext(async () => ({
-        status: "cancelled",
-        message: "The operator skipped this question.",
-      })),
-    );
+    const authorizer = authorizerFor(async () => ({
+      status: "cancelled",
+      message: "The operator skipped this question.",
+    }));
 
     await expect(
       authorizer.authorize({ input, signal: new AbortController().signal }),
@@ -117,10 +92,7 @@ describe("Claude CLI user input adapter", () => {
   });
 
   it("guides a malformed question retry without replaying the rejected call", async () => {
-    const requestUserInput = vi.fn(async () => ({
-      status: "answered" as const,
-      answers: { question_1: ["Vitest"], question_2: ["Unit tests"] },
-    }));
+    const requestUserInput = answered("Unit tests");
     const authorizer = createClaudeCliUserInputAuthorizer(createContext(requestUserInput));
     const signal = new AbortController().signal;
     const rejected = {
@@ -145,12 +117,7 @@ describe("Claude CLI user input adapter", () => {
       authorizer.authorize({ input, signal, toolUseId: "corrected-question" }),
     ).resolves.toMatchObject({
       behavior: "allow",
-      updatedInput: {
-        answers: {
-          "Which test runner should we use?": "Vitest",
-          "Which proof should we collect?": "Unit tests",
-        },
-      },
+      updatedInput: { answers: mappedAnswers("Unit tests") },
     });
     expect(requestUserInput).toHaveBeenCalledOnce();
   });
@@ -164,35 +131,22 @@ describe("Claude CLI user input adapter", () => {
     ],
     [
       "non-boolean multiSelect",
-      { questions: [question({ multiSelect: "no" })] },
+      malformed({ multiSelect: "no" }),
       "questions[0].multiSelect must be a boolean",
     ],
     [
       "too few options",
-      { questions: [question({ options: [{ label: "A", description: "a" }] })] },
+      malformed({ options: options("A") }),
       "questions[0].options must be an array of 2 to 4 options",
     ],
     [
       "empty option description",
-      {
-        questions: [
-          question({
-            options: [
-              { label: "A", description: "a" },
-              { label: "B", description: "" },
-            ],
-          }),
-        ],
-      },
+      malformed({ options: [...options("A"), { label: "B", description: "" }] }),
       "questions[0].options[1].description must not be empty",
     ],
     [
       "missing option label",
-      {
-        questions: [
-          question({ options: validOptions.map(({ description }) => ({ description })) }),
-        ],
-      },
+      malformed({ options: validOptions.map(({ description }) => ({ description })) }),
       "questions[0].options[0].label must be a string",
     ],
     ["non-record question", { questions: ["not a question"] }, "questions[0] must be an object"],
