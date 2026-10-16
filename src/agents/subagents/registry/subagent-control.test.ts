@@ -386,11 +386,13 @@ describe("killSubagentRunAdmin", () => {
       killed: false,
       runId,
     });
-    expect(await latestRun(childSessionKey)).toMatchObject({
+    const persistedChild = await latestRun(childSessionKey);
+    expect(persistedChild).toMatchObject({
       runId,
       generation: 2,
-      execution: { status: "running", endedAt: undefined },
+      execution: { status: "running" },
     });
+    expect(persistedChild?.execution.endedAt).toBeUndefined();
     expect(abort).not.toHaveBeenCalled();
   });
 
@@ -779,16 +781,20 @@ describe("controlled subagent cancellation races", () => {
     expect(abort).not.toHaveBeenCalled();
     expect(clearQueues).not.toHaveBeenCalled();
     for (const [index, childSessionKey] of successorKeys.entries()) {
-      expect(await latestRun(childSessionKey)).toMatchObject({
+      const persistedChild = await latestRun(childSessionKey);
+      expect(persistedChild).toMatchObject({
         runId: `run-old-${index}`,
         controllerSessionKey,
         generation: 2,
-        execution: { status: "running", endedAt: undefined },
+        execution: { status: "running" },
       });
-      expect(await latestRun(descendantKeys[index]!)).toMatchObject({
+      expect(persistedChild?.execution.endedAt).toBeUndefined();
+      const persistedDescendant = await latestRun(descendantKeys[index]!);
+      expect(persistedDescendant).toMatchObject({
         runId: `run-successor-leaf-${index}`,
-        execution: { status: "running", endedAt: undefined },
+        execution: { status: "running" },
       });
+      expect(persistedDescendant?.execution.endedAt).toBeUndefined();
     }
   });
 
@@ -864,8 +870,9 @@ describe("controlled subagent cancellation races", () => {
       const successor = await latestRun(sessionKey);
       expect(successor).toMatchObject({
         runId,
-        execution: { status: "running", endedAt: undefined },
+        execution: { status: "running" },
       });
+      expect(successor?.execution.endedAt).toBeUndefined();
     }
   });
 
@@ -1005,9 +1012,13 @@ describe("controlled subagent cancellation races", () => {
         killed: moved ? 0 : 1,
         labels: moved ? [] : ["leaf task"],
       });
-      expect(await latestRun(leaf.childSessionKey)).toMatchObject({
-        execution: { endedAt: moved ? undefined : expect.any(Number) },
-      });
+      const currentLeaf = await latestRun(leaf.childSessionKey);
+      expect(currentLeaf).toBeDefined();
+      if (moved) {
+        expect(currentLeaf?.execution.endedAt).toBeUndefined();
+      } else {
+        expect(currentLeaf?.execution.endedAt).toEqual(expect.any(Number));
+      }
     },
   );
 
@@ -1098,10 +1109,12 @@ describe("controlled subagent cancellation races", () => {
             killed: false,
             runId: entry.runId,
           });
-          expect(await latestRun(childSessionKey)).toMatchObject({
+          const recoveredSuccessor = await latestRun(childSessionKey);
+          expect(recoveredSuccessor).toMatchObject({
             runId: "recovery-successor",
-            execution: { status: "running", endedAt: undefined },
+            execution: { status: "running" },
           });
+          expect(recoveredSuccessor?.execution.endedAt).toBeUndefined();
           expect(abort).not.toHaveBeenCalled();
         } else {
           await expect(pendingKill).resolves.toMatchObject({ status: "ok" });

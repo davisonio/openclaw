@@ -1,4 +1,5 @@
 import { isChannelPartialDeliveryError } from "openclaw/plugin-sdk/channel-inbound";
+import type { ChannelMessageSendResult } from "openclaw/plugin-sdk/channel-outbound";
 import { expect, vi, type Mock } from "vitest";
 import type { sendSmsViaTwilio } from "./twilio.js";
 
@@ -19,7 +20,7 @@ export function createPartialSmsSend(
       events.push("send:second");
       throw new Error("second chunk failed");
     });
-  const onDeliveryResult = vi.fn(async (result: { messageId: string }) => {
+  const onDeliveryResult = vi.fn(async (result: ChannelMessageSendResult) => {
     events.push(`delivery:${result.messageId}`);
   });
   const onPlatformSendDispatch = vi.fn(async () => {

@@ -27,7 +27,7 @@ export function heldWork() {
     enter: entered.resolve,
     wait: release.promise,
     release: release.resolve,
-    run() {
+    run: () => {
       entered.resolve();
       return release.promise;
     },

@@ -40,13 +40,7 @@ import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js
 import { withEnvAsync } from "../test-utils/env.js";
 import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import type { GatewayRequestHandlerOptions } from "./server-methods/types.js";
-import {
-  reloadFailure,
-  heldWork,
-  pluginInstance,
-} from "./server-plugin-reload.fixture-tools.test-support.js";
 import { reloadGatewayPlugins } from "./server-plugin-reload.js";
-import { observeRetainedWork } from "./server-plugin-reload.recovery.test-support.js";
 import { createGatewayPluginRuntimeGeneration } from "./server-plugin-runtime-generation.js";
 import { GatewayRequestEntryLifetime } from "./server-request-entry.js";
 import { createGatewaySidecarStopOwner } from "./server-sidecar-owners.js";
@@ -54,10 +48,6 @@ import { createGatewaySidecarStopOwner } from "./server-sidecar-owners.js";
 const cleanups: Array<() => Promise<void>> = [];
 const tempDirs: string[] = [];
 const logs = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
-
-function writeJson(file: string, data: unknown) {
-  fs.writeFileSync(file, JSON.stringify(data));
-}
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -124,25 +114,31 @@ async function verifyInstalledPackageRetention(
     }),
   ) => {
     fs.mkdirSync(path.join(packageDir, "dist"), { recursive: true });
-    writeJson(path.join(packageDir, "package.json"), {
-      name: id,
-      version: "1.0.0",
-      openclaw: { extensions: ["./index.ts"], runtimeExtensions: ["./dist/index.js"] },
-    });
+    fs.writeFileSync(
+      path.join(packageDir, "package.json"),
+      JSON.stringify({
+        name: id,
+        version: "1.0.0",
+        openclaw: { extensions: ["./index.ts"], runtimeExtensions: ["./dist/index.js"] },
+      }),
+    );
     fs.writeFileSync(path.join(packageDir, "index.ts"), "throw new Error('unselected source');");
-    writeJson(path.join(packageDir, "openclaw.plugin.json"), {
-      id,
-      activation: { onStartup: true },
-      configSchema:
-        id === "sibling"
-          ? {
-              type: "object",
-              additionalProperties: false,
-              properties:
-                settings === "defaulted" ? { mode: { type: "string", default: "auto" } } : {},
-            }
-          : { type: "object" },
-    });
+    fs.writeFileSync(
+      path.join(packageDir, "openclaw.plugin.json"),
+      JSON.stringify({
+        id,
+        activation: { onStartup: true },
+        configSchema:
+          id === "sibling"
+            ? {
+                type: "object",
+                additionalProperties: false,
+                properties:
+                  settings === "defaulted" ? { mode: { type: "string", default: "auto" } } : {},
+              }
+            : { type: "object" },
+      }),
+    );
     fs.writeFileSync(path.join(packageDir, "dist", "helper.cjs"), 'module.exports = "A";');
     fs.writeFileSync(
       path.join(packageDir, "dist", "index.js"),
@@ -188,10 +184,13 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
       fs.writeFileSync(path.join(siblingDir, assetDir, "index.css"), ":root { color: blue; }\n");
       const manifestPath = path.join(siblingDir, "openclaw.plugin.json");
       const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-      writeJson(manifestPath, {
-        ...manifest,
-        controlUi: { entry: `${assetDir}/index.js`, styles: [`${assetDir}/index.css`] },
-      });
+      fs.writeFileSync(
+        manifestPath,
+        JSON.stringify({
+          ...manifest,
+          controlUi: { entry: `${assetDir}/index.js`, styles: [`${assetDir}/index.css`] },
+        }),
+      );
     };
     writeSiblingControlUi("build-a");
     const bundledDir =
@@ -210,12 +209,6 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
         path.join(secondaryWorkspace, ".openclaw", "extensions", "workspace-probe"),
       );
     }
-    const initialIds = [
-      "sibling",
-      ...(bundledDir ? ["bundled-probe"] : []),
-      ...(healthyDir ? ["healthy"] : []),
-      ...(hasWorkspacePlugin ? ["workspace-probe"] : []),
-    ];
     const initialConfig: OpenClawConfig = {
       agents: {
         ownership: "explicit",
@@ -225,8 +218,18 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
         },
       },
       plugins: {
-        allow: initialIds,
-        entries: Object.fromEntries(initialIds.map((id) => [id, { enabled: true }])),
+        allow: [
+          "sibling",
+          ...(bundledDir ? ["bundled-probe"] : []),
+          ...(healthyDir ? ["healthy"] : []),
+          ...(hasWorkspacePlugin ? ["workspace-probe"] : []),
+        ],
+        entries: {
+          sibling: { enabled: true },
+          ...(bundledDir ? { "bundled-probe": { enabled: true } } : {}),
+          ...(healthyDir ? { healthy: { enabled: true } } : {}),
+          ...(hasWorkspacePlugin ? { "workspace-probe": { enabled: true } } : {}),
+        },
         load: { paths: healthyDir ? [siblingDir, healthyDir] : [siblingDir] },
         slots: { memory: "none" },
       },
@@ -238,7 +241,12 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
       env,
     });
     expect(initialMetadata.manifestRegistry.plugins.map((plugin) => plugin.id).toSorted()).toEqual(
-      initialIds.toSorted(),
+      [
+        "sibling",
+        ...(bundledDir ? ["bundled-probe"] : []),
+        ...(healthyDir ? ["healthy"] : []),
+        ...(hasWorkspacePlugin ? ["workspace-probe"] : []),
+      ].toSorted(),
     );
     const initial = await bootstrap.prepareGatewayPluginLoad({
       pluginMetadataSnapshot: initialMetadata,
@@ -278,7 +286,10 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
     let beforeAttachment: ((candidate: (typeof loaded)[number]) => void) | undefined;
     cleanups.push(async () => {
       try {
-        await currentServices?.stop({ strict: true, deadlineAtMs: Date.now() + 5_000 });
+        await currentServices?.stop({
+          strict: true,
+          deadlineAtMs: Date.now() + 5_000,
+        });
       } finally {
         for (const generation of loaded) {
           generation.retireGatewayRuntimeBindings?.();
@@ -334,7 +345,9 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
         undefined,
         undefined,
       );
-      return respond.mock.calls[0]?.[1];
+      const response = respond.mock.calls[0];
+      assert.ok(response);
+      return response[1];
     };
     const workspacePlugin = hasWorkspacePlugin ? await probe("workspace-probe") : undefined;
     const sibling = await probe("sibling");
@@ -350,21 +363,6 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
         entries: { ...initialConfig.plugins?.entries, "installed-probe": { enabled: true } },
       },
     };
-    const pluginRecord = (id: string) =>
-      runtime.pluginRuntime.registry.plugins.find((record) => record.id === id);
-    const expectSibling = async () => {
-      expect(pluginRecord("sibling")).toBe(siblingRecord);
-      expect(runtime.pluginRuntime.registry.gatewayHandlers["sibling.probe"]).toBe(siblingHandler);
-      expect(await probe("sibling")).toEqual(sibling);
-    };
-    const withEntries = (
-      entries: NonNullable<NonNullable<OpenClawConfig["plugins"]>["entries"]>,
-    ): OpenClawConfig => ({
-      ...config,
-      plugins: { ...config.plugins, entries: { ...config.plugins?.entries, ...entries } },
-    });
-    const writeHelper = (source: string) =>
-      fs.writeFileSync(path.join(packageDir, "dist", "helper.cjs"), source);
     // Managed npm roots live outside discovery directories and are owned by the persisted ledger.
     const writeInstall = (installedAt?: string, version = "1.0.0") =>
       writePersistedInstalledPluginIndex(
@@ -385,7 +383,7 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
         { env },
       );
     await writeInstall();
-    writeJson(path.join(stateDir, "openclaw.json"), config);
+    fs.writeFileSync(path.join(stateDir, "openclaw.json"), JSON.stringify(config));
     const reload = async (
       nextConfig = config,
       pluginIds = ["installed-probe"],
@@ -424,7 +422,11 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
           changedPaths: [],
           prepareConfigEffects: () => ({ retire: () => {}, rollback: async () => {} }),
           assertInvokerOwned,
-          pluginLifecycle: { reason, operationId: "installed-package-reload", pluginIds },
+          pluginLifecycle: {
+            reason,
+            operationId: "installed-package-reload",
+            pluginIds,
+          },
           commitRuntime: async (publication) => {
             publication?.publish();
             setRuntimeConfigSnapshot(nextConfig);
@@ -487,7 +489,9 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
     if (cleanupRetry === "mixed-recovery") {
       assert.ok(healthyDir);
       const healthy = await probe("healthy");
-      const healthyRecord = pluginRecord("healthy");
+      const healthyRecord = runtime.pluginRuntime.registry.plugins.find(
+        (record) => record.id === "healthy",
+      );
       fs.writeFileSync(stopFailurePath, "fail once");
       try {
         await expect(reload()).rejects.toMatchObject({ details: { phase: "drain" } });
@@ -505,17 +509,26 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
         fs.writeFileSync(healthyHelper, "module.exports = ;");
         beforeAttachment = undefined;
       };
-      const mixedConfig = withEntries({
-        "installed-probe": { enabled: true, config: { failStart: true } },
-        healthy: { enabled: true, config: { candidate: true } },
+      const mixedConfig: OpenClawConfig = {
+        ...config,
+        plugins: {
+          ...config.plugins,
+          entries: {
+            ...config.plugins?.entries,
+            "installed-probe": { enabled: true, config: { failStart: true } },
+            healthy: { enabled: true, config: { candidate: true } },
+          },
+        },
+      };
+      await expect(reload(mixedConfig, ["installed-probe", "healthy"])).rejects.toMatchObject({
+        details: { phase: "activate", committed: false },
       });
-      await expect(reload(mixedConfig, ["installed-probe", "healthy"])).rejects.toMatchObject(
-        reloadFailure("activate"),
-      );
       const recoveredHealthy = await probe("healthy");
       expect(recoveredHealthy).toEqual({ ...healthy, instance: expect.any(String) });
       expect(recoveredHealthy.instance).not.toBe(healthy.instance);
-      expect(pluginRecord("healthy")).not.toBe(healthyRecord);
+      expect(
+        runtime.pluginRuntime.registry.plugins.find((record) => record.id === "healthy"),
+      ).not.toBe(healthyRecord);
       expect(
         runtime.pluginRuntime.registry.gatewayHandlers["installed-probe.probe"],
       ).toBeUndefined();
@@ -525,12 +538,21 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
       });
       expect(registrations).toHaveLength(2);
       expect(fs.existsSync(resourcePath)).toBe(false);
-      await expectSibling();
+      expect(runtime.pluginRuntime.registry.plugins.find((record) => record.id === "sibling")).toBe(
+        siblingRecord,
+      );
+      expect(runtime.pluginRuntime.registry.gatewayHandlers["sibling.probe"]).toBe(siblingHandler);
+      expect(await probe("sibling")).toEqual(sibling);
       return;
     }
     if (cleanupRetry) {
       const retiredRegistry = runtime.pluginRuntime.registry;
-      const retiredInstance = pluginInstance(retiredRegistry, "installed-probe");
+      const retiredRecord = retiredRegistry.plugins.find(
+        (record) => record.id === "installed-probe",
+      );
+      assert.ok(retiredRecord);
+      const retiredInstance = getPluginInstance(retiredRecord);
+      assert.ok(retiredInstance);
       if (cleanupRetry === "active-call") {
         const release = createDeferredCore();
         const effectsPath = path.join(root, "completed-call.txt");
@@ -583,7 +605,10 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
           await call;
           expect(fs.readFileSync(effectsPath, "utf8")).toBe("completed once");
           expect(retiredInstance.run(() => "still serving")).toBe("still serving");
-          writeHelper('module.exports = "retry";');
+          fs.writeFileSync(
+            path.join(packageDir, "dist", "helper.cjs"),
+            'module.exports = "retry";',
+          );
           await expect(reload()).resolves.toMatchObject({
             runtime: { pluginIds: ["installed-probe"] },
           });
@@ -594,7 +619,9 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
           expect(registrations).toEqual([first.instance, current.instance]);
           expect(retiredInstance.disposing).toBe(true);
           expect(fs.readFileSync(effectsPath, "utf8")).toBe("completed once");
-          expect(pluginRecord("sibling")).toBe(siblingRecord);
+          expect(
+            runtime.pluginRuntime.registry.plugins.find((record) => record.id === "sibling"),
+          ).toBe(siblingRecord);
           expect(runtime.pluginRuntime.registry.gatewayHandlers["sibling.probe"]).toBe(
             siblingHandler,
           );
@@ -611,7 +638,8 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
         }
         return;
       }
-      const disposal = heldWork();
+      const entered = createDeferredCore();
+      const release = createDeferredCore();
       let blockedInstance = retiredInstance;
       let capturedEntry: string | undefined;
       let capturedBytes: string | undefined;
@@ -621,7 +649,10 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
         expect(capturedEntry).not.toBe(path.join(packageDir, "dist", "index.js"));
         capturedBytes = fs.readFileSync(capturedEntry, "utf8");
         // Physical source cleanup remains owned after the caller's observation budget expires.
-        blockedInstance.onModuleDispose(disposal.run);
+        blockedInstance.onModuleDispose(async () => {
+          entered.resolve();
+          await release.promise;
+        });
       };
       let rejectedConfig = config;
       const rejectedRuntime =
@@ -631,16 +662,29 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
       } else if (cleanupRetry === "gateway-stop") {
         fs.writeFileSync(stopFailurePath, "fail once");
       } else {
-        rejectedConfig = withEntries({
-          "installed-probe": { enabled: true, config: { failStart: true } },
-        });
+        rejectedConfig = {
+          ...config,
+          plugins: {
+            ...config.plugins,
+            entries: {
+              ...config.plugins?.entries,
+              "installed-probe": { enabled: true, config: { failStart: true } },
+            },
+          },
+        };
         let attachments = 0;
         beforeAttachment = (candidate) => {
           attachments++;
           if (attachments !== (cleanupRetry === "candidate-disposal" ? 1 : 2)) {
             return;
           }
-          blockedInstance = pluginInstance(candidate.pluginRegistry, "installed-probe");
+          const record = candidate.pluginRegistry.plugins.find(
+            (entry) => entry.id === "installed-probe",
+          );
+          assert.ok(record);
+          const instance = getPluginInstance(record);
+          assert.ok(instance);
+          blockedInstance = instance;
           gateDisposal();
           if (cleanupRetry === "recovery-disposal") {
             throw new Error("synthetic recovery attachment failed");
@@ -652,7 +696,7 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
       let retry: Promise<Awaited<ReturnType<typeof reload>>> | undefined;
       try {
         if (cleanupRetry !== "gateway-stop") {
-          await disposal.entered;
+          await entered.promise;
           await vi.advanceTimersByTimeAsync(rejectedRuntime ? 10_000 : 5_000);
         }
         expect(await failed).toMatchObject({
@@ -671,7 +715,7 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
         expect(await probe("sibling")).toEqual(sibling);
 
         fs.rmSync(stopFailurePath, { force: true });
-        writeHelper('module.exports = "retry";');
+        fs.writeFileSync(path.join(packageDir, "dist", "helper.cjs"), 'module.exports = "retry";');
         if (cleanupRetry !== "gateway-stop") {
           // Plugin cleanup releases its lock before module cleanup relinquishes captured code.
           assert.ok(capturedEntry);
@@ -686,7 +730,7 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
           expect(registrations).toEqual(failedRegistrations);
           expect(fs.existsSync(resourcePath)).toBe(false);
           expect(fs.readFileSync(capturedEntry, "utf8")).toBe(capturedBytes);
-          disposal.release();
+          release.resolve();
           const { errors } = await blockedInstance.dispose();
           expect(errors).toHaveLength(1);
           const timeout = errors[0];
@@ -710,14 +754,16 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
         expect(current.instance).not.toBe(first.instance);
         expect(registrations).toEqual([...failedRegistrations, current.instance]);
         expect(fs.existsSync(resourcePath)).toBe(true);
-        expect(pluginRecord("sibling")).toBe(siblingRecord);
+        expect(
+          runtime.pluginRuntime.registry.plugins.find((record) => record.id === "sibling"),
+        ).toBe(siblingRecord);
         expect(runtime.pluginRuntime.registry.gatewayHandlers["sibling.probe"]).toBe(
           siblingHandler,
         );
         expect(await probe("sibling")).toEqual(sibling);
       } finally {
         fs.rmSync(stopFailurePath, { force: true });
-        disposal.release();
+        release.resolve();
         await Promise.allSettled([
           failed,
           retry,
@@ -734,7 +780,7 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
     expect(unchangedReceipt.application.pluginIds).toEqual([]);
 
     // Same-version reinstall changes the committed install input, not the manifest.
-    writeHelper('module.exports = "B";');
+    fs.writeFileSync(path.join(packageDir, "dist", "helper.cjs"), 'module.exports = "B";');
     await writeInstall("2026-09-07T00:00:00.000Z");
     const changedReceipt = await refresh();
     expect(runtime.pluginMetadataSnapshot?.index.installRecords["installed-probe"]).toMatchObject({
@@ -758,13 +804,14 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
     expect(second.instance).not.toBe(updated.instance);
     expect(secondReceipt.runtime.pluginIds).toEqual(["installed-probe"]);
     expect(secondReceipt.runtime.sourceDigests).toEqual(changedReceipt.application.sourceDigests);
+    assert.ok(firstReceipt.runtime && secondReceipt.runtime);
     expect(secondReceipt.runtime.generation).toBeGreaterThan(firstReceipt.runtime.generation);
     expect(firstReceipt.runtime.sourceDigests?.["installed-probe"]).toEqual(expect.any(String));
     expect(secondReceipt.runtime.sourceDigests?.["installed-probe"]).not.toBe(
       firstReceipt.runtime.sourceDigests?.["installed-probe"],
     );
 
-    writeHelper('module.exports = "C";');
+    fs.writeFileSync(path.join(packageDir, "dist", "helper.cjs"), 'module.exports = "C";');
     const sourceOnlyRefresh = await refresh();
     expect(sourceOnlyRefresh.application.pluginIds).toEqual([]);
     expect(await probe("installed-probe")).toEqual(second);
@@ -776,7 +823,7 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
     expect(sourceOnlyReload.runtime.sourceDigests).not.toEqual(secondReceipt.runtime.sourceDigests);
 
     const lastGoodRegistry = runtime.pluginRuntime.registry;
-    writeHelper("module.exports = ;");
+    fs.writeFileSync(path.join(packageDir, "dist", "helper.cjs"), "module.exports = ;");
     await expect(reload()).rejects.toMatchObject({
       details: { phase: "activate", committed: false, pluginIds: ["installed-probe"] },
     });
@@ -784,12 +831,23 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
     const syntaxRecovery = await probe("installed-probe");
     expect(syntaxRecovery).toEqual({ ...current, instance: expect.any(String) });
     expect(syntaxRecovery.instance).not.toBe(current.instance);
-    await expectSibling();
+    expect(runtime.pluginRuntime.registry.plugins.find((record) => record.id === "sibling")).toBe(
+      siblingRecord,
+    );
+    expect(runtime.pluginRuntime.registry.gatewayHandlers["sibling.probe"]).toBe(siblingHandler);
+    expect(await probe("sibling")).toEqual(sibling);
 
-    writeHelper('module.exports = "C";');
-    const rejectedConfig = withEntries({
-      "installed-probe": { enabled: true, config: { failStart: true } },
-    });
+    fs.writeFileSync(path.join(packageDir, "dist", "helper.cjs"), 'module.exports = "C";');
+    const rejectedConfig: OpenClawConfig = {
+      ...config,
+      plugins: {
+        ...config.plugins,
+        entries: {
+          ...config.plugins?.entries,
+          "installed-probe": { enabled: true, config: { failStart: true } },
+        },
+      },
+    };
     // Broad configuration reloads derive their affected owners from candidate identity.
     await expect(reload(rejectedConfig, [])).rejects.toMatchObject({
       details: { phase: "activate", committed: false, pluginIds: ["installed-probe"] },
@@ -800,13 +858,28 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
     expect(activationRecovery).toEqual({ ...current, instance: expect.any(String) });
     expect(activationRecovery.instance).not.toBe(syntaxRecovery.instance);
     expect(await probe("sibling")).toEqual(sibling);
-    const invalidSettings = withEntries({ sibling: { enabled: true, config: { mode: 42 } } });
-    await expect(reload(invalidSettings, [])).rejects.toMatchObject(reloadFailure("prepare"));
+    const invalidSettings: OpenClawConfig = {
+      ...config,
+      plugins: {
+        ...config.plugins,
+        entries: { ...config.plugins?.entries, sibling: { enabled: true, config: { mode: 42 } } },
+      },
+    };
+    await expect(reload(invalidSettings, [])).rejects.toMatchObject({
+      details: { phase: "prepare", committed: false },
+    });
     expect(runtime.pluginRuntime.registry).toBe(activationRecoveryRegistry);
     expect(await probe("sibling")).toEqual(sibling);
-    const changedSettings = withEntries({
-      "installed-probe": { enabled: true, config: { label: "changed" } },
-    });
+    const changedSettings: OpenClawConfig = {
+      ...config,
+      plugins: {
+        ...config.plugins,
+        entries: {
+          ...config.plugins?.entries,
+          "installed-probe": { enabled: true, config: { label: "changed" } },
+        },
+      },
+    };
     const configReceipt = await reload(changedSettings, []);
     expect(configReceipt.runtime.pluginIds).toEqual(["installed-probe"]);
     const configured = await probe("installed-probe");
@@ -824,19 +897,35 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
         ).plugins.find((plugin) => plugin.id === "installed-probe")?.version;
       expect(await listedVersion()).toBe("1.0.0");
       const previousRegistry = runtime.pluginRuntime.registry;
-      const previousInstance = pluginInstance(previousRegistry, "installed-probe");
+      const previousRecord = previousRegistry.plugins.find(
+        (record) => record.id === "installed-probe",
+      );
+      assert.ok(previousRecord);
+      const previousInstance = getPluginInstance(previousRecord);
+      assert.ok(previousInstance);
       const finishFirstRun = retainRuntimePluginWork([previousRegistry]);
       expect(await probe("installed-probe")).toEqual(configured);
       const finishSecondRun = retainRuntimePluginWork([previousRegistry]);
       const packageManifestPath = path.join(packageDir, "package.json");
       const packageManifest = JSON.parse(fs.readFileSync(packageManifestPath, "utf8"));
-      writeJson(packageManifestPath, { ...packageManifest, version: "1.1.0" });
+      fs.writeFileSync(
+        packageManifestPath,
+        JSON.stringify({ ...packageManifest, version: "1.1.0" }),
+      );
       await writeInstall("2026-09-08T00:00:00.000Z", "1.1.0");
-      const observation = observeRetainedWork(previousInstance);
+      const drainEntered = createDeferredCore();
+      const wait = previousInstance.waitForRetainedWork.bind(previousInstance);
+      const observation = vi
+        .spyOn(previousInstance, "waitForRetainedWork")
+        .mockImplementation((...args) => {
+          const draining = wait(...args);
+          drainEntered.resolve();
+          return draining;
+        });
       const replacing = reload(changedSettings);
-      void replacing.catch(observation.reject);
+      void replacing.catch(drainEntered.reject);
       try {
-        await observation.entered;
+        await drainEntered.promise;
         expect(owner.getReloadStatus()).toMatchObject({
           phase: "reloading",
           reason: expect.stringContaining("queued behind 2 retained work"),
@@ -866,7 +955,7 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
       } finally {
         finishFirstRun();
         finishSecondRun();
-        observation.restore();
+        observation.mockRestore();
         await replacing.catch(() => {});
       }
     }

@@ -161,7 +161,7 @@ it.each([
   ["confirmed send failure", failedPlacement("failed", "run-background", "Placement rejected")],
 ] as const)(
   "waits for terminal background completion after %s",
-  async (scenario, placement, observed = {}) => {
+  async (scenario, placement, observed) => {
     const alreadyTerminal = scenario === "confirmed send failure";
     vi.useFakeTimers();
     const showToast = vi.spyOn(toast, "showToast").mockReturnValue(true);

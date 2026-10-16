@@ -58,8 +58,10 @@ function fixture(uncertain = false) {
     ): Promise<T> {
       return withOpenClawStateLeaseWorkerAdmission(lease, databasePath, operation, authority);
     },
-    admitted<T>(operation: (admission: SqliteWorkerOperationAdmission) => T): Promise<Awaited<T>> {
-      return result.run(async (scope) => {
+    async admitted<T>(
+      operation: (admission: SqliteWorkerOperationAdmission) => T,
+    ): Promise<Awaited<T>> {
+      return await result.run(async (scope) => {
         const { admission } = scope.createAdmission({ settled: settled.promise });
         try {
           return await operation(admission);

@@ -51,6 +51,7 @@ vi.mock("./ingress-spool.js", () => ({ createSmsIngressSpool }));
 vi.mock("./media.js", () => ({ tryHandleHostedSmsMediaRequest }));
 vi.mock("./webhook.js", () => ({ createSmsWebhookHandler }));
 
+// mock-isolation: Gateway fixtures control webhook registration and request admission.
 vi.mock("openclaw/plugin-sdk/webhook-ingress", () => ({
   registerPluginHttpRoute,
 }));

@@ -24,115 +24,140 @@ import { createReefRuntimeAuthority, getActiveReef } from "./runtime.js";
 import type { ReefTransportClient } from "./transport.js";
 
 afterEach(resetFlowStoresForTests);
-const messageId = "01JZ0000000000000000000200";
-const message = { cfg: {}, to: "reef:Alice", text: "hello" };
-const prepareId = (text: string) =>
-  reefOutboundAdapter.prepareConversationTurnMessageId!({ ...message, to: "reef:alice", text });
-const activateSend = (send: ReefMessageFlow["send"]) =>
-  createReefRuntimeAuthority().activate({ flow: { send }, friends: {}, reviews: {} } as never);
-const dispatchingSend = (effect: () => string) =>
-  vi.fn<ReefMessageFlow["send"]>(async (_peer, _text, context = {}) => {
-    await context.onPlatformSendDispatch?.();
-    return effect();
-  });
-
-async function createFlow(
-  peers: Parameters<typeof workerFlowStores>[1],
-  overrides: Partial<ConstructorParameters<typeof ReefMessageFlow>[0]> = {},
-) {
-  const cfg = config();
-  const { trusted, audit, ...stores } = await workerFlowStores(cfg, peers);
-  return new ReefMessageFlow({
-    config: cfg,
-    trust: trusted,
-    keys: reefKeys(),
-    transport: transport() as unknown as ReefTransportClient,
-    guard: guard(allow),
-    audit,
-    replay: new MemoryReplayStore(),
-    ...stores,
-    onIngress: async () => {},
-    onOwnerNotice: async () => {},
-    ...overrides,
-  });
-}
 
 describe("reefOutboundAdapter", () => {
-  it("applies the shared sanitizer to outgoing text", () => {
-    const text = "Done.\n⚠️ 🛠️ `search repos (agent)` failed";
-    expect(reefOutboundAdapter.sanitizeText!({ text, payload: { text } })).toBe("Done.");
+  it("removes internal tool text while preserving user-visible examples", () => {
+    const sanitizeText = reefOutboundAdapter.sanitizeText;
+    if (!sanitizeText) {
+      throw new Error("expected Reef outbound sanitizeText hook");
+    }
+    const sanitize = (text: string) => sanitizeText({ text, payload: { text } });
+    const fenced = ["```xml", '<tool_call>{"name":"exec"}</tool_call>', "```"].join("\n");
+
+    expect(sanitize("Done.\n⚠️ 🛠️ `search repos (agent)` failed")).toBe("Done.");
+    expect(sanitize('<tool_call>{"name":"exec"}</tool_call>Message sent.')).toBe("Message sent.");
+    expect(sanitize("The encrypted message was delivered.")).toBe(
+      "The encrypted message was delivered.",
+    );
+    expect(sanitize(fenced)).toBe(fenced);
+    expect(sanitize("⚠️ 🛠️ `search repos (agent)` failed")).toBe("");
   });
 
-  it.each(["outbound", "message"] as const)(
-    "dispatches %s before encrypted I/O",
-    async (adapter) => {
-      const order: string[] = [];
-      const send = dispatchingSend(() => {
+  it("normalizes the SDK target and delegates only message content/context to the guarded flow", async () => {
+    const order: string[] = [];
+    const send = vi.fn(
+      async (
+        _peer: string,
+        _text: string,
+        context: { onPlatformSendDispatch?: () => Promise<void> },
+      ) => {
+        await context.onPlatformSendDispatch?.();
         order.push("send");
-        return messageId;
-      });
-      const onPlatformSendDispatch = vi.fn(async () => {
-        order.push("dispatch");
-      });
-      activateSend(send);
-      const context = {
-        ...message,
+        return "01JZ0000000000000000000200";
+      },
+    );
+    const onPlatformSendDispatch = vi.fn(async () => {
+      order.push("dispatch");
+    });
+    createReefRuntimeAuthority().activate({ flow: { send }, friends: {}, reviews: {} } as never);
+
+    await expect(
+      reefOutboundAdapter.sendText!({
+        cfg: {},
         accountId: "default",
+        to: "reef:Alice",
+        text: "hello",
         threadId: 42,
         replyToId: "01JZ0000000000000000000199",
-        preparedMessageId: messageId,
+        preparedMessageId: "01JZ0000000000000000000200",
         onPlatformSendDispatch,
-      };
-      if (adapter === "outbound") {
-        await expect(reefOutboundAdapter.sendText!(context as never)).resolves.toEqual({
-          channel: "reef",
-          messageId,
-          target: { kind: "chat", id: "alice" },
-          toJid: "reef:alice",
-        });
-        expect(send).toHaveBeenCalledWith("alice", "hello", {
-          thread: "42",
-          replyTo: "01JZ0000000000000000000199",
-          messageId,
-          onPlatformSendDispatch: expect.any(Function),
-        });
-      } else {
-        await reefMessageAdapter.send.text({ ...message, onPlatformSendDispatch });
-      }
-      expect(order).toEqual(["dispatch", "send"]);
-    },
-  );
+      } as never),
+    ).resolves.toEqual({
+      channel: "reef",
+      messageId: "01JZ0000000000000000000200",
+      target: { kind: "chat", id: "alice" },
+      toJid: "reef:alice",
+    });
+    expect(order).toEqual(["dispatch", "send"]);
+    expect(send).toHaveBeenCalledWith("alice", "hello", {
+      thread: "42",
+      replyTo: "01JZ0000000000000000000199",
+      messageId: "01JZ0000000000000000000200",
+      onPlatformSendDispatch: expect.any(Function),
+    });
+  });
+
+  it("marks message-adapter dispatch before encrypted transport I/O", async () => {
+    const order: string[] = [];
+    const send = vi.fn(
+      async (
+        _peer: string,
+        _text: string,
+        context: { onPlatformSendDispatch?: () => Promise<void> },
+      ) => {
+        await context.onPlatformSendDispatch?.();
+        order.push("send");
+        return "01JZ0000000000000000000200";
+      },
+    );
+    createReefRuntimeAuthority().activate({ flow: { send }, friends: {}, reviews: {} } as never);
+
+    await reefMessageAdapter.send.text({
+      cfg: {},
+      to: "reef:Alice",
+      text: "hello",
+      onPlatformSendDispatch: async () => {
+        order.push("dispatch");
+      },
+    });
+
+    expect(order).toEqual(["dispatch", "send"]);
+  });
 
   it("revokes a borrowed encrypted flow before a paused guard reaches the replaced relay", async () => {
     const guardEntered = createDeferred<void>();
     const guardPaused = createDeferred<void>();
     const firstAuthority = createReefRuntimeAuthority();
-    const classifier = guard(allow);
-    classifier.classify.mockImplementation(async () => {
-      guardEntered.resolve();
-      await guardPaused.promise;
-      return allow;
-    });
+    const classifier = {
+      ...guard(allow),
+      classify: vi.fn(async () => {
+        guardEntered.resolve();
+        await guardPaused.promise;
+        return allow;
+      }),
+    };
     const relay = transport();
-    const flow = await createFlow(
-      { alice: peerTrust(generateIdentity()) },
-      {
-        transport: relay as unknown as ReefTransportClient,
-        guard: classifier,
-        authoritySignal: firstAuthority.signal,
-      },
-    );
+    const cfg = config();
+    const { trusted, audit, ...stores } = await workerFlowStores(cfg, {
+      alice: peerTrust(generateIdentity()),
+    });
+    const flow = new ReefMessageFlow({
+      config: cfg,
+      trust: trusted,
+      keys: reefKeys(),
+      transport: relay as unknown as ReefTransportClient,
+      guard: classifier,
+      audit,
+      replay: new MemoryReplayStore(),
+      ...stores,
+      authoritySignal: firstAuthority.signal,
+      onIngress: async () => {},
+      onOwnerNotice: async () => {},
+    });
     firstAuthority.activate({ flow, friends: {}, reviews: {} } as never);
     const stale = reefMessageAdapter.send.text({ cfg: {}, to: "reef:alice", text: "stale" });
     await Promise.race([guardEntered.promise, stale]);
     expect(classifier.classify).toHaveBeenCalledOnce();
+
     const replacementAuthority = createReefRuntimeAuthority();
     const replacement = { flow: {}, friends: {}, reviews: {} } as never;
     replacementAuthority.activate(replacement);
     try {
       guardPaused.resolve();
-      await expect(stale).rejects.toBeInstanceOf(PlatformMessageNotDispatchedError);
+      const staleResult = await stale.catch((error: unknown) => error);
+
       expect(relay.sendEnvelope).not.toHaveBeenCalled();
+      expect(staleResult).toBeInstanceOf(PlatformMessageNotDispatchedError);
       expect(getActiveReef()).toBe(replacement);
     } finally {
       replacementAuthority.release();
@@ -141,10 +166,26 @@ describe("reefOutboundAdapter", () => {
   });
 
   it("terminally rejects unapproved Reef peers", async () => {
-    const flow = await createFlow({});
+    const cfg = config();
+    const { trusted, audit, ...stores } = await workerFlowStores(cfg, {});
+    const flow = new ReefMessageFlow({
+      config: cfg,
+      trust: trusted,
+      keys: reefKeys(),
+      transport: transport() as unknown as ReefTransportClient,
+      guard: guard(allow),
+      audit,
+      replay: new MemoryReplayStore(),
+      ...stores,
+      onIngress: async () => {},
+      onOwnerNotice: async () => {},
+    });
     createReefRuntimeAuthority().activate({ flow, friends: {}, reviews: {} } as never);
 
-    const error = await reefMessageAdapter.send.text(message).catch((caught: unknown) => caught);
+    const error = await reefMessageAdapter.send
+      .text({ cfg: {}, to: "reef:Alice", text: "hello" })
+      .catch((caught: unknown) => caught);
+
     expect(error).toBeInstanceOf(PlatformMessageNotDispatchedError);
     expect(error).toMatchObject({
       cause: {
@@ -157,16 +198,21 @@ describe("reefOutboundAdapter", () => {
 
   it("keeps guard availability failures retryable before dispatch", async () => {
     const cause = new PipelineError("guard", "guard unavailable", {
-      ...allow,
       decision: "deny",
       category: "guard_failure",
+      reason: "Guard unavailable or invalid.",
+      model: "gpt-5.6-sol",
+      policyVersion: "reef-v1",
     });
     const send = vi.fn(async () => {
       throw cause;
     });
-    activateSend(send);
+    createReefRuntimeAuthority().activate({ flow: { send }, friends: {}, reviews: {} } as never);
 
-    const error = await reefMessageAdapter.send.text(message).catch((caught: unknown) => caught);
+    const error = await reefMessageAdapter.send
+      .text({ cfg: {}, to: "reef:Alice", text: "hello" })
+      .catch((caught: unknown) => caught);
+
     expect(error).toBeInstanceOf(PlatformMessageNotDispatchedError);
     expect(error).toMatchObject({ cause, retryable: true });
   });
@@ -174,22 +220,44 @@ describe("reefOutboundAdapter", () => {
   it("keeps published dispatch ambiguous when account authority closes", async () => {
     const cause = new Error("relay outcome unknown");
     const authority = createReefRuntimeAuthority();
-    const send = dispatchingSend(() => {
-      throw cause;
-    });
+    const send = vi.fn(
+      async (
+        _peer: string,
+        _text: string,
+        context: { onPlatformSendDispatch?: () => Promise<void> },
+      ) => {
+        await context.onPlatformSendDispatch?.();
+        throw cause;
+      },
+    );
     const onPlatformSendDispatch = vi.fn(async () => authority.release());
     authority.activate({ flow: { send }, friends: {}, reviews: {} } as never);
 
     const error = await reefMessageAdapter.send
-      .text({ ...message, onPlatformSendDispatch })
+      .text({
+        cfg: {},
+        to: "reef:Alice",
+        text: "hello",
+        onPlatformSendDispatch,
+      })
       .catch((caught: unknown) => caught);
+
     expect(onPlatformSendDispatch).toHaveBeenCalledOnce();
     expect(error).toBe(cause);
   });
 
   it("prepares a protocol-valid id without requiring an active Gateway runtime", () => {
-    const first = prepareId("hello");
-    const second = prepareId("again");
+    const first = reefOutboundAdapter.prepareConversationTurnMessageId!({
+      cfg: {},
+      to: "reef:alice",
+      text: "hello",
+    });
+    const second = reefOutboundAdapter.prepareConversationTurnMessageId!({
+      cfg: {},
+      to: "reef:alice",
+      text: "again",
+    });
+
     expect(first).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/u);
     expect(second).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/u);
     expect(second > first).toBe(true);
@@ -197,9 +265,14 @@ describe("reefOutboundAdapter", () => {
 
   it("permanently rejects correlated text enlarged after its initial preflight", async () => {
     const rawText = "x".repeat(REEF_MAX_PLAINTEXT_BYTES - 256);
-    const preparedMessageId = prepareId(rawText);
-    const send = vi.fn(async () => messageId);
-    activateSend(send);
+    const preparedMessageId = reefOutboundAdapter.prepareConversationTurnMessageId!({
+      cfg: {},
+      to: "reef:alice",
+      text: rawText,
+    });
+    const send = vi.fn(async () => "01JZ0000000000000000000200");
+    createReefRuntimeAuthority().activate({ flow: { send }, friends: {}, reviews: {} } as never);
+
     const error = await reefOutboundAdapter.sendText!({
       cfg: {},
       accountId: "default",
@@ -219,13 +292,17 @@ describe("reefOutboundAdapter", () => {
   it("chunks ordinary text by canonical plaintext bytes", () => {
     const text = `${"a".repeat(40_000)}${"🦞".repeat(10_000)}`;
     const chunks = reefOutboundAdapter.chunker!(text, REEF_MAX_PLAINTEXT_BYTES);
-    const metadata = { replyTo: messageId, thread: messageId };
+
     expect(chunks.join("")).toBe(text);
     expect(chunks.length).toBeGreaterThan(1);
     for (const chunk of chunks) {
-      expect(canonicalBytes({ text: chunk, ...metadata }).length).toBeLessThanOrEqual(
-        REEF_MAX_PLAINTEXT_BYTES,
-      );
+      expect(
+        canonicalBytes({
+          text: chunk,
+          replyTo: "0".repeat(26),
+          thread: "0".repeat(26),
+        }).length,
+      ).toBeLessThanOrEqual(REEF_MAX_PLAINTEXT_BYTES);
     }
   });
 });

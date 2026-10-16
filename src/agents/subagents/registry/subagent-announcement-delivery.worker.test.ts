@@ -235,10 +235,10 @@ it("defers registered parent delivery until its descendant settles without host 
       const deferred = storedAnnouncement(parent.runId);
       expect(deferred).toMatchObject({
         cleanupHandled: false,
-        cleanupCompletedAt: undefined,
         wakeOnDescendantSettle: true,
         execution: { status: "terminal", outcome: { status: "ok" } },
       });
+      expect(deferred?.cleanupCompletedAt).toBeUndefined();
       expect(turns.start).not.toHaveBeenCalled();
       expect(fixture.wake).not.toHaveBeenCalled();
       expect(reads.map((read) => read.phase)).toEqual(
@@ -428,8 +428,8 @@ it("refuses an old registered wake after its descendant read outlives a successo
         task: "legitimate successor after the held wake",
         execution: { status: "terminal", outcome: { status: "ok" } },
         cleanupCompletedAt: expect.any(Number),
-        requesterSettleWake: undefined,
       });
+      expect(completed?.requesterSettleWake).toBeUndefined();
       expect(fixture.announce).not.toHaveBeenCalled();
       expect(turns.start).not.toHaveBeenCalled();
     } finally {

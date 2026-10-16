@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   resolveClickClackInboundAccess: vi.fn(),
 }));
 
+// mock-isolation: Thread-window tests observe inbound dispatch without starting agent turns.
 vi.mock("./inbound.js", () => ({ handleClickClackInbound: mocks.handleClickClackInbound }));
 
 vi.mock("./access.js", () => ({

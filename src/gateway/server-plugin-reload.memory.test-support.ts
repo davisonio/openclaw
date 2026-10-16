@@ -31,16 +31,7 @@ import type { OpenClawPluginApi } from "../plugins/types.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { resolveRelativeBundledPluginPublicModuleId } from "../test-utils/bundled-plugin-public-surface.js";
 import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
-import {
-  firstReloaded,
-  rejectWith,
-  heldWork,
-  observeSettlement,
-} from "./server-plugin-reload.fixture-tools.test-support.js";
-import {
-  waitForChannelAbort,
-  type RecoveryFixtureFactory,
-} from "./server-plugin-reload.recovery.test-support.js";
+import type { createPluginReloadRecoveryFixture } from "./server-plugin-reload.recovery.test-support.js";
 
 const { createMemoryRuntime, configureMemoryCoreDreamingState } = await vi.importActual<{
   configureMemoryCoreDreamingState: (
@@ -57,45 +48,10 @@ const { createMemoryRuntime, configureMemoryCoreDreamingState } = await vi.impor
   }),
 );
 
-function memoryReloadConfig(
-  workspace: string,
-  model: string,
-  search: NonNullable<NonNullable<OpenClawConfig["memory"]>["search"]> = {},
-): OpenClawConfig {
-  return {
-    plugins: { allow: ["first", "sibling"], slots: { memory: "sibling" } },
-    agents: { defaults: { workspace } },
-    memory: {
-      search: {
-        provider: "gateway-memory-probe",
-        model,
-        fallback: "none",
-        store: { vector: { enabled: false } },
-        ...search,
-      },
-    },
-  };
-}
-
-function registerMemoryRuntime(api: OpenClawPluginApi) {
-  assert(api.lifecycle.runInBackgroundContext);
-  const runtime = createMemoryRuntime({
-    runInBackgroundContext: api.lifecycle.runInBackgroundContext,
-  });
-  api.registerMemoryCapability({ runtime });
-  return runtime;
-}
-
-function independentRegistry() {
-  return createPluginRegistry({
-    logger: { info() {}, warn() {}, error() {}, debug() {} },
-    runtime: createPluginRuntime(),
-    activateGlobalSideEffects: false,
-  });
-}
-
 export async function verifyGatewayMemoryReplacement(
-  createRecoveryFixture: RecoveryFixtureFactory,
+  createRecoveryFixture: (
+    options: Parameters<typeof createPluginReloadRecoveryFixture>[1],
+  ) => ReturnType<typeof createPluginReloadRecoveryFixture>,
   mode: "held-close" | "failed-close",
 ) {
   const state = await createOpenClawTestState({
@@ -103,8 +59,20 @@ export async function verifyGatewayMemoryReplacement(
     label: "gateway-memory-reload",
   });
   const providerId = "gateway-memory-probe";
-  const config = memoryReloadConfig(state.workspaceDir, "synthetic-embedding");
-  const closeGate = heldWork();
+  const config: OpenClawConfig = {
+    plugins: { allow: ["first", "sibling"], slots: { memory: "sibling" } },
+    agents: { defaults: { workspace: state.workspaceDir } },
+    memory: {
+      search: {
+        provider: providerId,
+        model: "synthetic-embedding",
+        fallback: "none",
+        store: { vector: { enabled: false } },
+      },
+    },
+  };
+  const entered = createDeferredCore();
+  const release = createDeferredCore();
   const events: string[] = [];
   let refuseClose = mode === "failed-close";
   let generations = 0;
@@ -121,12 +89,12 @@ export async function verifyGatewayMemoryReplacement(
     expect(instance?.lifecycle.signal.aborted).toBe(false);
     expect(getPluginRuntimeGatewayRequestScope()?.pluginId).toBe("first");
     events.push("close:start");
-    closeGate.enter();
+    entered.resolve();
     if (refuseClose) {
       throw new Error("memory provider cleanup refused");
     }
     if (mode === "held-close") {
-      await closeGate.wait;
+      await release.promise;
     }
     events.push("close:end");
   });
@@ -137,7 +105,12 @@ export async function verifyGatewayMemoryReplacement(
       if (owner === "sibling") {
         record.kind = "memory";
         record.memorySlotSelected = true;
-        registerMemoryRuntime(api);
+        assert(api.lifecycle.runInBackgroundContext);
+        api.registerMemoryCapability({
+          runtime: createMemoryRuntime({
+            runInBackgroundContext: api.lifecycle.runInBackgroundContext,
+          }),
+        });
       } else {
         record.contracts = { ...record.contracts, embeddingProviders: [providerId] };
         const generation = ++generations;
@@ -159,14 +132,23 @@ export async function verifyGatewayMemoryReplacement(
   });
   const runtime = fixture.previousRegistry.memoryCapabilities[0]?.capability.runtime;
   assert(runtime);
-  const independent = independentRegistry();
+  const independent = createPluginRegistry({
+    logger: { info() {}, warn() {}, error() {}, debug() {} },
+    runtime: createPluginRuntime(),
+    activateGlobalSideEffects: false,
+  });
   const otherRecord = createPluginRecord({ id: "other-memory-host" });
   otherRecord.kind = "memory";
   otherRecord.memorySlotSelected = true;
   otherRecord.contracts = { embeddingProviders: [providerId] };
   independent.registry.plugins.push(otherRecord);
   const otherApi = independent.createApi(otherRecord, { config });
-  registerMemoryRuntime(otherApi);
+  assert(otherApi.lifecycle.runInBackgroundContext);
+  otherApi.registerMemoryCapability({
+    runtime: createMemoryRuntime({
+      runInBackgroundContext: otherApi.lifecycle.runInBackgroundContext,
+    }),
+  });
   const otherClose = vi.fn(async () => {});
   otherApi.registerEmbeddingProvider({
     id: providerId,
@@ -176,7 +158,8 @@ export async function verifyGatewayMemoryReplacement(
   assert(otherRuntime);
   let reloading: Promise<unknown> | undefined;
   try {
-    const memoryInstance = fixture.instance("sibling");
+    const memoryInstance = getPluginInstance(fixture.previousRegistry.plugins[1]!);
+    assert(memoryInstance);
     expect(memoryInstance.run(() => getMemoryEmbeddingProvider(providerId, config))).toBe(
       fixture.previousRegistry.embeddingProviders[0]?.provider,
     );
@@ -191,9 +174,10 @@ export async function verifyGatewayMemoryReplacement(
     // The pre-fix Gateway can finish without entering memory cleanup; race that
     // outcome so its missing owner produces an assertion rather than a deadlock.
     await Promise.race([
-      closeGate.entered,
+      entered.promise,
       reloading.then(() => expect(close).toHaveBeenCalledOnce()),
     ]);
+    expect(otherClose).not.toHaveBeenCalled();
     if (mode === "failed-close") {
       expect(await reloading).toMatchObject({
         runtime: {
@@ -201,14 +185,15 @@ export async function verifyGatewayMemoryReplacement(
           warnings: [expect.stringContaining("memory provider cleanup refused")],
         },
       });
+      expect(close).toHaveBeenCalled();
       reloading = fixture.reload();
     } else {
       expect(fixture.registryOwner.registry).toBe(fixture.previousRegistry);
       expect(fixture.firstStop).not.toHaveBeenCalled();
       expect(events).toEqual(["close:start"]);
-      closeGate.release();
+      release.resolve();
     }
-    expect(await reloading).toMatchObject(firstReloaded);
+    expect(await reloading).toMatchObject({ runtime: { pluginIds: ["first"] } });
     if (mode === "held-close") {
       expect(events.slice(-2)).toEqual(["close:end", "publish"]);
       expect(close).toHaveBeenCalledOnce();
@@ -224,10 +209,11 @@ export async function verifyGatewayMemoryReplacement(
     expect(created).toEqual([1, generations]);
     await expect(other.manager.probeEmbeddingAvailability()).resolves.toMatchObject({ ok: true });
     expect(otherClose).not.toHaveBeenCalled();
-    fixture.expectServices({ siblingStop: generations - 1, siblingStart: generations });
+    expect(fixture.siblingStop).toHaveBeenCalledTimes(generations - 1);
+    expect(fixture.siblingStart).toHaveBeenCalledTimes(generations);
   } finally {
     refuseClose = false;
-    closeGate.release();
+    release.resolve();
     await Promise.allSettled([reloading]);
     const closeCalls = close.mock.calls.length;
     try {
@@ -242,16 +228,23 @@ export async function verifyGatewayMemoryReplacement(
       }
       expect(close).toHaveBeenCalledTimes(closeCalls);
     } finally {
-      await Promise.resolve()
-        .then(() => otherRuntime.closeAllMemorySearchManagers?.())
-        .finally(() => disposePluginRegistryInstances(independent.registry))
-        .finally(() => state.cleanup());
+      try {
+        await otherRuntime.closeAllMemorySearchManagers?.();
+      } finally {
+        try {
+          await disposePluginRegistryInstances(independent.registry);
+        } finally {
+          await state.cleanup();
+        }
+      }
     }
   }
 }
 
 export async function verifyGatewayMemoryWatcherRestart(
-  createRecoveryFixture: RecoveryFixtureFactory,
+  createRecoveryFixture: (
+    options: Parameters<typeof createPluginReloadRecoveryFixture>[1],
+  ) => ReturnType<typeof createPluginReloadRecoveryFixture>,
   providerState: "pending" | "initialized" | "separate-registry" | "rollback",
   signal: AbortSignal,
   recovery?: {
@@ -260,10 +253,20 @@ export async function verifyGatewayMemoryWatcherRestart(
   },
 ) {
   const state = await createOpenClawTestState({ label: "gateway-memory-watcher-reload" });
-  const config = memoryReloadConfig(state.workspaceDir, "synthetic", {
-    sources: ["memory"],
-    cache: { enabled: false },
-  });
+  const config: OpenClawConfig = {
+    plugins: { allow: ["first", "sibling"], slots: { memory: "sibling" } },
+    agents: { defaults: { workspace: state.workspaceDir } },
+    memory: {
+      search: {
+        provider: "gateway-memory-probe",
+        model: "synthetic",
+        fallback: "none",
+        sources: ["memory"],
+        cache: { enabled: false },
+        store: { vector: { enabled: false } },
+      },
+    },
+  };
   const subscriptions: Array<{ notify: () => void; signal: AbortSignal }> = [];
   const unused = async (): Promise<never> => {
     throw new Error("Unexpected document operation");
@@ -285,7 +288,9 @@ export async function verifyGatewayMemoryWatcherRestart(
           notify: AsyncLocalStorage.bind(() => onChange("change")),
           signal: watchSignal,
         });
-        await waitForChannelAbort(watchSignal);
+        await new Promise<void>((resolve) => {
+          watchSignal.addEventListener("abort", () => resolve(), { once: true });
+        });
       },
     },
   });
@@ -293,7 +298,8 @@ export async function verifyGatewayMemoryWatcherRestart(
   const embeddings: number[] = [];
   let generation = 0;
   let memory: MemoryPluginRuntime | undefined;
-  const startupGate = heldWork();
+  const restarted = createDeferredCore();
+  const releaseStartup = createDeferredCore();
   let reloading: Promise<unknown> | undefined;
   let independent: ReturnType<typeof createPluginRegistry> | undefined;
   const recoveryFailure = new Error("memory reload checkpoint failed");
@@ -325,6 +331,10 @@ export async function verifyGatewayMemoryWatcherRestart(
         }
       },
       beforePublish: async () => {
+        expect(
+          subscriptions[0]!.signal.aborted,
+          "Stop memory watchers before provider publication",
+        ).toBe(true);
         if (independent) {
           await disposePluginRegistryInstances(independent.registry);
         }
@@ -352,7 +362,8 @@ export async function verifyGatewayMemoryWatcherRestart(
             assert(opened.manager, opened.error ?? "Expected a memory manager");
             managers.push(opened.manager);
             if (managers.length > 1) {
-              await startupGate.run();
+              restarted.resolve();
+              await releaseStartup.promise;
               if (recovery?.failure === "restart") {
                 throw new Error("memory indexing restart failed");
               }
@@ -367,7 +378,9 @@ export async function verifyGatewayMemoryWatcherRestart(
       fixture.lifetime.publish({
         stop: async () => {},
         preparePluginReload: () => ({
-          drain: rejectWith(recoveryFailure),
+          drain: async () => {
+            throw recoveryFailure;
+          },
           resume() {},
         }),
       });
@@ -375,7 +388,11 @@ export async function verifyGatewayMemoryWatcherRestart(
     expect(subscriptions).toHaveLength(1);
     const first = managers[0]!;
     if (providerState === "separate-registry") {
-      independent = independentRegistry();
+      independent = createPluginRegistry({
+        logger: { info() {}, warn() {}, error() {}, debug() {} },
+        runtime: createPluginRuntime(),
+        activateGlobalSideEffects: false,
+      });
       const record = createPluginRecord({
         id: "lazy-provider",
         contracts: { embeddingProviders: ["gateway-memory-probe"] },
@@ -396,7 +413,8 @@ export async function verifyGatewayMemoryWatcherRestart(
       providerState === "pending" ? [] : [providerState === "separate-registry" ? 0 : 1],
     );
     embeddings.length = 0;
-    const instance = fixture.instance("sibling");
+    const instance = getPluginInstance(fixture.previousRegistry.plugins[1]!);
+    assert(instance);
     const original = getPluginOriginalValue(first, instance) ?? first;
     const prototype = Object.getPrototypeOf(original) as RegisteredMemorySearchManager;
     const sync = prototype.sync;
@@ -416,26 +434,27 @@ export async function verifyGatewayMemoryWatcherRestart(
       .reload(config, [recovery?.owner === "replaced" ? "sibling" : "first"])
       .catch((error: unknown) => error);
     if (recovery?.failure === "before-drain") {
-      startupGate.release();
+      releaseStartup.resolve();
     } else {
       await withinTest(
         awaitGateBeforeSettlement(
-          startupGate.entered,
+          restarted.promise,
           reloading,
           "Plugin reload completed without restarting drained memory indexing",
         ),
         signal,
       );
-      expect(subscriptions[0]!.signal.aborted, "Stop watchers before provider publication").toBe(
-        true,
-      );
-      const completion = observeSettlement(reloading);
+      expect(subscriptions[0]!.signal.aborted).toBe(true);
+      let settled = false;
+      void reloading.then(() => {
+        settled = true;
+      });
       await Promise.resolve();
-      expect(completion.state.settled, "Reload must join memory service startup").toBe(false);
+      expect(settled, "Reload must join memory service startup").toBe(false);
       expect(fixture.owner.getReloadStatus()).toMatchObject({
         phase: providerState === "rollback" ? "recovering" : "reloading",
       });
-      startupGate.release();
+      releaseStartup.resolve();
     }
     expect(fixture.registryOwner.registry.memoryCapabilities[0]?.capability.runtime).toBe(
       fixture.previousRegistry.memoryCapabilities[0]?.capability.runtime,
@@ -444,7 +463,7 @@ export async function verifyGatewayMemoryWatcherRestart(
     if (providerState === "rollback" || recovery) {
       expect(result).toMatchObject({ details: { committed: false } });
     } else {
-      expect(result).toMatchObject(firstReloaded);
+      expect(result).toMatchObject({ runtime: { pluginIds: ["first"] } });
     }
     if (recovery?.failure === "restart") {
       expect(result).toMatchObject({
@@ -487,7 +506,7 @@ export async function verifyGatewayMemoryWatcherRestart(
     expect(await withinTest(indexed.promise, signal)).toBeGreaterThan(0);
     expect(embeddings).toEqual([generation]);
   } finally {
-    startupGate.release();
+    releaseStartup.resolve();
     await Promise.allSettled([reloading]);
     await memory?.closeAllMemorySearchManagers?.();
     if (independent) {

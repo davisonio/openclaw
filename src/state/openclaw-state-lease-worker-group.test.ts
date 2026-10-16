@@ -1,6 +1,9 @@
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { SqliteWorkerAdmissionFactory } from "../infra/sqlite-worker-operation-admission.js";
+import type {
+  SqliteWorkerAdmissionFactory,
+  SqliteWorkerOperationAdmission,
+} from "../infra/sqlite-worker-operation-admission.js";
 import type { SqliteWorkerOperationSettlement } from "../infra/sqlite-worker-operation-settlement.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { createOpenClawDatabaseMaintenanceScope } from "./openclaw-state-db-async-lifecycle.js";
@@ -22,7 +25,10 @@ vi.mock("./openclaw-state-worker-store.js", () => ({
 
 type Owner = ReturnType<typeof createOpenClawStateLeaseWorkerOwner>;
 const owners: Owner[] = [];
-const jobs: Array<ReturnType<typeof job>> = [];
+const jobs: Array<{
+  admission: SqliteWorkerOperationAdmission;
+  settled: ReturnType<typeof createDeferredCore<SqliteWorkerOperationSettlement>>;
+}> = [];
 const noop = () => {};
 const asyncNoop = async () => {};
 
@@ -96,7 +102,7 @@ function group(context = sourceContext()) {
     members,
     leases,
     run: withGroup.bind(null, leases, context),
-    expectReleasable(value: boolean) {
+    expectReleasable: (value: boolean) => {
       expect(members.map(({ owner }) => owner.canRelease())).toEqual([value, value]);
     },
   };

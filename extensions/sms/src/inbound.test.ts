@@ -18,6 +18,7 @@ vi.mock("./twilio.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./twilio.js")>()),
   sendSmsViaTwilio,
 }));
+// mock-isolation: Inbound fixtures own media cleanup without loading the production media runtime.
 vi.mock("openclaw/plugin-sdk/media-runtime", () => ({ unlinkIfExists: unlinkIfExistsMock }));
 
 type SmsTurnAdoptionLifecycle = NonNullable<
@@ -90,6 +91,50 @@ function createAuthorizedRuntime() {
     sessionKey: SMS_SESSION_KEY,
   });
   return mocks;
+}
+
+async function resolveAuthorizedSmsTurn(params: {
+  body: string;
+  messageSid: string;
+  commandRequested?: boolean;
+  isTextCommand?: boolean;
+  receivedAt?: number;
+  turnAdoptionLifecycle?: { onAdopted: () => void | Promise<void> };
+}) {
+  const mocks = createRuntime();
+  if (params.commandRequested !== undefined) {
+    mocks.shouldComputeCommandAuthorized.mockReturnValue(params.commandRequested);
+  }
+  if (params.isTextCommand !== undefined) {
+    mocks.isControlCommandMessage.mockReturnValue(params.isTextCommand);
+  }
+  mocks.resolveAgentRoute.mockReturnValue({
+    agentId: "main",
+    accountId: "default",
+    sessionKey: SMS_SESSION_KEY,
+  });
+  mocks.buildContext.mockReturnValue({ SessionKey: SMS_SESSION_KEY });
+  const msg = {
+    from: SMS_FROM,
+    to: SMS_TO,
+    body: params.body,
+    messageSid: params.messageSid,
+    accountSid: "AC123",
+    media: [],
+  };
+  await dispatchSmsInboundEvent({
+    cfg: {},
+    account: createAccount({ dmPolicy: "allowlist", allowFrom: [SMS_FROM] }),
+    channelRuntime: mocks.runtime,
+    receivedAt: params.receivedAt ?? 1_700_000_000_123,
+    ...(params.turnAdoptionLifecycle
+      ? { turnAdoptionLifecycle: params.turnAdoptionLifecycle }
+      : {}),
+    msg,
+  });
+  const runParams = expectDefined(mocks.run.mock.calls[0]?.[0], "SMS inbound run parameters");
+  const turn = await runParams.adapter.resolveTurn(runParams.adapter.ingest(msg));
+  return { ...mocks, runParams, turn };
 }
 
 function createMmsMessage(messageSid: string) {

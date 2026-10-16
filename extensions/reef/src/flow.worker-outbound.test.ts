@@ -6,7 +6,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { generateIdentity, type Verdict } from "../protocol/index.js";
 import { MemoryReplayStore } from "../protocol/memory-stores.test-support.js";
 import { openReefAuditStore } from "./audit-state.js";
-import { prepareReefMessageId, ReefMessageFlow } from "./flow.js";
+import { isPermanentReefOutboundRejection, prepareReefMessageId, ReefMessageFlow } from "./flow.js";
 import {
   allow,
   config,
@@ -30,28 +30,8 @@ describe("Reef worker outbound composition", () => {
   let trusted: ReturnType<typeof openReefTrustStore>;
   let audit: ReturnType<typeof openReefAuditStore>;
   let flow: ReefMessageFlow;
-  const send = (id: string) => flow.send("alice", "private coordination", { messageId: id });
-  const auditEntries = async (id: string) =>
-    (await audit.entries()).filter(
-      (entry) => isRecord(entry.event.payload) && entry.event.payload.id === id,
-    );
-  const auditTypes = async (id: string) =>
-    (await auditEntries(id)).map((entry) => entry.event.type);
 
-  async function prepareReview(approved?: boolean) {
-    const id = prepareReefMessageId();
-    classify.classify.mockResolvedValue({ ...allow, decision: "review" });
-    await expect(send(id)).rejects.toMatchObject({ reviewOutcome: "pending" });
-    const [review] = await stores.reviews.list();
-    expect(review?.id).toBe(id);
-    if (approved !== undefined) {
-      await stores.reviews.decide(review!.approvalDigest, approved);
-    }
-    classify.classify.mockClear();
-    return id;
-  }
-
-  const makeFlow = () =>
+  const makeFlow = (reviews = stores.reviews) =>
     new ReefMessageFlow({
       config: cfg,
       trust: trusted,
@@ -60,7 +40,7 @@ describe("Reef worker outbound composition", () => {
       guard: classify,
       audit,
       replay: new MemoryReplayStore(),
-      reviews: stores.reviews,
+      reviews,
       delivered: stores.delivered,
       onIngress: async () => {},
       onOwnerNotice: async () => {},
@@ -110,7 +90,7 @@ describe("Reef worker outbound composition", () => {
     const hostSql = observeHostDataSql();
     const firstSecond = Math.floor(Date.now() / 1000);
     try {
-      expect(await send(id)).toBe(id);
+      expect(await flow.send("alice", "private coordination", { messageId: id })).toBe(id);
       expect(commands()).toEqual(["pluginState.executeOperation", "pluginState.executeOperation"]);
       for (const call of hostSql.calls) {
         expect(call).not.toHaveBeenCalled();
@@ -119,7 +99,9 @@ describe("Reef worker outbound composition", () => {
       hostSql.restore();
     }
     expect(fetcher).toHaveBeenCalledOnce();
-    const entries = await auditEntries(id);
+    const entries = (await audit.entries()).filter(
+      (entry) => isRecord(entry.event.payload) && entry.event.payload.id === id,
+    );
     expect(entries.map((entry) => entry.event.type)).toEqual([
       "proposal",
       "guard_verdict",
@@ -132,34 +114,61 @@ describe("Reef worker outbound composition", () => {
     const delivery = (await trusted.readOutboundDelivery("alice", id))?.delivery;
     expect(delivery).toMatchObject({
       recipient: { keyEpoch: 1, ed25519PublicKey: peer.signing.publicKey },
-      bodyHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
-      textHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
     });
+    expect(delivery?.bodyHash).toMatch(/^[a-f0-9]{64}$/u);
+    expect(delivery?.textHash).toMatch(/^[a-f0-9]{64}$/u);
   });
 
-  it.each([false, true])("settles an existing review with approved=%s", async (approved) => {
-    const id = await prepareReview(approved);
+  it.each(["denied"] as const)(
+    "settles an existing %s review in one command without classifying again",
+    async (decision) => {
+      const id = prepareReefMessageId();
+      classify.classify.mockResolvedValue({ ...allow, decision: "review" });
+      await expect(
+        flow.send("alice", "private coordination", { messageId: id }),
+      ).rejects.toMatchObject({ reviewOutcome: "pending" });
+      const [review] = await stores.reviews.list();
+      expect(review?.id).toBe(id);
+      if (decision === "denied") {
+        await stores.reviews.decide(review!.approvalDigest, false);
+      }
+      classify.classify.mockClear();
+      const commands = recordDispatches();
+      await expect(
+        flow.send("alice", "private coordination", { messageId: id }),
+      ).rejects.toMatchObject({ reviewOutcome: decision });
+      expect(commands()).toEqual(["pluginState.executeOperation"]);
+      expect(classify.classify).not.toHaveBeenCalled();
+      expect(fetcher).not.toHaveBeenCalled();
+    },
+  );
+
+  it("reclassifies an approved review once and commits its approved send in two commands", async () => {
+    const id = prepareReefMessageId();
+    classify.classify.mockResolvedValue({ ...allow, decision: "review" });
+    await expect(
+      flow.send("alice", "private coordination", { messageId: id }),
+    ).rejects.toMatchObject({ reviewOutcome: "pending" });
+    const [review] = await stores.reviews.list();
+    await stores.reviews.decide(review!.approvalDigest, true);
+    classify.classify.mockClear();
     const commands = recordDispatches();
-    if (approved) {
-      expect(await send(id)).toBe(id);
-    } else {
-      await expect(send(id)).rejects.toMatchObject({ reviewOutcome: "denied" });
-    }
-    expect(commands()).toEqual(
-      Array.from({ length: approved ? 2 : 1 }, () => "pluginState.executeOperation"),
-    );
-    expect(classify.classify).toHaveBeenCalledTimes(Number(approved));
-    expect(fetcher).toHaveBeenCalledTimes(Number(approved));
-    if (approved) {
-      expect(await auditTypes(id)).toEqual([
-        "proposal",
-        "guard_verdict",
-        "proposal",
-        "review_approval",
-        "guard_verdict",
-        "envelope",
-      ]);
-    }
+    expect(await flow.send("alice", "private coordination", { messageId: id })).toBe(id);
+    expect(commands()).toHaveLength(2);
+    expect(classify.classify).toHaveBeenCalledOnce();
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(
+      (await audit.entries())
+        .filter((entry) => isRecord(entry.event.payload) && entry.event.payload.id === id)
+        .map((entry) => entry.event.type),
+    ).toEqual([
+      "proposal",
+      "guard_verdict",
+      "proposal",
+      "review_approval",
+      "guard_verdict",
+      "envelope",
+    ]);
   });
 
   it("refuses removal and reapproval with identical keys while classification is pending", async () => {
@@ -174,16 +183,43 @@ describe("Reef worker outbound composition", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it("refuses a committed binding's effect when a sanctioned mutation invalidates its receipt", async () => {
+    const result = await flow
+      .send("alice", "private coordination", {
+        onPlatformSendDispatch: async () => {
+          await trusted.remove("alice");
+        },
+      })
+      .catch((error: unknown) => error);
+    expect(result).toBeInstanceOf(Error);
+    expect(isPermanentReefOutboundRejection(result)).toBe(true);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("keeps the guard audit on a review-capacity refusal without recording delivery", async () => {
-    await prepareReview();
+    const reviews = stores.reviews;
+    await reviews.request({
+      id: "occupied",
+      from: "bob#1",
+      to: "alice#1",
+      direction: "outbound",
+      bodyHash: "a".repeat(64),
+      approvalDigest: "b".repeat(64),
+      verdict: { ...allow, decision: "review" },
+    });
     const id = prepareReefMessageId();
+    classify.classify.mockResolvedValue({ ...allow, decision: "review" });
     const commands = recordDispatches();
     await expect(
-      makeFlow().send("alice", "private coordination", { messageId: id }),
+      makeFlow(reviews).send("alice", "private coordination", { messageId: id }),
     ).rejects.toThrow("pending review capacity");
     expect(commands()).toHaveLength(2);
     expect(fetcher).not.toHaveBeenCalled();
-    expect(await auditTypes(id)).toEqual(["proposal", "guard_verdict"]);
+    expect(
+      (await audit.entries())
+        .filter((entry) => isRecord(entry.event.payload) && entry.event.payload.id === id)
+        .map((entry) => entry.event.type),
+    ).toEqual(["proposal", "guard_verdict"]);
     expect(await trusted.readOutboundDelivery("alice", id)).toBeUndefined();
   });
 
@@ -196,10 +232,12 @@ describe("Reef worker outbound composition", () => {
     });
     const id = prepareReefMessageId();
     const commands = recordDispatches();
-    const first = send(id);
+    const first = flow.send("alice", "private coordination", { messageId: id });
     try {
       await started.promise;
-      await expect(send(id)).rejects.toThrow("Duplicate outbound");
+      await expect(flow.send("alice", "private coordination", { messageId: id })).rejects.toThrow(
+        "Duplicate outbound",
+      );
       expect(commands()).toHaveLength(1);
     } finally {
       verdict.resolve(allow);

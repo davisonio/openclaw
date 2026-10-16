@@ -28,6 +28,7 @@ const VALID_MESSAGE_ID = "msg_01arz3ndektsv4rrffq69g5fav";
 const SECOND_VALID_MESSAGE_ID = "msg_01arz3ndektsv4rrffq69g5faw";
 const THIRD_VALID_MESSAGE_ID = "msg_01arz3ndektsv4rrffq69g5fax";
 
+// mock-isolation: Inbound tests capture replies without performing network sends.
 vi.mock("./outbound.js", () => ({ sendClickClackText: sendClickClackTextMock }));
 
 function createAgentAccount(

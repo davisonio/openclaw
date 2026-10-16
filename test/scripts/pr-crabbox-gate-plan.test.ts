@@ -35,23 +35,12 @@ function createTrackedFixture(files: Record<string, string>) {
   return cwd;
 }
 
-function planFixture(
-  cwd: string,
-  paths: string[],
-  overrides: Partial<Parameters<typeof createCrabboxGatePlan>[0]> = {},
-) {
+function planFixture(cwd: string, paths: string[]) {
   return createCrabboxGatePlan({
     baseSha,
-    headSha,
     cwd,
     changedPaths: paths.map((changedPath) => ({ path: changedPath, status: "M" })),
-    ...overrides,
-  });
-}
-
-function mergePlan() {
-  return planFixture(process.cwd(), ["scripts/pr"], {
-    resolvePathPlan: () => ({ mode: "targets", targets: ["test/scripts/pr-merge.test.ts"] }),
+    headSha,
   });
 }
 
@@ -62,25 +51,6 @@ const ordinaryUiTests = [
   "ui/src/presenter.test.ts",
   "ui/src/unrelated.browser.test.ts",
 ];
-const e2eHelper = "ui/src/test-helpers/control-ui-e2e.ts";
-const e2eTests = [
-  "extensions/example/browser/view.e2e.test.ts",
-  "extensions/qa-lab/src/session-host-command-state.real-gateway.e2e.test.ts",
-  "ui/src/e2e/example.e2e.test.ts",
-];
-const uiReaders = (...extra: string[]) =>
-  [...ordinaryUiTests, "src/ui-consumer.test.ts", ...extra].toSorted();
-
-const emptyFiles = (...files: string[]) =>
-  Object.fromEntries(files.map((file) => [file, "export {};\n"]));
-const inventoryImports = (prefix: string, names = ["agents", "cli-process"]) =>
-  names.map((name) => `import "${prefix}/vitest.${name}-paths.mjs";\n`).join("");
-
-function expectRouting(targets: string[], cwd: string, config: string) {
-  expect(buildVitestRunPlans(targets, cwd)).toEqual([
-    { config, forwardedArgs: [], includePatterns: targets, watchMode: false },
-  ]);
-}
 
 function createUiFixture() {
   return createTrackedFixture({
@@ -88,16 +58,12 @@ function createUiFixture() {
     "ui/src/theme.css": ".example { color: red; }\n",
     "ui/src/catalog.json": '{"label":"Example"}\n',
     "extensions/example/browser/view.ts": "export const view = 1;\n",
-    ...emptyFiles(
-      ...ordinaryUiTests,
-      ...e2eTests,
-      e2eHelper,
-      "ui/src/ignored.live.test.ts",
-      "ui/src/vendor/ignored.test.ts",
-      "ui/src/vendor/ignored.e2e.test.ts",
-      "ui/src/node_modules/ignored.test.ts",
-      "ui/src/._ignored.test.ts",
-    ),
+    ...Object.fromEntries(ordinaryUiTests.map((file) => [file, "export {};\n"])),
+    "ui/src/e2e/example.e2e.test.ts": "export {};\n",
+    "ui/src/ignored.live.test.ts": "export {};\n",
+    "ui/src/vendor/ignored.test.ts": "export {};\n",
+    "ui/src/node_modules/ignored.test.ts": "export {};\n",
+    "ui/src/._ignored.test.ts": "export {};\n",
     "src/ui-consumer.test.ts": 'import "../ui/src/presenter.js";\n',
     "test/scripts/ui-catalog-reader.test.ts":
       'import { readFileSync } from "node:fs"; readFileSync("ui/src/catalog.json", "utf8");\n',
@@ -110,14 +76,6 @@ describe("Crabbox PR-derived gate plan", () => {
     const agents = "test/vitest/vitest.agents-paths.mjs";
     const cli = "test/vitest/vitest.cli-process-paths.mjs";
     const unowned = "test/vitest/vitest.unowned-paths.mjs";
-    const consumers = {
-      "test/scripts/ci-node-test-plan.test.ts": inventoryImports("../vitest"),
-      "test/scripts/test-projects.test.ts":
-        'import "../../scripts/test-projects.test-support.mts";\n',
-      "test/vitest-projects-config.test.ts": inventoryImports("./vitest", ["agents"]),
-      "test/vitest-scoped-config.test.ts": inventoryImports("./vitest"),
-      "test/vitest-unit-fast-config.test.ts": inventoryImports("./vitest", ["unit-fast"]),
-    };
     const cwd = createTrackedFixture({
       [agents]:
         'import { cliProcessTestFiles } from "./vitest.cli-process-paths.mjs";\n' +
@@ -129,15 +87,41 @@ describe("Crabbox PR-derived gate plan", () => {
       [unowned]: "export {};\n",
       "test/vitest/vitest.unit-fast-paths.mjs":
         'export { agentFiles } from "./vitest.agents-paths.mjs";\n',
-      "scripts/test-projects.test-support.mts": inventoryImports("../test/vitest"),
-      ...consumers,
+      "scripts/test-projects.test-support.mts":
+        'import "../test/vitest/vitest.agents-paths.mjs";\n' +
+        'import "../test/vitest/vitest.cli-process-paths.mjs";\n',
+      "test/scripts/test-projects.test.ts":
+        'import "../../scripts/test-projects.test-support.mts";\n',
+      "test/scripts/ci-node-test-plan.test.ts":
+        'import "../vitest/vitest.agents-paths.mjs";\n' +
+        'import "../vitest/vitest.cli-process-paths.mjs";\n',
+      "test/vitest-scoped-config.test.ts":
+        'import "./vitest/vitest.agents-paths.mjs";\n' +
+        'import "./vitest/vitest.cli-process-paths.mjs";\n',
+      "test/vitest-projects-config.test.ts": 'import "./vitest/vitest.agents-paths.mjs";\n',
+      "test/vitest-unit-fast-config.test.ts": 'import "./vitest/vitest.unit-fast-paths.mjs";\n',
       "test/vitest/unrelated.test.ts": "export {};\n",
       "src/unrelated.test.ts": "export {};\n",
     });
+    const consumers = [
+      "test/scripts/ci-node-test-plan.test.ts",
+      "test/scripts/test-projects.test.ts",
+      "test/vitest-projects-config.test.ts",
+      "test/vitest-scoped-config.test.ts",
+      "test/vitest-unit-fast-config.test.ts",
+    ];
+
     for (const changed of [[agents], [cli], [agents, cli]]) {
       const plan = planFixture(cwd, changed);
-      expect(plan.targets).toEqual(Object.keys(consumers));
-      expectRouting(plan.targets, cwd, "test/vitest/vitest.tooling.config.ts");
+      expect(plan.targets).toEqual(consumers);
+      expect(buildVitestRunPlans(plan.targets, cwd)).toEqual([
+        {
+          config: "test/vitest/vitest.tooling.config.ts",
+          forwardedArgs: [],
+          includePatterns: consumers,
+          watchMode: false,
+        },
+      ]);
     }
     expect(() => planFixture(cwd, [agents, unowned])).toThrow(
       /broad or unmatched target test\/vitest\/vitest\.unowned-paths\.mjs/u,
@@ -146,30 +130,61 @@ describe("Crabbox PR-derived gate plan", () => {
 
   it.each([
     ...["ui/src/presenter.ts", "ui/src/theme.css", "extensions/example/browser/view.ts"].map(
-      (file) => [[file], uiReaders()],
+      (file) => ({
+        paths: [file],
+        readers: ["src/ui-consumer.test.ts"],
+        explicit: false,
+      }),
     ),
-    [["ui/src/catalog.json"], uiReaders("test/scripts/ui-catalog-reader.test.ts")],
-    ...["ui/src/presenter.test.ts", "ui/src/e2e/example.e2e.test.ts"].map((file) => [
-      [file],
-      [file],
-    ]),
-    [
-      [
+    {
+      paths: ["ui/src/catalog.json"],
+      readers: ["src/ui-consumer.test.ts", "test/scripts/ui-catalog-reader.test.ts"],
+      explicit: false,
+    },
+    ...["ui/src/presenter.test.ts", "ui/src/e2e/example.e2e.test.ts"].map((file) => ({
+      paths: [file],
+      readers: [],
+      explicit: true,
+    })),
+    {
+      paths: [
         "ui/src/presenter.ts",
         "ui/src/theme.css",
         "ui/src/presenter.test.ts",
         "ui/src/e2e/example.e2e.test.ts",
       ],
-      uiReaders("ui/src/e2e/example.e2e.test.ts"),
-    ],
-    [[e2eHelper], e2eTests],
-  ])("materializes precise UI coverage for %s", (paths, targets) => {
-    const cwd = createUiFixture();
-    const plan = planFixture(cwd, paths);
-    expect(plan.targets).toEqual(targets);
-    if (paths[0] === e2eHelper) {
-      expectRouting(plan.targets, cwd, UI_E2E_VITEST_CONFIG);
-    }
+      readers: ["src/ui-consumer.test.ts", "ui/src/e2e/example.e2e.test.ts"],
+      explicit: false,
+    },
+  ])("materializes precise UI coverage for $paths", ({ paths, readers, explicit }) => {
+    expect(planFixture(createUiFixture(), paths).targets).toEqual(
+      explicit ? paths : [...ordinaryUiTests, ...readers].toSorted(),
+    );
+  });
+
+  it("uses the E2E helper's whole family, including native QA fixtures", () => {
+    const helper = "ui/src/test-helpers/control-ui-e2e.ts";
+    const tests = [
+      "extensions/example/browser/view.e2e.test.ts",
+      "extensions/qa-lab/src/session-host-command-state.real-gateway.e2e.test.ts",
+      "ui/src/e2e/example.e2e.test.ts",
+    ];
+    const cwd = createTrackedFixture({
+      [helper]: "export {};\n",
+      ...Object.fromEntries(tests.map((file) => [file, "export {};\n"])),
+      "ui/src/presenter.test.ts": "export {};\n",
+      "ui/src/vendor/ignored.e2e.test.ts": "export {};\n",
+    });
+    const plan = planFixture(cwd, [helper]);
+    expect(plan.targets).toEqual(tests);
+    expect(buildVitestRunPlans(plan.targets, cwd)).toEqual([
+      {
+        config: UI_E2E_VITEST_CONFIG,
+        forwardedArgs: [],
+        includePatterns: tests,
+        watchMode: false,
+      },
+    ]);
   });
 
   it.each([
@@ -219,7 +234,10 @@ describe("Crabbox PR-derived gate plan", () => {
     expect(planFixture(first, ["ui/src/presenter.ts"]).targets).not.toContain(
       "ui/src/untracked.test.ts",
     );
-    const second = createTrackedFixture(emptyFiles("ui/src/another.ts", "ui/src/another.test.ts"));
+    const second = createTrackedFixture({
+      "ui/src/another.ts": "export {};\n",
+      "ui/src/another.test.ts": "export {};\n",
+    });
     expect(planFixture(second, ["ui/src/another.ts"]).targets).toEqual(["ui/src/another.test.ts"]);
   });
 
@@ -239,22 +257,32 @@ describe("Crabbox PR-derived gate plan", () => {
     { mode: "targets", targets: ["test/vitest/vitest.tooling.config.ts"], error: undefined },
   ])("rejects incomplete or broad authorization plan %#", ({ error, ...pathPlan }) => {
     expect(() =>
-      planFixture(
-        process.cwd(),
-        error ? ["scripts/pr", "scripts/pr-lib/gates.sh"] : ["scripts/pr"],
-        {
-          resolvePathPlan: (file) =>
-            error && file === "scripts/pr"
-              ? { mode: "targets", targets: ["test/scripts/pr-merge.test.ts"] }
-              : pathPlan,
-        },
-      ),
+      createCrabboxGatePlan({
+        baseSha,
+        headSha,
+        changedPaths: error
+          ? [
+              { path: "scripts/pr", status: "M" },
+              { path: "scripts/pr-lib/gates.sh", status: "M" },
+            ]
+          : [{ path: "scripts/pr", status: "M" }],
+        resolvePathPlan: (file) =>
+          error && file === "scripts/pr"
+            ? { mode: "targets", targets: ["test/scripts/pr-merge.test.ts"] }
+            : pathPlan,
+      }),
     ).toThrow(error);
   });
 
   it("allows zero test targets only for explicit docs and instruction surfaces", () => {
     expect(
-      planFixture(process.cwd(), ["docs/ci.md", "scripts/AGENTS.md"], {
+      createCrabboxGatePlan({
+        baseSha,
+        changedPaths: [
+          { path: "docs/ci.md", status: "M" },
+          { path: "scripts/AGENTS.md", status: "M" },
+        ],
+        headSha,
         resolvePathPlan: () => {
           throw new Error("docs must not consult executable test routing");
         },
@@ -263,13 +291,25 @@ describe("Crabbox PR-derived gate plan", () => {
   });
 
   it("does not authorize an arbitrary broad PR with gate-only tests", () => {
-    expect(() => planFixture(process.cwd(), ["package.json"])).toThrow(
-      /no complete targeted test plan for package\.json/u,
-    );
+    expect(() =>
+      createCrabboxGatePlan({
+        baseSha,
+        changedPaths: [{ path: "package.json", status: "M" }],
+        headSha,
+      }),
+    ).toThrow(/no complete targeted test plan for package\.json/u);
   });
 
   it("binds immutable proof into the command and publisher workflow into the summary", () => {
-    const plan = mergePlan();
+    const plan = createCrabboxGatePlan({
+      baseSha,
+      changedPaths: [{ path: "scripts/pr", status: "M" }],
+      headSha,
+      resolvePathPlan: () => ({
+        mode: "targets",
+        targets: ["test/scripts/pr-merge.test.ts"],
+      }),
+    });
     const digest = crabboxGatePlanDigest(plan);
     const command = buildCrabboxGateCommand(plan, bootstrapSha256);
     expect(command).toContain(`OPENCLAW_CRABBOX_GATE_BASE=${baseSha}`);
@@ -278,7 +318,7 @@ describe("Crabbox PR-derived gate plan", () => {
     expect(command).toContain(`OPENCLAW_CRABBOX_GATE_PLAN_SHA256=${digest}`);
     expect(command).toContain("test/scripts/pr-merge.test.ts");
 
-    const proof = {
+    const summary = formatCrabboxGateCheckSummary({
       baseSha,
       headSha,
       leaseId: "cbx_def456",
@@ -286,14 +326,30 @@ describe("Crabbox PR-derived gate plan", () => {
       runId: "run_abc123",
       targetCount: 1,
       workflowSha,
-    };
-    expect(parseCrabboxGateCheckSummary(formatCrabboxGateCheckSummary(proof))).toEqual(proof);
+    });
+    expect(parseCrabboxGateCheckSummary(summary)).toEqual({
+      baseSha,
+      headSha,
+      leaseId: "cbx_def456",
+      planDigest: digest,
+      runId: "run_abc123",
+      targetCount: 1,
+      workflowSha,
+    });
   });
 
   it.skipIf(process.platform === "win32").each([undefined, "3"])(
     "preserves native worker sizing (%s) and forwards compact reporting for every target",
     (workers) => {
-      const plan = mergePlan();
+      const plan = createCrabboxGatePlan({
+        baseSha,
+        changedPaths: [{ path: "scripts/pr", status: "M" }],
+        headSha,
+        resolvePathPlan: () => ({
+          mode: "targets",
+          targets: ["test/scripts/pr-merge.test.ts"],
+        }),
+      });
       const command = buildCrabboxGateCommand(plan, bootstrapSha256);
       const output = execFileSync(
         "/bin/bash",

@@ -35,6 +35,7 @@ const mocks = vi.hoisted(() => ({
   resolveWorkspaceId: vi.fn(),
 }));
 
+// mock-isolation: Gateway tests supply access decisions independently of channel policy.
 vi.mock("./access.js", () => ({
   resolveClickClackInboundAccess: mocks.resolveAccess,
 }));
@@ -44,12 +45,14 @@ vi.mock("./http-client.js", async (importOriginal) => {
   return { ...actual, createClickClackClient: mocks.createClickClackClient };
 });
 
+// mock-isolation: Gateway tests observe dispatch without starting agent turns.
 vi.mock("./inbound.js", () => ({ handleClickClackInbound: mocks.inbound }));
 
 vi.mock("openclaw/plugin-sdk/native-command-registry", () => ({
   listNativeCommandSpecsForConfig: () => [],
 }));
 
+// mock-isolation: Workspace resolution is fixed by the synthetic gateway fixture.
 vi.mock("./resolve.js", () => ({ resolveWorkspaceId: mocks.resolveWorkspaceId }));
 
 import { startClickClackGatewayAccount } from "./gateway.js";
