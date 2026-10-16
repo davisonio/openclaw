@@ -67,16 +67,11 @@ function createDefaultSpawnConfig(): OpenClawConfig {
 const hoisted = vi.hoisted(() => ({
   callGatewayMock: vi.fn(),
   sessionBindingBindMock: vi.fn(),
-  sessionBindingUnbindMock: vi.fn(),
-  sessionBindingResolveByConversationMock: vi.fn(),
-  sessionBindingListBySessionMock: vi.fn(),
   initializeSessionMock: vi.fn(),
-  getAcpSessionManagerMock: vi.fn(),
   startAcpSpawnParentStreamRelayMock: vi.fn(),
   loadSessionStoreMock: vi.fn(),
   readAcpResumeSessionOwnerMock: vi.fn(),
-  resolveStorePathMock: vi.fn(),
-  areHeartbeatsEnabledMock: vi.fn(),
+  resolveStorePathMock: () => "/tmp/codex-sessions.json",
   cleanupFailedAcpSpawnMock: vi.fn(),
   closeRuntimeOnFailureMock: vi.fn(),
   registerSubagentRunMock: vi.fn(),
@@ -88,7 +83,7 @@ const hoisted = vi.hoisted(() => ({
 }));
 
 vi.mock("../../../acp/control-plane/manager.js", () => ({
-  getAcpSessionManager: hoisted.getAcpSessionManagerMock,
+  getAcpSessionManager: () => ({ initializeSession: hoisted.initializeSessionMock }),
 }));
 
 vi.mock("../../../acp/control-plane/spawn.js", () => ({
@@ -138,7 +133,7 @@ vi.mock("../../../config/config.js", () => ({ getRuntimeConfig: () => hoisted.st
 vi.mock("../../../gateway/call.js", () => ({ callGateway: hoisted.callGatewayMock }));
 
 vi.mock("../../../infra/heartbeat-wake.js", () => ({
-  areHeartbeatsEnabled: hoisted.areHeartbeatsEnabledMock,
+  areHeartbeatsEnabled: () => true,
 }));
 
 // mock-isolation: Keep captured requester identity with the fixture's synthetic session store.
@@ -201,9 +196,9 @@ function registerBindingAdapter(
     accountId,
     capabilities: { bindSupported: true, unbindSupported: true, placements },
     bind: async (input) => await hoisted.sessionBindingBindMock(input),
-    listBySession: (targetSessionKey) => hoisted.sessionBindingListBySessionMock(targetSessionKey),
-    resolveByConversation: (ref) => hoisted.sessionBindingResolveByConversationMock(ref),
-    unbind: async (input) => await hoisted.sessionBindingUnbindMock(input),
+    listBySession: () => [],
+    resolveByConversation: () => null,
+    unbind: async () => [],
   });
 }
 
@@ -310,15 +305,19 @@ function expectInitializeSessionFields(expected: Record<string, unknown>): Recor
   );
 }
 
-function expectBindingCallFields(expected: Record<string, unknown>): void {
-  expect(latestMockCall(hoisted.sessionBindingBindMock, "session bind")[0]).toMatchObject(expected);
-}
-
-function expectRelayCallFields(expected: Record<string, unknown>, callIndex = 0): void {
-  expectRecordFields(
-    hoisted.startAcpSpawnParentStreamRelayMock.mock.calls[callIndex]?.[0],
-    expected,
-  );
+function expectThreadDelivery(
+  conversation: Record<string, unknown>,
+  delivery: Record<string, unknown>,
+) {
+  expect(latestMockCall(hoisted.sessionBindingBindMock, "session bind")[0]).toMatchObject({
+    placement: "child",
+    conversation,
+  });
+  expect(gatewayRequest("agent").params).toMatchObject({
+    deliver: true,
+    channel: conversation.channel,
+    ...delivery,
+  });
 }
 
 function resolveMatrixRoomTargetForTest(value: string | undefined): string | undefined {
@@ -451,7 +450,6 @@ describe("spawnAcpDirect", () => {
     setActivePluginRegistry(createTestRegistry());
     acpRuntimeRegistryTesting.resetAcpRuntimeBackendsForTests();
     replaceSpawnConfig(createDefaultSpawnConfig());
-    hoisted.areHeartbeatsEnabledMock.mockReset().mockReturnValue(true);
     hoisted.cleanupFailedAcpSpawnMock.mockReset().mockResolvedValue(undefined);
     hoisted.closeRuntimeOnFailureMock.mockReset().mockResolvedValue(undefined);
     hoisted.registerSubagentRunMock.mockReset().mockResolvedValue(undefined);
@@ -469,13 +467,9 @@ describe("spawnAcpDirect", () => {
       .mockReset()
       .mockImplementation(async (args: { method?: string }) => gatewayResponse(args.method));
 
-    hoisted.getAcpSessionManagerMock.mockReset().mockReturnValue({
-      initializeSession: hoisted.initializeSessionMock,
-    });
     hoisted.initializeSessionMock
       .mockReset()
       .mockImplementation(async (args: AcpInitializeSessionInput) => {
-        const runtimeSessionName = `${args.sessionKey}:runtime`;
         const cwd = typeof args.cwd === "string" ? args.cwd : undefined;
         return {
           closeRuntimeOnFailure: hoisted.closeRuntimeOnFailureMock,
@@ -483,8 +477,7 @@ describe("spawnAcpDirect", () => {
           meta: {
             backend: "acpx",
             agent: args.agent,
-            runtimeSessionName,
-            ...(cwd ? { runtimeOptions: { cwd }, cwd } : {}),
+            ...(cwd ? { runtimeOptions: { cwd } } : {}),
             identity: {
               state: "pending",
               source: "ensure",
@@ -492,9 +485,6 @@ describe("spawnAcpDirect", () => {
               agentSessionId: "codex-inner-1",
               lastUpdatedAt: Date.now(),
             },
-            mode: args.mode,
-            state: "idle",
-            lastActivityAt: Date.now(),
           },
         };
       });
@@ -511,15 +501,11 @@ describe("spawnAcpDirect", () => {
         metadata: bindingMetadata(input, "codex", "wh-1"),
       }),
     );
-    hoisted.sessionBindingResolveByConversationMock.mockReset().mockReturnValue(null);
-    hoisted.sessionBindingListBySessionMock.mockReset().mockReturnValue([]);
-    hoisted.sessionBindingUnbindMock.mockReset().mockResolvedValue([]);
     sessionBindingServiceTesting.resetSessionBindingAdaptersForTests();
     registerBindingAdapter("discord");
     hoisted.startAcpSpawnParentStreamRelayMock
       .mockReset()
       .mockImplementation(() => createRelayHandle());
-    hoisted.resolveStorePathMock.mockReset().mockReturnValue("/tmp/codex-sessions.json");
     hoisted.readAcpResumeSessionOwnerMock.mockReset().mockReturnValue(undefined);
     mockSessionStore();
   });
@@ -932,21 +918,15 @@ describe("spawnAcpDirect", () => {
     );
 
     expect(result.status, JSON.stringify(result)).toBe("accepted");
-    expectBindingCallFields({
-      placement: "child",
-      conversation: {
+    expectThreadDelivery(
+      {
         channel: "matrix",
         accountId: "default",
         conversationId: "$thread-root",
         parentConversationId: "!Room:Example.org",
       },
-    });
-    expect(gatewayRequest("agent").params).toMatchObject({
-      deliver: true,
-      channel: "matrix",
-      to: "room:!Room:Example.org",
-      threadId: "child-thread",
-    });
+      { to: "room:!Room:Example.org", threadId: "child-thread" },
+    );
   });
 
   it("surfaces non-missing target workspace access failures instead of silently dropping cwd", async () => {
@@ -1004,17 +984,10 @@ describe("spawnAcpDirect", () => {
     );
 
     expect(result.status).toBe("accepted");
-    expectBindingCallFields({
-      placement: "child",
-      conversation: { channel: "custom", accountId: "work", conversationId: "123456" },
-    });
-    expect(gatewayRequest("agent").params).toMatchObject({
-      deliver: true,
-      channel: "custom",
-      to: "channel:123456",
-      threadId: undefined,
-    });
-    expect(gatewayRequest("agent")?.params?.accountId).toBe("work");
+    expectThreadDelivery(
+      { channel: "custom", accountId: "work", conversationId: "123456" },
+      { to: "channel:123456", threadId: undefined, accountId: "work" },
+    );
   });
 
   it.each(["bot-alpha", undefined])(
@@ -1071,16 +1044,10 @@ describe("spawnAcpDirect", () => {
         agentId: ownerAgentId,
         agent: agentId === "bot-alpha" ? "bot-alpha" : "codex",
       });
-      expectBindingCallFields({
-        placement: "child",
-        conversation: { channel: "matrix", accountId: "bot-alpha", conversationId: boundRoom },
-      });
-      expectRecordFields(gatewayRequest("agent").params, {
-        deliver: true,
-        channel: "matrix",
-        accountId: "bot-alpha",
-        to: `room:${boundRoom}`,
-      });
+      expectThreadDelivery(
+        { channel: "matrix", accountId: "bot-alpha", conversationId: boundRoom },
+        { accountId: "bot-alpha", to: `room:${boundRoom}` },
+      );
       expectRegisteredSubagentRun(
         hoisted.registerSubagentRunMock,
         {
@@ -1117,7 +1084,7 @@ describe("spawnAcpDirect", () => {
       to: undefined,
       threadId: undefined,
     });
-    expectRelayCallFields({
+    expectRecordFields(hoisted.startAcpSpawnParentStreamRelayMock.mock.calls[0]?.[0], {
       parentSessionKey: "agent:main:subagent:parent",
       agentId: "codex",
       ownerAgentId: "main",

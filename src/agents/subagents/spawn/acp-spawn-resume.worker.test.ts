@@ -1,4 +1,5 @@
 import type { AcpRuntime } from "@openclaw/acp-core/runtime/types";
+import { expectDefined } from "@openclaw/normalization-core";
 import { expect, it, vi } from "vitest";
 import { awaitGateBeforeSettlement, createDeferred } from "../../../../test/helpers/promise.js";
 import { observeHostDataSql } from "../../../../test/helpers/sqlite-statement-execution-counter.js";
@@ -46,7 +47,6 @@ it("resolves resume ownership off-thread, preserving backend, order, and lifecyc
         resume?: string;
         binding?: string;
         startedAt?: number;
-        updatedAt?: number;
         missing?: boolean;
       } = {},
     ) => {
@@ -85,7 +85,7 @@ it("resolves resume ownership off-thread, preserving backend, order, and lifecyc
         lifecycleRevision: options.binding ?? entry?.lifecycleRevision ?? "deleted",
         meta,
         env: state.env,
-        now: () => options.updatedAt ?? 100,
+        now: () => 100,
       });
       return { sessionKey, meta, entry };
     };
@@ -136,31 +136,30 @@ it("resolves resume ownership off-thread, preserving backend, order, and lifecyc
         requesterSessionKey,
       });
     }
-    const cases = [
-      ["owned", true],
-      ["acpx-owned", true],
-      ["parent", true],
-      ["foreign", false],
-      ["backend", false],
-      ["agent", false],
-      ["runtime", false],
-      ["stale", false],
-      ["legacy", true],
-      ["reset", false],
-      ["missing", false],
-      ["incognito-private", false],
-      ["unqualified", false],
-      ["alias", false],
-      ["internal", false],
-      ["absent", false],
-      ["trimmed", true],
-      ["duplicate-live", true],
-      ["duplicate-denied", false],
-    ] as const;
     const observe = observeHostDataSql();
     try {
-      for (const [resumeSessionId, allowed] of cases) {
-        await expectOwnership(resumeSessionId, allowed);
+      for (const [id, allowed] of [
+        ["owned", true],
+        ["acpx-owned", true],
+        ["parent", true],
+        ["foreign", false],
+        ["backend", false],
+        ["agent", false],
+        ["runtime", false],
+        ["stale", false],
+        ["legacy", true],
+        ["reset", false],
+        ["missing", false],
+        ["incognito-private", false],
+        ["unqualified", false],
+        ["alias", false],
+        ["internal", false],
+        ["absent", false],
+        ["trimmed", true],
+        ["duplicate-live", true],
+        ["duplicate-denied", false],
+      ] as const) {
+        await expectOwnership(id, allowed);
       }
       await expectOwnership("owned", true, { requesterSessionKey: owned.sessionKey });
       await expectOwnership("owned", false, { requesterSessionKey: undefined });
@@ -235,10 +234,7 @@ it("resolves resume ownership off-thread, preserving backend, order, and lifecyc
         agentId: "reviewer",
         runtimeAgent: "coder",
       });
-      const sourceEntry = source.entry;
-      if (!sourceEntry) {
-        throw new Error("resume source fixture was not created");
-      }
+      const sourceEntry = expectDefined(source.entry, "resume source fixture was not created");
       let current = true;
       const assertCurrent = () => {
         if (!current) {
@@ -308,12 +304,14 @@ it("resolves resume ownership off-thread, preserving backend, order, and lifecyc
       try {
         await awaitGateBeforeSettlement(prepared.promise, operation, "manager did not prepare");
         const scope = { agentId: "coder", sessionKey: source.sessionKey, env: state.env };
-        if (mutation === "reassigned") {
-          await replaceSessionEntry(scope, {
+        const reassign = () =>
+          replaceSessionEntry(scope, {
             ...sourceEntry,
             spawnedBy: "agent:other:main",
             parentSessionKey: "agent:other:main",
           });
+        if (mutation === "reassigned") {
+          await reassign();
         } else if (mutation === "runtime") {
           writeMeta(source, { ...source.meta, agent: "cursor" });
         } else if (mutation === "deleted") {
@@ -334,11 +332,7 @@ it("resolves resume ownership off-thread, preserving backend, order, and lifecyc
               read(readScope, assertReadCurrent, async (snapshot, owner) => {
                 expect(readScope.sessionKey).toBe(source.sessionKey);
                 expect(snapshot).toMatchObject({ ok: true, value: { spawnedBy: requester } });
-                await replaceSessionEntry(scope, {
-                  ...sourceEntry,
-                  spawnedBy: "agent:other:main",
-                  parentSessionKey: "agent:other:main",
-                });
+                await reassign();
                 return consume(snapshot, owner);
               }),
             );
@@ -349,10 +343,8 @@ it("resolves resume ownership off-thread, preserving backend, order, and lifecyc
       }
       const result = await outcome.finally(() => restoreRead?.());
       expect(result.ok, mutation).toBe(mutation === "unchanged");
-      if (!retained.revalidateResume) {
-        throw new Error("resume authorization callback was not provided");
-      }
-      await expect(retained.revalidateResume()).rejects.toThrow(
+      const revalidate = expectDefined(retained.revalidateResume, "resume authorization callback");
+      await expect(revalidate()).rejects.toThrow(
         mutation === "retired" ? "request retired" : "ACP resume source authority changed",
       );
       if (result.ok) {

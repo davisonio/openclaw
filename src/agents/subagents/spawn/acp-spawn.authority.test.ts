@@ -43,8 +43,7 @@ import { createAcpSpawnSessionBinding } from "./acp-spawn-store.test-support.js"
 import { testing as spawnTesting } from "./subagent-spawn.test-support.js";
 
 vi.mock("../../runtime-plugins.js", () => ({
-  loadAgentRuntimePluginRegistryHandle:
-    vi.fn<typeof import("../../runtime-plugins.js").loadAgentRuntimePluginRegistryHandle>(),
+  loadAgentRuntimePluginRegistryHandle: vi.fn<typeof loadAgentRuntimePluginRegistryHandle>(),
 }));
 
 const parentSessionKey = "agent:main:main";
@@ -134,11 +133,7 @@ it.each([
   "pending ACP spawn transfers work only from its live parent: %s / %s",
   async (stage, closure) => {
     const cfg = configRuntime.getRuntimeConfig();
-    await registryPersistence.writeSubagentSessionEntry({
-      stateDir,
-      ...parentScope,
-      defaultSessionId: "parent-session",
-    });
+    await registryPersistence.writeChildSession(stateDir, parentSessionKey, "parent-session");
     const live = closure === "live";
     const thread = stage === "thread";
     const readChild = (sessionKey: string) =>
@@ -264,8 +259,10 @@ it.each([
       async ensureSession(input) {
         if (live) {
           const entry = readChild(input.sessionKey);
-          expect(entry?.inheritedGitContributorProfileIds).toEqual(["human-contributor"]);
-          expect(entry?.participants ?? []).toEqual([]);
+          expect({
+            profiles: entry?.inheritedGitContributorProfileIds,
+            participants: entry?.participants ?? [],
+          }).toEqual({ profiles: ["human-contributor"], participants: [] });
         }
         ensuredSessions.push(input.sessionKey);
         if (pausesRuntime) {

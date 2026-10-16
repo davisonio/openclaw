@@ -94,10 +94,8 @@ describe("persisted subagent capability lookups", () => {
         const projection = await createSessionRowProjection({ cfg });
         try {
           await projection.ensureMaterialized();
-          const context = bindSessionRowProjection(
-            createDirectChatContext({ getRuntimeConfig: () => cfg }),
-            () => projection,
-          );
+          const context = createDirectChatContext({ getRuntimeConfig: () => cfg });
+          bindSessionRowProjection(context, () => projection);
           const copied = { ...context };
           let retired = false;
           await withPluginRuntimeGatewayContextResolver(
@@ -109,16 +107,11 @@ describe("persisted subagent capability lookups", () => {
             },
             async () => {
               const policy = { allow: ["read"], deny: ["exec"] };
-              const resolve = () =>
-                resolveRequesterToolPolicies({
-                  config: cfg,
-                  agentId: "main",
-                  sessionKey: key,
-                });
+              const request = { config: cfg, agentId: "main", sessionKey: key };
+              const resolve = () => resolveRequesterToolPolicies(request);
               const readPolicy = () => {
-                const current = resolve();
-                const depth = resolveCapabilities(key, { cfg, store: current.subagentStore }).depth;
-                return { policy: current.inheritedToolPolicy, depth };
+                const { inheritedToolPolicy: inherited, subagentStore: store } = resolve();
+                return { policy: inherited, depth: resolveCapabilities(key, { cfg, store }).depth };
               };
               expect(resolve().inheritedToolPolicy).toEqual(policy);
               const queries = observeSqliteReadSql(StatementSync.prototype);
@@ -139,13 +132,10 @@ describe("persisted subagent capability lookups", () => {
                 depth: 3,
               });
               const retained = createSubagentSessionStore(storePath, "main");
-              const createdKey = "agent:main:subagent:created";
-              const readCreated = () => [
-                retained.get(createdKey),
-                retained.getById("created-child"),
-              ];
+              const created = "agent:main:subagent:created";
+              const readCreated = () => [retained.get(created), retained.getById("created-child")];
               expect(readCreated()).toEqual([undefined, undefined]);
-              await seed(createdKey, "created-child", { updatedAt: 2, spawnDepth: 4 });
+              await seed(created, "created-child", { updatedAt: 2, spawnDepth: 4 });
               expect(readCreated().map((entry) => entry?.spawnDepth)).toEqual([4, 4]);
 
               // Rebinding a context updates its copies; rebinding a copy creates a separate owner.
@@ -235,12 +225,10 @@ describe("persisted subagent capability lookups", () => {
           entry: { sessionId: "child", spawnDepth: 3, inheritedToolDeny: ["exec"] },
         },
       });
-      expect(await withPreparedRead(() => resolveCapabilities(key, { cfg, store }).depth)).toBe(
-        matching ? 3 : 1,
-      );
-      expect(await withPreparedRead(() => resolveDenylist(key, { cfg, store }))).toEqual(
-        matching ? ["exec"] : [],
-      );
+      const depth = () => resolveCapabilities(key, { cfg, store }).depth;
+      const deny = () => resolveDenylist(key, { cfg, store });
+      expect(await withPreparedRead(depth)).toBe(matching ? 3 : 1);
+      expect(await withPreparedRead(deny)).toEqual(matching ? ["exec"] : []);
       expect(fs.existsSync(storePath)).toBe(false);
     },
   );
@@ -256,20 +244,18 @@ describe("persisted subagent capability lookups", () => {
       const dashboard = "agent:main:dashboard:spawned";
       const byId = "agent:main:subagent:by-id";
       const cycle = "agent:main:acp:cycle-one";
+      const inherited = (id: string) =>
+        makeEntry(id, {
+          spawnedBy: child,
+          inheritedToolAllow: ["read"],
+          inheritedToolDeny: ["exec"],
+        });
       const entries: Record<string, SessionEntry> = {
         [root]: makeEntry("root", { spawnDepth: 0 }),
         [parent]: makeEntry("parent-id", { spawnedBy: root }),
         [child]: makeEntry(`${padding}child-id${padding}`, { spawnedBy: parent }),
-        "agent:main:subagent:renamed": makeEntry(`${padding}${byId}${padding}`, {
-          spawnedBy: child,
-          inheritedToolAllow: ["read"],
-          inheritedToolDeny: ["exec"],
-        }),
-        [acp]: makeEntry("acp-id", {
-          spawnedBy: child,
-          inheritedToolAllow: ["read"],
-          inheritedToolDeny: ["exec"],
-        }),
+        "agent:main:subagent:renamed": inherited(`${padding}${byId}${padding}`),
+        [acp]: inherited("acp-id"),
         [dashboard]: makeEntry("dashboard-id", { spawnDepth: 4, spawnedBy: acp }),
         [cycle]: makeEntry("cycle-one", { spawnedBy: "agent:main:acp:cycle-two" }),
         "agent:main:acp:cycle-two": makeEntry("cycle-two", { spawnedBy: cycle }),
@@ -302,13 +288,14 @@ describe("persisted subagent capability lookups", () => {
           }
         });
       }
-      expect(
-        await withPreparedRead(() =>
-          resolveCapabilities("child-id", {
-            cfg: { ...cfg, agents: { defaults: { subagents: { maxSpawnDepth: 2 } } } },
-          }),
-        ),
-      ).toMatchObject({ depth: 2, role: "leaf", canSpawn: false, canControlChildren: false });
+      const capped = { ...cfg, agents: { defaults: { subagents: { maxSpawnDepth: 2 } } } };
+      const cappedRead = () => resolveCapabilities("child-id", { cfg: capped });
+      expect(await withPreparedRead(cappedRead)).toMatchObject({
+        depth: 2,
+        role: "leaf",
+        canSpawn: false,
+        canControlChildren: false,
+      });
       expect(listing).not.toHaveBeenCalled();
     },
   );

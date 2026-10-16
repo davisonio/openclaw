@@ -33,11 +33,14 @@ const progressCommentaryDeliveryContext = {
   threadId: 1122,
 };
 
-function progressModeConfig(acp?: OpenClawConfig["acp"]): OpenClawConfig {
-  return {
-    ...(acp ? { acp } : {}),
-    channels: { forum: { streaming: { mode: "progress", progress: { commentary: true } } } },
-  };
+function progressRelay(runId: string, acp?: OpenClawConfig["acp"]) {
+  return createRelay(runId, {
+    cfg: {
+      ...(acp ? { acp } : {}),
+      channels: { forum: { streaming: { mode: "progress", progress: { commentary: true } } } },
+    },
+    deliveryContext: progressCommentaryDeliveryContext,
+  });
 }
 
 function createRelay(
@@ -54,10 +57,17 @@ function createRelay(
     agentId: "codex",
     ...options,
   });
+  const emit = (stream: string, data: Record<string, unknown>) =>
+    emitAgentEvent({ runId, stream, data });
   return {
     ...relay,
-    emit: (stream: string, data: Record<string, unknown>) =>
-      emitAgentEvent({ runId, stream, data }),
+    emit,
+    assistant: (delta: string, phase?: string) =>
+      emit("assistant", { delta, ...(phase ? { phase } : {}) }),
+    prompt: (proxyEnvKeys: string[] = []) =>
+      emit("acp", { phase: "prompt_submitted", at: Date.now(), proxyEnvKeys }),
+    status: (text: string, tag?: string) =>
+      emit("acp", { phase: "runtime_event", eventType: "status", text, ...(tag ? { tag } : {}) }),
   };
 }
 
@@ -99,8 +109,8 @@ describe("startAcpSpawnParentStreamRelay", () => {
 
     expect(enqueueSessionEventMock).not.toHaveBeenCalled();
     relay.notifyStarted();
-    relay.emit("assistant", { delta: "hello" });
-    relay.emit("assistant", { delta: " from child" });
+    relay.assistant("hello");
+    relay.assistant(" from child");
     vi.advanceTimersByTime(2_500);
 
     relay.emit("lifecycle", {
@@ -146,15 +156,15 @@ describe("startAcpSpawnParentStreamRelay", () => {
       childSessionId: "session-diagnostic-retry",
     });
 
-    relay.emit("assistant", { delta: "first" });
+    relay.assistant("first");
     await vi.advanceTimersByTimeAsync(1_000);
     expect(recordAcpParentStreamEventsMock).toHaveBeenCalledTimes(1);
 
-    relay.emit("assistant", { delta: "arrived while the write was pending" });
+    relay.assistant("arrived while the write was pending");
     rollback.resolve({ ok: false, error: new Error("database unavailable") });
     await vi.advanceTimersByTimeAsync(0);
     for (let index = 0; index < 300; index += 1) {
-      relay.emit("assistant", { delta: `event-${index}` });
+      relay.assistant(`event-${index}`);
     }
     expect(recordAcpParentStreamEventsMock).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1_999);
@@ -218,9 +228,7 @@ describe("startAcpSpawnParentStreamRelay", () => {
       eventRouting: { mainKey: "primary", sessionScope: "global" },
     });
 
-    relay.emit("assistant", {
-      delta: "hello from child",
-    });
+    relay.assistant("hello from child");
     vi.advanceTimersByTime(2_500);
 
     const progressEvent = enqueueSessionEventMock.mock.calls.find(
@@ -245,9 +253,7 @@ describe("startAcpSpawnParentStreamRelay", () => {
     vi.advanceTimersByTime(60_000);
     expectTextWithFragment(collectedTexts(), "no prompt submission was observed for 60s");
 
-    relay.emit("assistant", {
-      delta: "resumed output",
-    });
+    relay.assistant("resumed output");
     vi.advanceTimersByTime(2_500);
 
     const texts = collectedTexts();
@@ -265,11 +271,7 @@ describe("startAcpSpawnParentStreamRelay", () => {
   it("classifies stalls after prompt submission but before the first runtime event", async () => {
     const relay = createRelay("run-prompt-stall");
 
-    relay.emit("acp", {
-      phase: "prompt_submitted",
-      at: Date.now(),
-      proxyEnvKeys: ["HTTPS_PROXY"],
-    });
+    relay.prompt(["HTTPS_PROXY"]);
     vi.advanceTimersByTime(60_000);
 
     const texts = collectedTexts();
@@ -282,17 +284,9 @@ describe("startAcpSpawnParentStreamRelay", () => {
   it("classifies runtime activity without visible assistant output separately from input waits", async () => {
     const relay = createRelay("run-runtime-stall");
 
-    relay.emit("acp", {
-      phase: "prompt_submitted",
-      at: Date.now(),
-      proxyEnvKeys: [],
-    });
+    relay.prompt();
     vi.advanceTimersByTime(45_000);
-    relay.emit("acp", {
-      phase: "runtime_event",
-      eventType: "status",
-      text: "connecting to upstream",
-    });
+    relay.status("connecting to upstream");
     vi.advanceTimersByTime(45_000);
     expectNoTextWithFragment(collectedTexts(), "has ACP runtime activity");
 
@@ -315,9 +309,7 @@ describe("startAcpSpawnParentStreamRelay", () => {
     expectTextWithFragment(collectedTexts(), "stream relay timed out after 21600s");
 
     const before = enqueueSessionEventMock.mock.calls.length;
-    relay.emit("assistant", {
-      delta: "late output",
-    });
+    relay.assistant("late output");
     vi.advanceTimersByTime(2_500);
 
     expect(enqueueSessionEventMock.mock.calls).toHaveLength(before);
@@ -351,18 +343,10 @@ describe("startAcpSpawnParentStreamRelay", () => {
   });
 
   it("flushes visible commentary before final answer text", async () => {
-    const relay = createRelay("run-commentary-final", {
-      cfg: progressModeConfig(),
-      deliveryContext: progressCommentaryDeliveryContext,
-    });
+    const relay = progressRelay("run-commentary-final");
 
-    relay.emit("assistant", {
-      delta: "Note: Checking the requested response shape only.",
-      phase: "commentary",
-    });
-    relay.emit("assistant", {
-      delta: "ready",
-    });
+    relay.assistant("Note: Checking the requested response shape only.", "commentary");
+    relay.assistant("ready");
     vi.advanceTimersByTime(2_500);
 
     expect(collectedTexts()).toEqual([
@@ -388,10 +372,7 @@ describe("startAcpSpawnParentStreamRelay", () => {
       expected: ["codex: Checking", "codex: the app-server stream"],
     },
   ])("$name", async ({ name, first, second, flushFirst, expected }) => {
-    const relay = createRelay(name, {
-      cfg: progressModeConfig(),
-      deliveryContext: progressCommentaryDeliveryContext,
-    });
+    const relay = progressRelay(name);
 
     const preamble = (progressText: string) =>
       relay.emit("item", { itemId: "preamble-1", kind: "preamble", progressText });
@@ -499,27 +480,12 @@ describe("startAcpSpawnParentStreamRelay", () => {
   );
 
   it("flushes buffered commentary before ACP status progress", async () => {
-    const relay = createRelay("run-commentary-status-boundary", {
-      cfg: progressModeConfig({
-        stream: {
-          tagVisibility: {
-            plan: true,
-          },
-        },
-      }),
-      deliveryContext: progressCommentaryDeliveryContext,
+    const relay = progressRelay("run-commentary-status-boundary", {
+      stream: { tagVisibility: { plan: true } },
     });
 
-    relay.emit("assistant", {
-      delta: "checking files",
-      phase: "commentary",
-    });
-    relay.emit("acp", {
-      phase: "runtime_event",
-      eventType: "status",
-      tag: "plan",
-      text: "plan: inspect the runtime handoff first",
-    });
+    relay.assistant("checking files", "commentary");
+    relay.status("plan: inspect the runtime handoff first", "plan");
 
     expect(collectedTexts()).toEqual([
       "codex: checking files",
@@ -529,17 +495,9 @@ describe("startAcpSpawnParentStreamRelay", () => {
   });
 
   it("does not relay ACP status tags hidden by default when progress commentary is enabled", async () => {
-    const relay = createRelay("run-status-commentary-default-hidden", {
-      cfg: progressModeConfig(),
-      deliveryContext: progressCommentaryDeliveryContext,
-    });
+    const relay = progressRelay("run-status-commentary-default-hidden");
 
-    relay.emit("acp", {
-      phase: "runtime_event",
-      eventType: "status",
-      tag: "plan",
-      text: "plan: inspect the runtime handoff first",
-    });
+    relay.status("plan: inspect the runtime handoff first", "plan");
     vi.advanceTimersByTime(2_500);
 
     expectNoTextWithFragment(collectedTexts(), "inspect the runtime handoff");
@@ -547,25 +505,11 @@ describe("startAcpSpawnParentStreamRelay", () => {
   });
 
   it("classifies opted-in commentary as visible output for stall notices", async () => {
-    const relay = createRelay("run-commentary-visible-stall", {
-      cfg: progressModeConfig(),
-      deliveryContext: progressCommentaryDeliveryContext,
-    });
+    const relay = progressRelay("run-commentary-visible-stall");
 
-    relay.emit("acp", {
-      phase: "prompt_submitted",
-      at: Date.now(),
-      proxyEnvKeys: [],
-    });
-    relay.emit("acp", {
-      phase: "runtime_event",
-      eventType: "status",
-      text: "connecting to upstream",
-    });
-    relay.emit("assistant", {
-      delta: "checking active files before patching.",
-      phase: "commentary",
-    });
+    relay.prompt();
+    relay.status("connecting to upstream");
+    relay.assistant("checking active files before patching.", "commentary");
     vi.advanceTimersByTime(2_500);
     vi.advanceTimersByTime(60_000);
 
@@ -579,14 +523,11 @@ describe("startAcpSpawnParentStreamRelay", () => {
   it("still relays final_answer assistant text after suppressed commentary", async () => {
     const relay = createRelay("run-final");
 
-    relay.emit("assistant", {
-      delta: "checking thread context; then post a tight progress reply here.",
-      phase: "commentary",
-    });
-    relay.emit("assistant", {
-      delta: "final answer ready",
-      phase: "final_answer",
-    });
+    relay.assistant(
+      "checking thread context; then post a tight progress reply here.",
+      "commentary",
+    );
+    relay.assistant("final answer ready", "final_answer");
     vi.advanceTimersByTime(2_500);
 
     const texts = collectedTexts();
