@@ -29,10 +29,7 @@ import { packageActivationRuntimeForTest } from "../../src/infra/package-update-
 import { createPackageIntegrityReader } from "../../src/infra/package-update-integrity.js";
 import { createPackageSwapFixture } from "../../src/infra/package-update-swap.test-support.js";
 import { resolveRuntimeWorkerUrl } from "../../src/infra/runtime-worker-url.js";
-import {
-  MANAGED_HANDOFF_RUNTIME_ENTRY,
-  managedHandoffRuntimeEntrypoint,
-} from "../../src/infra/update-managed-service-handoff-runtime-assets.js";
+import { MANAGED_HANDOFF_RUNTIME_ENTRY } from "../../src/infra/update-managed-service-handoff-runtime-assets.js";
 import { stageManagedHandoffRuntime } from "../../src/infra/update-managed-service-handoff-runtime.js";
 import { resolveTestNodeExecPath } from "../../src/test-utils/node-process.js";
 import buildConfigs from "../../tsdown.config.ts";
@@ -222,8 +219,11 @@ it.each(
     let entry: string;
     if (kind === "managed") {
       // The repository runner compiles a separate graph from this production build.
+      const invocationAssets = await vi.importActual<
+        typeof import("../../src/infra/update-managed-service-handoff-runtime-assets.js")
+      >("../../src/infra/update-managed-service-handoff-runtime-assets.js");
       const invocationEntry = runtimeWorker.resolveRuntimeWorkerUrl(
-        managedHandoffRuntimeEntrypoint,
+        invocationAssets.managedHandoffRuntimeEntrypoint,
       );
       expect(readFileSync(new URL(`./${helperName}`, invocationEntry))).toEqual(publishedHelper);
       const manifest = JSON.parse(
@@ -276,7 +276,9 @@ it.each(
       const windowsAssets =
         process.platform === "win32" ? [path.join(path.dirname(entry), helperName)] : [];
       expect(staged.toSorted()).toEqual([entry, ...nativeAssets, ...windowsAssets].toSorted());
-      for (const helper of windowsAssets) expect(readFileSync(helper)).toEqual(publishedHelper);
+      for (const helper of windowsAssets) {
+        expect(readFileSync(helper)).toEqual(publishedHelper);
+      }
       if (process.platform === "freebsd") {
         const privateModules = path.join(directory, "runtime", "node_modules");
         const stagedPackageFiles = globSync("**/*", { cwd: privateModules })
