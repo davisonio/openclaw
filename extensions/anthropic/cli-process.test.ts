@@ -9,7 +9,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildAnthropicCliBackend } from "./cli-backend.js";
 import { discoverClaudeCliModels } from "./cli-model-discovery.js";
 import * as cliProcess from "./cli-process.js";
-import type { ClaudeCliSecretInput } from "./cli-process.js";
 import {
   collectClaudeCli as collect,
   createCliTestHarness,
@@ -39,6 +38,7 @@ const PROTOCOL_CHILD = `
       } });
     } else if (message.type === "user") {
       const text = message.message.content;
+      writeSync(1, "native stdout must stay private\\n");
       if (delayedDiagnostic) {
         writeSync(2, delayedDiagnostic);
         delayedDiagnostic = "";
@@ -83,12 +83,8 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-async function contextForChild(
-  source: string,
-  signal?: AbortSignal,
-): Promise<CliBackendExecuteContext> {
-  return harness.context(source, signal ? { abortSignal: signal } : {});
-}
+const contextForChild = (source: string, signal?: AbortSignal) =>
+  harness.context(source, signal ? { abortSignal: signal } : {});
 
 const failureOf = (running: Promise<unknown>) => running.catch((failure: unknown) => failure);
 
@@ -212,14 +208,9 @@ describe("Claude subprocess diagnostics through the direct CLI transport", () =>
     const current = attachLiveSession(context);
     const spawned = createDeferred<void>();
     const release = createDeferred<void>();
-    let extinct = false;
+    const extinct = vi.fn();
     observeChild(async (child) => {
-      void child.waitForExtinction?.().then(
-        () => {
-          extinct = true;
-        },
-        () => {},
-      );
+      void child.waitForExtinction?.().then(extinct, () => {});
       spawned.resolve();
       await release.promise;
     });
@@ -233,17 +224,15 @@ describe("Claude subprocess diagnostics through the direct CLI transport", () =>
         throw new Error("Expected the starting session to be registered.");
       }
       session.close("restart");
-      let finished = false;
-      waiting = session.waitForExit().then(() => {
-        finished = true;
-      });
+      const finished = vi.fn();
+      waiting = session.waitForExit().then(finished);
       void waiting.catch(() => {});
       // Let a prematurely resolved exit promise run before releasing startup.
       await Promise.resolve();
-      expect(finished).toBe(false);
+      expect(finished).not.toHaveBeenCalled();
       release.resolve();
       await withinTest(waiting, signal);
-      expect(extinct).toBe(true);
+      expect(extinct).toHaveBeenCalled();
       await expect(running).rejects.toThrow("Claude CLI live session closed.");
     } finally {
       release.resolve();
@@ -310,13 +299,12 @@ describe("Claude subprocess diagnostics through the direct CLI transport", () =>
     const error = await failureOf(collect(context));
     expect(error).toBeInstanceOf(Error);
     expect(error).toHaveProperty("message", EXIT_FAILURE);
-    expect(
-      expectDiagnostic(
-        error,
-        ["exited with code 1", "PermissionError: [Errno 1]", "'/bin/ps' 🦞"],
-        [secret, "discarded noise"],
-      ).length,
-    ).toBeLessThan(2_200);
+    const display = expectDiagnostic(
+      error,
+      ["exited with code 1", "PermissionError: [Errno 1]", "'/bin/ps' 🦞"],
+      [secret, "discarded noise"],
+    );
+    expect(display.length).toBeLessThan(2_200);
   });
 
   it.skipIf(process.platform === "win32")(
@@ -518,30 +506,6 @@ describe("Claude subprocess diagnostics through the direct CLI transport", () =>
     },
   );
 
-  it("masks descriptor/environment secrets and excludes native stdout", async () => {
-    const context = await contextForChild(`
-      import { readFileSync, writeSync } from "node:fs";
-      writeSync(1, "native stdout must stay private\\n");
-      writeSync(2, "credential: " + readFileSync(3, "utf8") + "\\n");
-      writeSync(2, "environment: " + process.env.OPENCLAW_MCP_TOKEN + "\\n");
-      writeSync(2, "PermissionError: denied resource 3\\n");
-      process.exit(1);
-    `);
-    const credential = "opaque-descriptor-fixture-value";
-    const grant = "opaque-mcp-fixture-value";
-    context.env.OPENCLAW_MCP_TOKEN = grant;
-    context.env.CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR = "3";
-    const secretInput: ClaudeCliSecretInput = { fd: 3, createData: () => Buffer.from(credential) };
-    const buffers = recordCredentialBuffers(secretInput);
-    const error = await failureOf(collect(context, secretInput));
-    expectDiagnostic(
-      error,
-      ["PermissionError: denied resource 3", "[REDACTED]"],
-      [credential, grant, "native stdout must stay private", context.prompt],
-    );
-    expectErased(buffers);
-  });
-
   // POSIX process groups survive root exit; Windows cannot enumerate a spontaneously exited root.
   it.skipIf(process.platform === "win32")(
     "reports failure and reaps a descendant that inherited stderr",
@@ -641,8 +605,9 @@ describe("Claude subprocess diagnostics through the direct CLI transport", () =>
               : "exited with code 1",
             "stderr (process-wide; may include earlier turns):",
             "previous turn diagnostic",
+            "[REDACTED]",
           ],
-          [credential, processGrant],
+          [credential, processGrant, "native stdout must stay private", context.prompt],
         );
         expect(display.includes("PermissionError: current turn failed")).toBe(
           prompt === "fail noisily" || prompt === "exit without result",

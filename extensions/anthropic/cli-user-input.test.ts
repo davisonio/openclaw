@@ -46,6 +46,21 @@ const input = {
     }),
   ],
 };
+const allowed = (proof: string) => ({
+  behavior: "allow",
+  updatedInput: { ...input, answers: mappedAnswers(proof) },
+});
+const rejectedQuestions = (detail: string) => ({
+  behavior: "deny",
+  message: `OpenClaw rejected malformed Claude user questions: ${detail}. Correct the invalid field and retry AskUserQuestion.`,
+});
+function ask(
+  authorizer: ReturnType<typeof authorizerFor>,
+  payload: Record<string, unknown> = input,
+  toolUseId?: string,
+) {
+  return authorizer.authorize({ input: payload, toolUseId, signal: new AbortController().signal });
+}
 
 describe("Claude CLI user input adapter", () => {
   it("maps Claude questions and answers while deduplicating the CLI callbacks", async () => {
@@ -56,13 +71,7 @@ describe("Claude CLI user input adapter", () => {
     const first = authorizer.authorize({ input, signal, toolUseId: "claude-question-1" });
     const second = authorizer.authorize({ input, signal, toolUseId: "claude-question-1" });
 
-    await expect(first).resolves.toEqual({
-      behavior: "allow",
-      updatedInput: {
-        ...input,
-        answers: mappedAnswers("Unit tests, UI proof"),
-      },
-    });
+    await expect(first).resolves.toEqual(allowed("Unit tests, UI proof"));
     await expect(second).resolves.toEqual(await first);
     expect(requestUserInput).toHaveBeenCalledOnce();
     expect(requestUserInput).toHaveBeenCalledWith({
@@ -83,9 +92,7 @@ describe("Claude CLI user input adapter", () => {
       message: "The operator skipped this question.",
     }));
 
-    await expect(
-      authorizer.authorize({ input, signal: new AbortController().signal }),
-    ).resolves.toEqual({
+    await expect(ask(authorizer)).resolves.toEqual({
       behavior: "deny",
       message: "The operator skipped this question. Continue with your best judgment.",
     });
@@ -93,32 +100,17 @@ describe("Claude CLI user input adapter", () => {
 
   it("guides a malformed question retry without replaying the rejected call", async () => {
     const requestUserInput = answered("Unit tests");
-    const authorizer = createClaudeCliUserInputAuthorizer(createContext(requestUserInput));
-    const signal = new AbortController().signal;
-    const rejected = {
-      behavior: "deny",
-      message:
-        "OpenClaw rejected malformed Claude user questions: questions[0].header must be at most 12 characters. Correct the invalid field and retry AskUserQuestion.",
-    };
+    const authorizer = authorizerFor(requestUserInput);
+    const rejected = rejectedQuestions("questions[0].header must be at most 12 characters");
+    const invalid = malformed({ header: "Too long for Claude" });
 
-    await expect(
-      authorizer.authorize({
-        input: { questions: [{ ...input.questions[0], header: "Too long for Claude" }] },
-        signal,
-        toolUseId: "rejected-question",
-      }),
-    ).resolves.toEqual(rejected);
-    await expect(
-      authorizer.authorize({ input, signal, toolUseId: "rejected-question" }),
-    ).resolves.toEqual(rejected);
+    await expect(ask(authorizer, invalid, "rejected-question")).resolves.toEqual(rejected);
+    await expect(ask(authorizer, input, "rejected-question")).resolves.toEqual(rejected);
     expect(requestUserInput).not.toHaveBeenCalled();
 
-    await expect(
-      authorizer.authorize({ input, signal, toolUseId: "corrected-question" }),
-    ).resolves.toMatchObject({
-      behavior: "allow",
-      updatedInput: { answers: mappedAnswers("Unit tests") },
-    });
+    await expect(ask(authorizer, input, "corrected-question")).resolves.toEqual(
+      allowed("Unit tests"),
+    );
     expect(requestUserInput).toHaveBeenCalledOnce();
   });
 
@@ -154,17 +146,11 @@ describe("Claude CLI user input adapter", () => {
     "reports the failed constraint for %s without echoing payload text",
     async (_case, malformedInput, expectedDetail) => {
       const requestUserInput = vi.fn();
-      const authorizer = createClaudeCliUserInputAuthorizer(createContext(requestUserInput));
+      const authorizer = authorizerFor(requestUserInput);
 
-      const result = await authorizer.authorize({
-        input: malformedInput as Record<string, unknown>,
-        signal: new AbortController().signal,
-      });
+      const result = await ask(authorizer, malformedInput as Record<string, unknown>);
 
-      expect(result).toEqual({
-        behavior: "deny",
-        message: `OpenClaw rejected malformed Claude user questions: ${expectedDetail}. Correct the invalid field and retry AskUserQuestion.`,
-      });
+      expect(result).toEqual(rejectedQuestions(expectedDetail));
       expect(requestUserInput).not.toHaveBeenCalled();
     },
   );

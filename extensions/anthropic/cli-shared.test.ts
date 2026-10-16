@@ -82,6 +82,10 @@ function prepare(
   });
 }
 
+function prepareSecret(authCredential: Credential, authProfileId?: string) {
+  return prepare(backend, { authCredential, authProfileId }) as ClaudePreparedExecutionWithSecret;
+}
+
 function executionArgs(overrides: Partial<Parameters<typeof resolveClaudeCliExecutionArgs>[0]>) {
   return resolveClaudeCliExecutionArgs({
     workspaceDir: "/tmp",
@@ -185,16 +189,14 @@ function normalizeClaudeArgs(
   ).args;
 }
 
-describe("Claude backend permission args", () => {
-  it.each([
-    ["--dangerously-skip-permissions --verbose", "--verbose --setting-sources user"],
-    ["--permission-mode acceptEdits", "--permission-mode acceptEdits --setting-sources user"],
-    ["--permission-mode=acceptEdits", "--permission-mode=acceptEdits --setting-sources user"],
-    ["--setting-sources project", "--setting-sources user"],
-    ["--setting-sources=local,user", "--setting-sources=user"],
-  ])("normalizes permission and setting args: %s", (input, expected) => {
-    expect(normalizeClaudeArgs(argv("-p", input))).toEqual(argv("-p", expected));
-  });
+it.each([
+  ["--dangerously-skip-permissions --verbose", "--verbose --setting-sources user"],
+  ["--permission-mode acceptEdits", "--permission-mode acceptEdits --setting-sources user"],
+  ["--permission-mode=acceptEdits", "--permission-mode=acceptEdits --setting-sources user"],
+  ["--setting-sources project", "--setting-sources user"],
+  ["--setting-sources=local,user", "--setting-sources=user"],
+])("normalizes Claude permission and setting args: %s", (input, expected) => {
+  expect(normalizeClaudeArgs(argv("-p", input))).toEqual(argv("-p", expected));
 });
 
 describe("resolveClaudeCliExecutionArgs", () => {
@@ -309,21 +311,18 @@ function registeredBackend(
 
 describe("normalizeClaudeBackendConfig", () => {
   it("normalizes both args and resumeArgs for custom overrides", () => {
+    const streamArgs = argv("-p --output-format stream-json --verbose");
+    const resumeArgs = [...streamArgs, "--resume", "{sessionId}"];
+    const permissions = argv("--setting-sources user --permission-mode bypassPermissions");
     const normalized = normalizeClaudeBackendConfig({
       command: "claude",
-      args: ["-p", "--output-format", "stream-json", "--verbose"],
-      resumeArgs: argv("-p --output-format stream-json --verbose --resume {sessionId}"),
+      args: [...streamArgs],
+      resumeArgs: [...resumeArgs],
     });
 
     expect(normalized).toMatchObject({
-      args: argv(
-        "-p --output-format stream-json --verbose --setting-sources user --permission-mode",
-        "bypassPermissions",
-      ),
-      resumeArgs: argv(
-        "-p --output-format stream-json --verbose --resume {sessionId} --setting-sources",
-        "user --permission-mode bypassPermissions",
-      ),
+      args: [...streamArgs, ...permissions],
+      resumeArgs: [...resumeArgs, ...permissions],
       output: "jsonl",
       liveSession: "claude-stdio",
       input: "stdin",
@@ -448,22 +447,15 @@ describe("normalizeClaudeBackendConfig", () => {
   });
 
   it("forwards the selected OAuth profile through Claude's private descriptor", async () => {
-    const prepared = prepare(backend, {
-      authProfileId: "anthropic:claude-cli",
-      authCredential: oauth(),
-    }) as ClaudePreparedExecutionWithSecret;
+    const prepared = prepareSecret(oauth(), "anthropic:claude-cli");
 
     expectSecret(prepared, "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "selected-access-token");
     expect(prepared.env).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
     expect(prepared.clearEnv).toEqual([...CLAUDE_CLI_CLEAR_ENV]);
     expect(prepared.secretInput.fd).toBe(3);
 
-    const sameToken = prepare(backend, {
-      authCredential: token("selected-access-token"),
-    }) as ClaudePreparedExecutionWithSecret;
-    const rotatedToken = prepare(backend, {
-      authCredential: token("rotated-access-token"),
-    }) as ClaudePreparedExecutionWithSecret;
+    const sameToken = prepareSecret(token("selected-access-token"));
+    const rotatedToken = prepareSecret(token("rotated-access-token"));
     expect(sameToken.secretInput.fingerprint).toBe(prepared.secretInput.fingerprint);
     expect(rotatedToken.secretInput.fingerprint).not.toBe(prepared.secretInput.fingerprint);
 
@@ -491,14 +483,10 @@ describe("normalizeClaudeBackendConfig", () => {
   });
 
   it("forwards a selected API-key profile through Claude's private descriptor", async () => {
-    const prepared = prepare(backend, {
-      authProfileId: "claude-cli:api",
-      authCredential: {
-        type: "api_key",
-        provider: "claude-cli",
-        key: "selected-api-key",
-      },
-    }) as ClaudePreparedExecutionWithSecret;
+    const prepared = prepareSecret(
+      { type: "api_key", provider: "claude-cli", key: "selected-api-key" },
+      "claude-cli:api",
+    );
 
     expectSecret(prepared, "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR", "selected-api-key");
     expect(prepared.env).not.toHaveProperty("ANTHROPIC_API_KEY");

@@ -43,15 +43,12 @@ describe("anthropic Claude model refs", () => {
   it.each(["toString"])("leaves unknown alias %s unchanged", (ref) => {
     expect(resolveKnownAnthropicModelRef(ref)).toBe(ref);
   });
-  it("upgrades retired refs without rewriting future canonical refs", () => {
-    for (const [from, to] of [
-      ["claude-opus-4-5", "claude-opus-5-5"],
-      ["claude-opus-4-5@anthropic:work", "claude-opus-5-5@anthropic:work"],
-      ["claude-sonnet-4-20250514", "claude-sonnet-4-6"],
-    ]) {
-      expect(resolveKnownAnthropicModelRef(`anthropic/${from}`)).toBe(`anthropic/${to}`);
-    }
-    for (const modelId of [
+  it.each([
+    ["claude-opus-4-5", "claude-opus-5-5"],
+    ["claude-opus-4-5@anthropic:work", "claude-opus-5-5@anthropic:work"],
+    ["claude-sonnet-4-20250514", "claude-sonnet-4-6"],
+    ["claude-3-5-haiku-20241022", "claude-sonnet-4-6"],
+    ...[
       "claude-opus-5-0",
       "claude-opus-4-10",
       "claude-sonnet-4-7",
@@ -59,18 +56,11 @@ describe("anthropic Claude model refs", () => {
       "claude-sonnet-5-5",
       "claude-sonnet-5-20260901",
       "claude-haiku-4-5",
-    ]) {
-      expect(resolveKnownAnthropicModelRef(`anthropic/${modelId}`)).toBe(`anthropic/${modelId}`);
-    }
-  });
-
-  it("preserves explicit claude-haiku-4-5 refs", () => {
-    for (const ref of ["claude-haiku-4-5", "claude-haiku-4.5", "claude-haiku-4-5@anthropic:work"]) {
-      expect(resolveKnownAnthropicModelRef(`anthropic/${ref}`)).toBe(`anthropic/${ref}`);
-    }
-    expect(resolveKnownAnthropicModelRef("anthropic/claude-3-5-haiku-20241022")).toBe(
-      "anthropic/claude-sonnet-4-6",
-    );
+      "claude-haiku-4.5",
+      "claude-haiku-4-5@anthropic:work",
+    ].map((ref) => [ref, ref]),
+  ])("resolves Anthropic model %s to %s", (from, to) => {
+    expect(resolveKnownAnthropicModelRef(`anthropic/${from}`)).toBe(`anthropic/${to}`);
   });
 });
 
