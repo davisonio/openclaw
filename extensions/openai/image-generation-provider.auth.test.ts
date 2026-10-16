@@ -7,6 +7,8 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { buildOpenAIImageGenerationProvider } from "./image-generation-provider.js";
 import {
+  createChatGPTAccessToken,
+  createCodexApiKeyAuthStore,
   createCodexOAuthAuthStore,
   openAIImageConfig,
 } from "./image-generation-provider.test-support.js";
@@ -168,5 +170,88 @@ describe("OpenAI image generation auth availability", () => {
       },
       false,
     );
+  });
+
+  describe("Free ChatGPT plans", () => {
+    function freePlanStore(access = createChatGPTAccessToken("free")): AuthProfileStore {
+      const store = createCodexOAuthAuthStore();
+      store.profiles["openai:default"].access = access;
+      return store;
+    }
+
+    it("does not report image generation when every ChatGPT profile is on the Free plan", async () => {
+      authConfigured = true;
+      authStore = freePlanStore();
+      await expectConfigured({ agentDir: "/tmp/agent" }, false);
+
+      authStore = {
+        version: 1,
+        profiles: {
+          "openai:token": {
+            type: "token",
+            provider: "openai",
+            token: createChatGPTAccessToken("free"),
+          },
+        },
+      };
+      await expectConfigured({ agentDir: "/tmp/agent" }, false);
+    });
+
+    it("falls back to the plan stored at login when the token has no plan claim", async () => {
+      authConfigured = true;
+      authStore = freePlanStore("opaque-access");
+      authStore.profiles["openai:default"] = {
+        ...authStore.profiles["openai:default"],
+        chatgptPlanType: "free",
+      } as AuthProfileStore["profiles"][string];
+      await expectConfigured({ agentDir: "/tmp/agent" }, false);
+    });
+
+    it("prefers the refreshed token plan over the plan stored at login", async () => {
+      authConfigured = true;
+      authStore = freePlanStore(createChatGPTAccessToken("plus"));
+      authStore.profiles["openai:default"] = {
+        ...authStore.profiles["openai:default"],
+        chatgptPlanType: "free",
+      } as AuthProfileStore["profiles"][string];
+      await expectConfigured({ agentDir: "/tmp/agent" }, true);
+    });
+
+    it.each(["plus", "pro", "team"])("keeps image generation for the %s plan", async (plan) => {
+      authConfigured = true;
+      authStore = freePlanStore(createChatGPTAccessToken(plan));
+      await expectConfigured({ agentDir: "/tmp/agent" }, true);
+    });
+
+    it("keeps image generation when the plan is unknown", async () => {
+      authConfigured = true;
+      authStore = createCodexOAuthAuthStore();
+      await expectConfigured({ agentDir: "/tmp/agent" }, true);
+    });
+
+    it("keeps image generation when an OpenAI API key is also available", async () => {
+      authConfigured = true;
+      authStore = {
+        version: 1,
+        profiles: { ...freePlanStore().profiles, ...createCodexApiKeyAuthStore().profiles },
+      };
+      await expectConfigured({ agentDir: "/tmp/agent" }, true);
+
+      authStore = freePlanStore();
+      await expectConfigured(
+        {
+          agentDir: "/tmp/agent",
+          cfg: openAIImageConfig({ baseUrl: "https://api.openai.com/v1", apiKey: "sk-test" }),
+        },
+        true,
+      );
+    });
+
+    it("does not count OPENAI_API_KEY while ChatGPT sign-in keeps the Codex route", async () => {
+      authConfigured = true;
+      authStore = freePlanStore();
+      vi.stubEnv("OPENAI_API_KEY", "sk-test");
+      await expectConfigured({ agentDir: "/tmp/agent" }, false);
+    });
   });
 });

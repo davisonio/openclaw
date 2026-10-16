@@ -132,6 +132,9 @@ does not first try `OPENAI_API_KEY` or silently fall back to an API key.
 That Responses request runs on `gpt-6-astra`. If your ChatGPT plan rejects that
 model, OpenClaw retries with each `openai/*` model in `agents.defaults.model`
 (primary, then fallbacks), so configure a model your plan supports there.
+The Free ChatGPT plan cannot generate images through ChatGPT sign-in, so
+OpenClaw does not offer OpenAI image generation for Free plan profiles unless
+`models.providers.openai` has an API key.
 Configure `models.providers.openai` explicitly with an API key, custom base
 URL, or Azure endpoint when you want the direct OpenAI Images API route
 instead. If that custom image endpoint is on a trusted LAN/private address,
