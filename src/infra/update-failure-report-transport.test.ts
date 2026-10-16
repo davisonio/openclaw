@@ -13,8 +13,11 @@ import {
   reserveUpdateFailureReportReceipt,
 } from "./restart-sentinel.js";
 import { SqliteWorkerError } from "./sqlite-worker-contract.js";
-import { prepareUpdateFailureReport, submitUpdateFailureReport } from "./update-failure-report.js";
-import { expireUpdateFailureReportReceipt } from "./update-failure-report.test-support.js";
+import { prepareUpdateFailureReport } from "./update-failure-report.js";
+import {
+  expireUpdateFailureReportReceipt,
+  submitUpdateFailureReportFixture as submitUpdateFailureReport,
+} from "./update-failure-report.test-support.js";
 
 const tempDirs = useStateDatabaseTempDirs();
 const issueUrl = "https://github.com/openclaw/openclaw/issues/123";
@@ -388,21 +391,26 @@ describe("update report shared transport boundary", () => {
         (value) => value,
         (error: unknown) => error,
       );
-      await entered.promise;
-      current = false;
-      released.resolve();
-      const result = await observed;
-      if (change === "authority") {
-        expect(result).toBeInstanceOf(Error);
-      } else {
-        expect(result).toMatchObject({ status: "stale" });
+      try {
+        await entered.promise;
+        current = false;
+        released.resolve();
+        const result = await observed;
+        if (change === "authority") {
+          expect(result).toBeInstanceOf(Error);
+        } else {
+          expect(result).toMatchObject({ status: "stale" });
+        }
+        expect(fixture.runGh).toHaveBeenCalledOnce();
+        expect(fixture.createCalls).toHaveLength(0);
+        expect(await fixture.receipt()).toBeNull();
+        await expect(fs.stat(`${fixture.stateDir}/update-reports`)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      } finally {
+        released.resolve();
+        await observed;
       }
-      expect(fixture.runGh).toHaveBeenCalledOnce();
-      expect(fixture.createCalls).toHaveLength(0);
-      expect(await fixture.receipt()).toBeNull();
-      await expect(fs.stat(`${fixture.stateDir}/update-reports`)).rejects.toMatchObject({
-        code: "ENOENT",
-      });
     },
   );
 

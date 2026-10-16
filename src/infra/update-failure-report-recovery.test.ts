@@ -18,9 +18,10 @@ import {
   readUpdateFailureReportReceipt,
   reserveUpdateFailureReportReceipt,
 } from "./restart-sentinel.js";
-import { prepareUpdateFailureReport, submitUpdateFailureReport } from "./update-failure-report.js";
+import { prepareUpdateFailureReport } from "./update-failure-report.js";
 import {
   createUpdateFailureReportFixture,
+  submitUpdateFailureReportFixture as submitUpdateFailureReport,
   expireUpdateFailureReportReceipt,
   savedReportArtifactPath,
   mockCreatedIssue,
