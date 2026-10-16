@@ -129,25 +129,17 @@ describe("Telegram polling lease", () => {
     first.release();
   });
 
-  it("releases an aborted same-account lease after the stop wait elapses", async () => {
-    vi.useFakeTimers();
+  it.each([0, 10])("releases an aborted same-account lease after %i ms", async (waitMs) => {
+    if (waitMs > 0) {
+      vi.useFakeTimers();
+    }
     const { abort, first } = await initialLease();
     abort.abort();
-
-    const release = releaseStopped(10);
-    await vi.advanceTimersByTimeAsync(10);
+    const release = releaseStopped(waitMs);
+    if (waitMs > 0) {
+      await vi.advanceTimersByTimeAsync(waitMs);
+    }
     await expect(release).resolves.toBe(true);
-
-    const next = await acquire();
-    next.release();
-    first.release();
-  });
-
-  it("releases an aborted same-account lease immediately with no stop wait", async () => {
-    const { abort, first } = await initialLease();
-    abort.abort();
-
-    await expect(releaseStopped(0)).resolves.toBe(true);
     const next = await acquire();
     next.release();
     first.release();
