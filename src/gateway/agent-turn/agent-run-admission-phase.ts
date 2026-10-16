@@ -527,6 +527,7 @@ export async function prepareAgentRunDispatch(
       getAbortStopReason: () => activeRunAbort.entry?.abortStopReason ?? "rpc",
       deferTimeoutCompletion: activeRunAbort.deferTimeoutCompletion,
       admittedSessionId: params.getAdmittedSessionId(),
+      freshChildStorePath: params.freshChild ? lifecycleStorePath : undefined,
       resolvedThreadId,
     });
     if (userTurn.recorder) {

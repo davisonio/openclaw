@@ -74,7 +74,7 @@ import type {
   ChatTaskSuggestionTrayProps,
   TaskSuggestionStartMode,
 } from "./components/chat-task-suggestions.tsx";
-import type { ChatTranscriptController } from "./components/chat-transcript-controller.ts";
+import type { ChatTranscript } from "./components/chat-transcript-controller.ts";
 import type { ChatMessageCache } from "./session-message-cache.ts";
 import type { SessionSnapshotStore } from "./session-snapshot-store.ts";
 
@@ -130,7 +130,7 @@ export interface TestChatPane extends HTMLElement, PaneTestLifecycle {
   readonly updateComplete: Promise<boolean>;
   readonly element: HTMLElement;
   render: ChatPaneRuntime["render"];
-  readonly transcript: ChatTranscriptController;
+  readonly transcript: ChatTranscript;
   catalogMessages: unknown[];
   active: boolean;
   presented: boolean;

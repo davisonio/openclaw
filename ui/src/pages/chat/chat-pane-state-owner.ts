@@ -66,7 +66,7 @@ import { getChatComposerState } from "./components/chat-composer-state.ts";
 import type { ChatPaneHeaderAction } from "./components/chat-pane-header.ts";
 import type { ChatSessionSharingState } from "./components/chat-session-sharing.ts";
 import { getTranscriptState } from "./components/chat-thread-interactions.ts";
-import { ChatTranscriptController } from "./components/chat-transcript-controller.ts";
+import { createChatTranscript } from "./components/chat-transcript-controller.ts";
 import type { SessionDiscussionPanelConfig } from "./components/session-discussion-panel.tsx";
 import { canAutoFollowChat, handleChatScrollTakeover } from "./scroll.ts";
 import type { ChatMessageCache } from "./session-message-cache.ts";
@@ -119,7 +119,7 @@ export abstract class ChatPaneStateOwner {
       this.element.closest("openclaw-app-shell") ?? this.element.parentElement;
     document.addEventListener("visibilitychange", this.handleVisibilityChange);
     this.isConnected = true;
-    this.transcript.hostConnected();
+    this.transcript.start();
     this.refreshBoardSubscriptions();
     this.chatState.addCleanup(
       chatInputOwnerForContext(this.context).subscribe(() => this.activeChanged(this.active)),
@@ -155,7 +155,7 @@ export abstract class ChatPaneStateOwner {
     document.removeEventListener("visibilitychange", this.handleVisibilityChange);
     this.chatState.dispose();
     this.isConnected = false;
-    this.transcript.hostDisconnected();
+    this.transcript.dispose();
     this.stopBoardSubscriptions?.();
     this.stopBoardSubscriptions = undefined;
     this.subscribedBoardProvider = undefined;
@@ -368,13 +368,8 @@ export abstract class ChatPaneStateOwner {
     return this.chatState.projectRunActivity(this.state);
   }
   protected readonly composerCapabilities = new ChatComposerCapabilityHost(() => this.invalidate());
-  protected readonly transcript = new ChatTranscriptController(
-    {
-      addController: () => {},
-      removeController: () => {},
-      requestUpdate: () => this.invalidate(),
-      updateComplete: Promise.resolve(true),
-    },
+  protected readonly transcript = createChatTranscript(
+    () => this.invalidate(),
     () => this.paneId,
     {
       geometryEventTarget: this.element,
