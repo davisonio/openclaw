@@ -229,9 +229,9 @@ async function prepareBackupOutputParent(outputPath: string): Promise<void> {
 }
 
 // Keep staged config and database snapshots outside the tree being archived.
-async function chooseBackupTempRoot(params: {
+export async function chooseBackupTempRoot(params: {
   assets: readonly BackupAsset[];
-  outputPath: string;
+  outputPath?: string;
 }): Promise<string> {
   const systemTmp = os.tmpdir();
   const canonicalSystemTmp = await canonicalizePathForContainment(systemTmp);
@@ -246,7 +246,15 @@ async function chooseBackupTempRoot(params: {
   // output-containment check guarantees `outputPath` is outside every asset,
   // so its parent is too. The caller must already have write access there to
   // write the archive itself, so this stays within the existing sandbox.
-  const fallback = path.dirname(params.outputPath);
+  // Without an output path (offsite uploads stage into scratch), fall back to
+  // the parent of the source that contains the system temp dir, e.g. when the
+  // Gateway runs jobs with TMPDIR=~/.openclaw/tmp.
+  const overlapping = params.assets.find((asset) =>
+    isPathInside(asset.sourcePath, canonicalSystemTmp),
+  );
+  const fallback = params.outputPath
+    ? path.dirname(params.outputPath)
+    : path.dirname(overlapping!.sourcePath);
   const canonicalFallback = await canonicalizePathForContainment(fallback);
   const fallbackInsideAsset = params.assets.find((asset) =>
     isPathInside(asset.sourcePath, canonicalFallback),
@@ -506,7 +514,14 @@ async function createBackupArchiveInScope(
         skippedStateSourcePaths.add(skippedSourcePath);
       }
     }
+    const clientDirectories = new Set(
+      inventory.coreDatabases
+        .filter((database) => database.role === "client" && database.identity)
+        .map((database) => path.dirname(database.sourcePath)),
+    );
+    // Emit private client directories before snapshots create implicit tar parents.
     const requiredSourcePaths = new Set([
+      ...clientDirectories,
       ...sourcePathRemaps.keys(),
       ...result.assets.map((asset) => asset.sourcePath),
     ]);
@@ -566,6 +581,7 @@ async function createBackupArchiveInScope(
       tempArchivePath,
       log: opts.log,
       runTar: async (attemptTempArchivePath) => {
+        const visitedClientDirectories = new Set<string>();
         // Keep vanished paths across retries unless a later attempt archives them.
         for (const [sourcePath, reason] of skippedEntries) {
           if (reason === "volatile") {
@@ -583,6 +599,12 @@ async function createBackupArchiveInScope(
                 signal,
                 paths: [...requiredSourcePaths],
                 skip: (sourcePath) => {
+                  if (clientDirectories.has(sourcePath)) {
+                    if (visitedClientDirectories.has(sourcePath)) {
+                      return true;
+                    }
+                    visitedClientDirectories.add(sourcePath);
+                  }
                   if (!requiredSourcePaths.has(sourcePath) && inventory.isVolatile(sourcePath)) {
                     skippedEntries.set(sourcePath, "volatile");
                     return true;

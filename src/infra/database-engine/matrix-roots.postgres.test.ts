@@ -118,21 +118,30 @@ describe.skipIf(!connection)("Matrix declared account-root database portability"
           ).run(`chunk-${index}`, cryptoValue);
         }
         await closeOpenClawStateDatabaseAsync();
-        const migration = await runPluginDoctorStateMigrationPlans({
+        const retainedEntries = files.map(sqliteEntries);
+        await expect(doctorDatabasePort({ to: "postgres", dryRun: true })).rejects.toThrow(
+          "Run openclaw doctor --fix first, then retry port. If a named plugin is disabled, enable it for repair.",
+        );
+        // Complete Doctor's retained-root scan before porting, then keep testing a disabled plugin.
+        const repairConfig: OpenClawConfig = {
+          ...config,
+          plugins: { entries: { matrix: { enabled: true } } },
+        };
+        await state.writeConfig(repairConfig);
+        const repaired = await runPluginDoctorStateMigrationPlans({
           detected: {
             stateDir: state.stateDir,
-            oauthDir: state.statePath("oauth"),
+            oauthDir: state.statePath("credentials"),
             doctorOnlyStateMigrations: true,
           },
-          config: {
-            ...config,
-            plugins: { allow: ["matrix"], entries: { matrix: { enabled: true } } },
-          },
+          config: repairConfig,
           env: state.env,
         });
-        expect(migration.warnings).toEqual([]);
-        expect(migration.completedPluginIds).toContain("matrix");
+        expect(repaired.warnings).toEqual([]);
+        expect(repaired.completedPluginIds).toContain("matrix");
         await closeOpenClawStateDatabaseAsync();
+        expect(files.map(sqliteEntries)).toEqual(retainedEntries);
+        await state.writeConfig(config);
         await run(state, files, config);
       } finally {
         vi.restoreAllMocks();
