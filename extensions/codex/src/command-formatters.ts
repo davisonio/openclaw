@@ -1,7 +1,12 @@
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { CodexComputerUseStatus } from "./app-server/computer-use.js";
 import type { CodexAppServerModelListResult } from "./app-server/models.js";
-import { isJsonObject, type JsonValue } from "./app-server/protocol.js";
+import {
+  isJsonObject,
+  type CodexThread,
+  type CodexThreadListResponse,
+  type JsonValue,
+} from "./app-server/protocol.js";
 import {
   hasCodexRateLimitSnapshots,
   summarizeCodexAccountRateLimits,
@@ -50,7 +55,7 @@ export function formatModels(result: CodexAppServerModelListResult): string {
   ].join("\n");
 }
 
-export function formatThreads(response: JsonValue | undefined): string {
+export function formatThreads(response: CodexThreadListResponse | JsonValue | undefined): string {
   const threads = extractArray(response);
   if (threads.length === 0) {
     return "No Codex threads returned.";
@@ -415,7 +420,13 @@ function isMeaningfulRateLimitSnapshot(value: JsonValue | undefined): boolean {
   });
 }
 
-function extractArray(value: JsonValue | undefined): JsonValue[] {
+function extractArray(value: JsonValue | undefined): JsonValue[];
+function extractArray(
+  value: CodexThreadListResponse | JsonValue | undefined,
+): (CodexThread | JsonValue)[];
+function extractArray(
+  value: CodexThreadListResponse | JsonValue | undefined,
+): (CodexThread | JsonValue)[] {
   if (Array.isArray(value)) {
     return value;
   }
