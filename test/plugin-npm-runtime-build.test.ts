@@ -27,6 +27,7 @@ import { defineBundledChannelSetupEntry } from "../src/plugin-sdk/channel-entry-
 import { createCommandTest } from "./helpers/command-fixture.js";
 import { writePublicRuntimeSurfacePluginFixture } from "./helpers/publishable-plugin-fixture.js";
 import { useAutoCleanupTempDirTracker } from "./helpers/temp-dir.js";
+import { writeJsonFile } from "./helpers/temp-repo.js";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -64,7 +65,7 @@ function copyPluginBuildFixture(plugin: string) {
   }
   const tsconfig = path.join(source, "tsconfig.json");
   if (existsSync(tsconfig)) {
-    writeFileSync(path.join(packageDir, "tsconfig.json"), JSON.stringify({ extends: tsconfig }));
+    writeJsonFile(path.join(packageDir, "tsconfig.json"), { extends: tsconfig });
   }
   return packageDir;
 }
@@ -75,16 +76,13 @@ describe("plugin npm runtime build planning", () => {
     const packageDir = path.join(fixtureRoot, "extensions", "team-reports");
     const sourceDir = path.join(packageDir, "src");
     mkdirSync(sourceDir, { recursive: true });
-    writeFileSync(path.join(fixtureRoot, "package.json"), JSON.stringify({ exports: {} }));
-    writeFileSync(
-      path.join(packageDir, "package.json"),
-      JSON.stringify({
-        name: "@openclaw/team-reports",
-        version: "1.0.0",
-        type: "module",
-        openclaw: { extensions: ["./index.ts"] },
-      }),
-    );
+    writeJsonFile(path.join(fixtureRoot, "package.json"), { exports: {} });
+    writeJsonFile(path.join(packageDir, "package.json"), {
+      name: "@openclaw/team-reports",
+      version: "1.0.0",
+      type: "module",
+      openclaw: { extensions: ["./index.ts"] },
+    });
     writeFileSync(
       path.join(packageDir, "index.ts"),
       'export { TEAM_REPORTS_POSTGRES_SCHEMA_SQL } from "./src/store-postgres-schema.js";',
@@ -109,28 +107,21 @@ describe("plugin npm runtime build planning", () => {
     const channelsDir = path.join(frozenRoot, "src", "channels");
     mkdirSync(packageDir, { recursive: true });
     mkdirSync(channelsDir, { recursive: true });
-    writeFileSync(
-      path.join(frozenRoot, "package.json"),
-      JSON.stringify({
-        name: "openclaw",
-        version: "1.0.0",
-        exports: {
-          "./plugin-sdk/channel-mention-gating": "./dist/plugin-sdk/channel-mention-gating.js",
-          "./plugin-sdk/runtime-doctor-migrations":
-            "./dist/plugin-sdk/runtime-doctor-migrations.js",
-        },
-      }),
-    );
-    writeFileSync(
-      path.join(packageDir, "package.json"),
-      JSON.stringify({
-        name: "@openclaw/frozen-fixture",
-        version: "1.0.0",
-        type: "module",
-        openclaw: { extensions: ["./index.ts"] },
-        peerDependencies: { openclaw: "*" },
-      }),
-    );
+    writeJsonFile(path.join(frozenRoot, "package.json"), {
+      name: "openclaw",
+      version: "1.0.0",
+      exports: {
+        "./plugin-sdk/channel-mention-gating": "./dist/plugin-sdk/channel-mention-gating.js",
+        "./plugin-sdk/runtime-doctor-migrations": "./dist/plugin-sdk/runtime-doctor-migrations.js",
+      },
+    });
+    writeJsonFile(path.join(packageDir, "package.json"), {
+      name: "@openclaw/frozen-fixture",
+      version: "1.0.0",
+      type: "module",
+      openclaw: { extensions: ["./index.ts"] },
+      peerDependencies: { openclaw: "*" },
+    });
     writeFileSync(
       path.join(packageDir, "index.ts"),
       [
@@ -163,18 +154,12 @@ describe("plugin npm runtime build planning", () => {
     ([runtimeFormat, packageName], { command }) =>
       command.lifetime.run(async () => {
         const packageDir = command.createTempDir("openclaw-plugin-runtime-old-host-");
-        writeFileSync(
-          path.join(packageDir, "package.json"),
-          JSON.stringify({
-            name: packageName,
-            version: "1.0.0",
-            type: "module",
-            openclaw: {
-              extensions: ["./index.ts"],
-              build: { runtimeFormat },
-            },
-          }),
-        );
+        writeJsonFile(path.join(packageDir, "package.json"), {
+          name: packageName,
+          version: "1.0.0",
+          type: "module",
+          openclaw: { extensions: ["./index.ts"], build: { runtimeFormat } },
+        });
         writeFileSync(
           path.join(packageDir, "index.ts"),
           [
@@ -194,15 +179,12 @@ describe("plugin npm runtime build planning", () => {
           "channel-outbound": "createPreviewMessageReceipt",
           "error-runtime": "formatErrorMessage",
         };
-        writeFileSync(
-          path.join(hostDir, "package.json"),
-          JSON.stringify({
-            name: "openclaw",
-            exports: Object.fromEntries(
-              Object.keys(hostBindings).map((name) => [`./plugin-sdk/${name}`, `./${name}.cjs`]),
-            ),
-          }),
-        );
+        writeJsonFile(path.join(hostDir, "package.json"), {
+          name: "openclaw",
+          exports: Object.fromEntries(
+            Object.keys(hostBindings).map((name) => [`./plugin-sdk/${name}`, `./${name}.cjs`]),
+          ),
+        });
         for (const [name, binding] of Object.entries(hostBindings)) {
           writeFileSync(path.join(hostDir, `${name}.cjs`), `exports.${binding} = () => 31337;\n`);
         }
@@ -317,30 +299,24 @@ describe("plugin npm runtime build planning", () => {
 
   it("packages declared theme definitions and artwork outside conventional asset paths", () => {
     const packageDir = tempDirs.make("openclaw-plugin-theme-package-");
-    writeFileSync(
-      path.join(packageDir, "package.json"),
-      JSON.stringify({
-        name: "theme-fixture",
-        version: "1.0.0",
-        openclaw: { extensions: ["./index.ts"] },
-      }),
-    );
-    writeFileSync(
-      path.join(packageDir, "openclaw.plugin.json"),
-      JSON.stringify({
-        id: "theme-fixture",
-        themes: [
-          {
-            id: "workshop",
-            name: "Workshop",
-            description: "Workshop colors",
-            source: "palettes/workshop.json",
-            hats: { beret: "art/beret.svg" },
-            critters: { ferris: { source: "visitors/ferris.svg", crossMs: 9000 } },
-          },
-        ],
-      }),
-    );
+    writeJsonFile(path.join(packageDir, "package.json"), {
+      name: "theme-fixture",
+      version: "1.0.0",
+      openclaw: { extensions: ["./index.ts"] },
+    });
+    writeJsonFile(path.join(packageDir, "openclaw.plugin.json"), {
+      id: "theme-fixture",
+      themes: [
+        {
+          id: "workshop",
+          name: "Workshop",
+          description: "Workshop colors",
+          source: "palettes/workshop.json",
+          hats: { beret: "art/beret.svg" },
+          critters: { ferris: { source: "visitors/ferris.svg", crossMs: 9000 } },
+        },
+      ],
+    });
     const plan = expectPluginNpmRuntimeBuildPlan(
       resolvePluginNpmRuntimeBuildPlan({ repoRoot, packageDir }),
     );
@@ -365,14 +341,11 @@ describe("plugin npm runtime build planning", () => {
       if (scenario === "malformed-manifest") {
         writeFileSync(manifestPath, "{");
       } else if (scenario === "no-extensions" || scenario === "javascript-only") {
-        writeFileSync(
-          manifestPath,
-          JSON.stringify({
-            name: "input-fixture",
-            version: "1.0.0",
-            ...(scenario === "javascript-only" ? { openclaw: { extensions: ["./index.js"] } } : {}),
-          }),
-        );
+        writeJsonFile(manifestPath, {
+          name: "input-fixture",
+          version: "1.0.0",
+          ...(scenario === "javascript-only" ? { openclaw: { extensions: ["./index.js"] } } : {}),
+        });
         writeFileSync(path.join(packageDir, "index.js"), "export default {};\n");
       }
 
@@ -394,21 +367,18 @@ describe("plugin npm runtime build planning", () => {
     async (id) => {
       const packageDir = path.join(tempDirs.make("openclaw-qa-gateway-package-"), id);
       mkdirSync(packageDir);
-      writeFileSync(
-        path.join(packageDir, "package.json"),
-        JSON.stringify({
-          name: `@openclaw/${id}`,
-          private: true,
-          version: "2026.9.5",
-          type: "module",
-          dependencies: id === "qa-channel" ? { typebox: "1.3.32", zod: "4.6.5" } : {},
-          openclaw: {
-            extensions: ["./index.ts"],
-            build: { workerEntries: ["./tooling.worker.ts"] },
-          },
-        }),
-      );
-      writeFileSync(path.join(packageDir, "openclaw.plugin.json"), JSON.stringify({ id }));
+      writeJsonFile(path.join(packageDir, "package.json"), {
+        name: `@openclaw/${id}`,
+        private: true,
+        version: "2026.9.5",
+        type: "module",
+        dependencies: id === "qa-channel" ? { typebox: "1.3.32", zod: "4.6.5" } : {},
+        openclaw: {
+          extensions: ["./index.ts"],
+          build: { workerEntries: ["./tooling.worker.ts"] },
+        },
+      });
+      writeJsonFile(path.join(packageDir, "openclaw.plugin.json"), { id });
       for (const file of ["tooling-api.ts", "tooling.worker.ts"]) {
         writeFileSync(path.join(packageDir, file), 'import "private-qa-tooling-not-installed";\n');
       }
@@ -455,19 +425,16 @@ describe("plugin npm runtime build planning", () => {
   it("builds a private worker without registering it as a plugin entry", async () => {
     const packageDir = tempDirs.make("openclaw-plugin-runtime-worker-");
     mkdirSync(path.join(packageDir, "src"));
-    writeFileSync(
-      path.join(packageDir, "package.json"),
-      JSON.stringify({
-        name: "@openclaw/worker-fixture",
-        version: "1.0.0",
-        type: "module",
-        openclaw: {
-          extensions: ["./index.ts"],
-          compat: { pluginApi: "1.0.0" },
-          build: { workerEntries: ["./src/store.worker.ts"] },
-        },
-      }),
-    );
+    writeJsonFile(path.join(packageDir, "package.json"), {
+      name: "@openclaw/worker-fixture",
+      version: "1.0.0",
+      type: "module",
+      openclaw: {
+        extensions: ["./index.ts"],
+        compat: { pluginApi: "1.0.0" },
+        build: { workerEntries: ["./src/store.worker.ts"] },
+      },
+    });
     writeFileSync(
       path.join(packageDir, "index.ts"),
       `import { resolveRuntimeWorkerUrl } from ${JSON.stringify(path.join(repoRoot, "src/infra/runtime-worker-url.ts").replaceAll("\\", "/"))};
@@ -509,15 +476,12 @@ describe("plugin npm runtime build planning", () => {
   it.each(["src/index.tsx"])("builds an executable %s package entry", async (entry) => {
     const packageDir = tempDirs.make("openclaw-plugin-runtime-tsx-");
     mkdirSync(path.dirname(path.join(packageDir, entry)), { recursive: true });
-    writeFileSync(
-      path.join(packageDir, "package.json"),
-      JSON.stringify({
-        name: "@openclaw/tsx-fixture",
-        version: "1.0.0",
-        type: "module",
-        openclaw: { extensions: [`./${entry}`], compat: { pluginApi: "1.0.0" } },
-      }),
-    );
+    writeJsonFile(path.join(packageDir, "package.json"), {
+      name: "@openclaw/tsx-fixture",
+      version: "1.0.0",
+      type: "module",
+      openclaw: { extensions: [`./${entry}`], compat: { pluginApi: "1.0.0" } },
+    });
     writeFileSync(
       path.join(packageDir, entry),
       'const id: string = "tsx-fixture"; export default { id };\n',
@@ -534,22 +498,16 @@ describe("plugin npm runtime build planning", () => {
     const syntheticRepoRoot = tempDirs.make("openclaw-plugin-runtime-output-root-");
     const packageDir = path.join(syntheticRepoRoot, "extensions", "demo");
     mkdirSync(packageDir, { recursive: true });
-    writeFileSync(
-      path.join(syntheticRepoRoot, "package.json"),
-      JSON.stringify({ version: "1.0.0" }),
-    );
-    writeFileSync(
-      path.join(packageDir, "package.json"),
-      JSON.stringify({
-        name: "@openclaw/demo",
-        version: "1.0.0",
-        openclaw: {
-          compat: { pluginApi: "1.0.0" },
-          extensions: ["./index.ts"],
-          release: { publishToNpm: true },
-        },
-      }),
-    );
+    writeJsonFile(path.join(syntheticRepoRoot, "package.json"), { version: "1.0.0" });
+    writeJsonFile(path.join(packageDir, "package.json"), {
+      name: "@openclaw/demo",
+      version: "1.0.0",
+      openclaw: {
+        compat: { pluginApi: "1.0.0" },
+        extensions: ["./index.ts"],
+        release: { publishToNpm: true },
+      },
+    });
     writeFileSync(path.join(packageDir, "index.ts"), "export default {};\n");
     const targetDir = path.join(syntheticRepoRoot, "live-gateway-dist");
     mkdirSync(targetDir);
@@ -557,11 +515,7 @@ describe("plugin npm runtime build planning", () => {
     symlinkSync(targetDir, path.join(packageDir, "dist"), "dir");
 
     await expect(
-      buildPluginNpmRuntime({
-        repoRoot: syntheticRepoRoot,
-        packageDir,
-        logLevel: "silent",
-      }),
+      buildPluginNpmRuntime({ repoRoot: syntheticRepoRoot, packageDir, logLevel: "silent" }),
     ).rejects.toThrow(/symbolic link/u);
     expect(readFileSync(path.join(targetDir, "sentinel.js"), "utf8")).toBe("keep\n");
     expect(readlinkSync(path.join(packageDir, "dist"))).toBe(targetDir);
@@ -572,10 +526,7 @@ describe("plugin npm runtime build planning", () => {
     expect(packageDirs.length).toBeGreaterThan(0);
 
     const plans = packageDirs.map((packageDir) =>
-      resolvePluginNpmRuntimeBuildPlan({
-        repoRoot,
-        packageDir,
-      }),
+      resolvePluginNpmRuntimeBuildPlan({ repoRoot, packageDir }),
     );
     const resolvedPlans = plans.map(expectPluginNpmRuntimeBuildPlan);
     expect(resolvedPlans.map((plan) => plan.pluginDir)).toEqual(
