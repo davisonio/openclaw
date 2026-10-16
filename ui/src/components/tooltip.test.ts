@@ -538,6 +538,24 @@ describe("title tooltips", () => {
     vi.useRealTimers();
   });
 
+  it("names an icon-only trigger without reading layout during discovery", () => {
+    const trigger = document.createElement("button");
+    trigger.title = "Open settings";
+    trigger.innerHTML = '<svg aria-hidden="true"><path d="M0 0h10v10z" /></svg>';
+    document.body.append(trigger);
+    const readStyle = vi.spyOn(window, "getComputedStyle");
+
+    dispatchMousePointer(trigger, "pointerover");
+
+    expect(trigger.title).toBe("");
+    expect(trigger.getAttribute("aria-label")).toBe("Open settings");
+    expect(readStyle).not.toHaveBeenCalled();
+    readStyle.mockRestore();
+    dispatchMousePointer(trigger, "pointerleave");
+    expect(trigger.title).toBe("Open settings");
+    expect(trigger.hasAttribute("aria-label")).toBe(false);
+  });
+
   it("suppresses a redundant title through open shadow DOM until true pointer leave", () => {
     const host = document.createElement("div");
     const shadowRoot = host.attachShadow({ mode: "open" });

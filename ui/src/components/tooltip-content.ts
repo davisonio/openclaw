@@ -17,10 +17,15 @@ function isElementNode(node: Node): node is Element {
 }
 
 function collectTooltipText(element: Element, checkOpacity: boolean, root = true): string {
-  const style = element.ownerDocument.defaultView?.getComputedStyle(element);
   if (
     element.hasAttribute("hidden") ||
     (!checkOpacity && element.getAttribute("aria-hidden") === "true") ||
+    !element.textContent?.trim()
+  ) {
+    return "";
+  }
+  const style = element.ownerDocument.defaultView?.getComputedStyle(element);
+  if (
     (checkOpacity && !root && style?.opacity === "0") ||
     style?.display === "none" ||
     style?.contentVisibility === "hidden"

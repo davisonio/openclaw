@@ -289,9 +289,15 @@ export function resetTranscriptSession(paneId: string, owner?: ParentNode): void
   owner?.querySelectorAll<HTMLElement>(".chat-thread").forEach(releaseMarkdownTables);
   const state = transcriptStates.get(paneId);
   if (state) {
-    state.asyncQuestionDrafts = new Map();
-    // Parked rows must commit fresh bindings on return even when visible props match.
-    state.transcriptRenderDependencies = [];
+    // Question actions capture the retired draft map; ordinary retained rows keep their bindings.
+    if (
+      state.asyncQuestionDrafts.size > 0 ||
+      (state.asyncQuestionPresentation?.pending.length ?? 0) > 0 ||
+      (state.asyncQuestionPresentation?.archived.size ?? 0) > 0
+    ) {
+      state.asyncQuestionDrafts = new Map();
+      state.transcriptRenderDependencies = [];
+    }
     // Search input belongs to the outgoing transcript; pane preferences survive.
     Object.assign(state, transcriptSearchDefaults);
   }

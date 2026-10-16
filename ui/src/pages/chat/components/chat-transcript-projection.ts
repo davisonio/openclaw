@@ -444,7 +444,11 @@ export function projectChatTranscript(props: ChatThreadProps, transcript: ChatTr
   };
   const renderItem = guardChatRenderItems(
     state,
-    (item) => [liveStatusSignature(item), ...transcriptReplyDependencies(item, loadedReplySources)],
+    (item) => [
+      liveStatusSignature(item),
+      ...transcriptReplyDependencies(item, loadedReplySources),
+      item.kind === "notice" ? props.onRetryRun : undefined,
+    ],
     (item) => {
       if (item.kind === "group") {
         return { kind: "group", group: item, options: renderGroupOptions(item) };
@@ -599,7 +603,6 @@ export function projectChatTranscript(props: ChatThreadProps, transcript: ChatTr
     Boolean(props.runFinalizing),
     props.startupLabel,
     props.retryAt,
-    props.onRetryRun,
     props.failureActionsRunId,
     Boolean(props.waitingApproval),
     props.questionPrompts,

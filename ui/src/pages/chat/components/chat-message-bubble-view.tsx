@@ -9,6 +9,7 @@ import {
   Switch,
   onCleanup,
   type Accessor,
+  useContext,
   untrack,
 } from "solid-js";
 import { readNodePermissionRequest } from "../../../../../packages/gateway-protocol/src/node-permissions.js";
@@ -18,9 +19,9 @@ import { registerChatMessageMetadataEnglish } from "../../../i18n/locales/en-cha
 import type { ToolCard } from "../../../lib/chat/chat-types.ts";
 import { resolveMessageDisplayMarkdown } from "../../../lib/chat/message-display.ts";
 import { registerEnglishCatalog, t } from "../../../lib/reactive/i18n.ts";
+import { ContentPresentation } from "../../../lib/solid/presentation.ts";
 import { PluginSurface } from "../../../plugins/control-ui-view.solid.tsx";
 import { assistantMessageIsInterrupted } from "../chat-assistant-reply.ts";
-import { usePanePresentation } from "../chat-pane-presentation.ts";
 import { AsyncQuestionSummary } from "./chat-async-question-summary.tsx";
 import "../../../components/person-reference.ts";
 import { ChatBubbleActivity } from "./chat-bubble-activity-view.tsx";
@@ -373,7 +374,7 @@ function MessageAvatar(props: { render?: () => JSX.Element }) {
 }
 
 function VideoPreview(props: ContentProps & { item: Accessor<AttachmentItem | undefined> }) {
-  const presented = usePanePresentation(() => props.options.transcriptVisible ?? true);
+  const presented = useContext(ContentPresentation);
   return (
     <div class="chat-image-frame chat-video-preview">
       <Show when={props.item()}>

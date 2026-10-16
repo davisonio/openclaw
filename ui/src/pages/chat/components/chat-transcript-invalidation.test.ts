@@ -25,9 +25,14 @@ import {
   renderChatThread,
   renderTranscriptSearch,
 } from "../test-helpers/chat-transcript-native.tsx";
+import { createAsyncQuestionPresentation } from "./chat-async-question.ts";
 import * as chatMessage from "./chat-message-group-frame.ts";
 import { releaseChatMediaResourceSubscriber } from "./chat-message-media.ts";
-import { resetTranscriptSession, toggleTranscriptSearch } from "./chat-thread-interactions.ts";
+import {
+  getTranscriptState,
+  resetTranscriptSession,
+  toggleTranscriptSearch,
+} from "./chat-thread-interactions.ts";
 import { settleToolBridges } from "./chat-tool-render.test-support.ts";
 import { projectChatTranscript } from "./chat-transcript-projection.ts";
 import {
@@ -515,6 +520,123 @@ describe("chat transcript invalidation", () => {
     expect(buildSpy).toHaveBeenCalledTimes(2);
     expect(restoredItemsA).toBe(itemsA);
     expect(restoredItemsA.every((item, index) => item === itemsA[index])).toBe(true);
+  });
+
+  it("retains settled rows on reveal while rebinding the failed-run retry action", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(60_000);
+    const props = threadProps("pane-retained-retry", "agent:main:retained-retry", [
+      { role: "assistant", content: "A **settled** reply", timestamp: 1_000 },
+      {
+        role: "custom",
+        content: "Failed reply",
+        timestamp: 2_000,
+        openclawRunError: { runId: "failed-run", summary: "Failed reply" },
+      },
+    ]);
+    const owner = new EventTarget();
+    let visible = true;
+    props.presented = props.transcriptVisible = { owner, isPresented: () => visible };
+    props.failureActionsRunId = "failed-run";
+    const previousRetry = vi.fn();
+    props.onRetryRun = previousRetry;
+    const transcript = createTestTranscript();
+    const container = document.body.appendChild(document.createElement("div"));
+    const rerender = () => {
+      render(renderChatThread(props, transcript), container);
+      transcript.hostUpdated();
+    };
+    const prepareFrame = vi.spyOn(chatMessage, "prepareMessageGroupFrame");
+    try {
+      rerender();
+      transcript.hostConnected();
+      await container.querySelector("openclaw-chat-run-failure-notice")?.updateComplete;
+      expect(container.querySelector("strong")?.textContent).toBe("settled");
+      expect(prepareFrame).toHaveBeenCalled();
+      const settledRow = container.querySelector(".chat-group");
+      prepareFrame.mockClear();
+
+      visible = false;
+      owner.dispatchEvent(new Event(PRESENTATION_CHANGED_EVENT));
+      resetTranscriptSession(props.paneId, container);
+      flush();
+      const currentRetry = vi.fn();
+      props.onRetryRun = currentRetry;
+      visible = true;
+      owner.dispatchEvent(new Event(PRESENTATION_CHANGED_EVENT));
+      rerender();
+
+      expect(prepareFrame).not.toHaveBeenCalled();
+      expect(container.querySelector(".chat-group")).toBe(settledRow);
+      const failure = container.querySelector("openclaw-chat-run-failure-notice");
+      await failure?.updateComplete;
+      const retry = [...(failure?.querySelectorAll("button") ?? [])].find((button) =>
+        button.textContent?.includes("Try again"),
+      );
+      expectDefined(retry, "retry failed run").click();
+      expect(currentRetry).toHaveBeenCalledExactlyOnceWith("failed-run");
+      expect(previousRetry).not.toHaveBeenCalled();
+    } finally {
+      transcript.hostDisconnected();
+    }
+  });
+
+  it("rebinds an archived question's Answer action after retained presentation resets", () => {
+    const questionId = "archived-question";
+    const props = threadProps("pane-retained-question", "agent:main:retained-question", [
+      {
+        role: "assistant",
+        runId: "question-run",
+        phase: "final_answer",
+        content: "Which audience?",
+        openclawAsyncDelivery: {
+          itemId: questionId,
+          questions: [{ title: "Which audience?", options: ["Engineers", "Everyone"] }],
+        },
+      },
+      {
+        role: "assistant",
+        runId: "question-run",
+        phase: "final_answer",
+        stopReason: "stop",
+        content: "Completed the question turn",
+      },
+      {
+        role: "assistant",
+        runId: "later-run",
+        phase: "final_answer",
+        stopReason: "stop",
+        content: "Completed later work",
+      },
+    ]);
+    const state = getTranscriptState(props.paneId);
+    const transcript = createTestTranscript();
+    const container = document.body.appendChild(document.createElement("div"));
+    const rerender = () => {
+      props.asyncQuestions = createAsyncQuestionPresentation(state, {
+        ...props,
+        onAsyncQuestionSubmit: async () => true,
+      });
+      render(renderChatThread({ ...props }, transcript), container);
+      transcript.hostUpdated();
+    };
+    try {
+      rerender();
+      expect(props.asyncQuestions?.archived.has(questionId)).toBe(true);
+      expect(state.asyncQuestionDrafts.size).toBe(0);
+      resetTranscriptSession(props.paneId, container);
+      rerender();
+      const answer = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+        (button) => button.textContent?.trim() === "Answer",
+      );
+      expectDefined(answer, "archived question Answer action").click();
+      expect(state.asyncQuestionDrafts.has(questionId)).toBe(true);
+      rerender();
+      expect(props.asyncQuestions?.pending.map((question) => question.itemId)).toContain(
+        questionId,
+      );
+    } finally {
+      transcript.hostDisconnected();
+    }
   });
 
   it("keeps history cached during worker setup and clears its notice when placement becomes active", async () => {
