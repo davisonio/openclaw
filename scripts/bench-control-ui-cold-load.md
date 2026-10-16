@@ -58,6 +58,27 @@ in diagnostic traces distinguish transcript, sidebar, and composer cache
 completions; a completion callback can include later render microtasks and is
 not a measurement of native IndexedDB cost alone.
 
+`--interaction-latency` measures trusted native composer typing, transcript
+End/PageUp, session-menu opening, and pinned-session switches during a
+90-second reply stream at 30 cumulative deltas per second plus Team background
+events. It cannot be combined with `--live-events` or `--streaming-reply`.
+The selected conversation has one streamed reply and the operator's unsent draft;
+competing reply deltas and new user turns are excluded from its background mix.
+`run-N.interactions.json` records per-type input, processing, presentation, and
+total latency distributions, raw Event Timing entries, native input delays, and
+overlapping LoAF scripts. Event Timing omits durations below 16 ms and rounds to
+8 ms; paging measures keyboard-to-paint rather than smooth-scroll completion.
+LoAF overlap identifies candidate blockers, not exclusive causal attribution.
+The composer settles before live traffic starts. Each round returns to the reply
+with End and checks that it is in view before typing, then pages up to read it.
+Transcript focus happens before each paging checkpoint, outside the measured key.
+`pageUpResponses` records upward content movement at the two-animation-frame
+checkpoint, including no-motion outcomes. A quick paint alone does not establish
+that the transcript moved; this checkpoint does not measure scroll completion.
+Compare at least seven interleaved baseline/candidate pairs on one quiet machine,
+with the same bundle settings, Chromium, latency, and rig probes. Use `--untraced`
+for those comparisons and retain all interaction counts and tail results.
+
 `--live-events` adds 125 synthetic live frames over 20 seconds after each reload
 settles. The stream mixes full presence snapshots, session patches for displayed,
 held-but-hidden, and outside-window rows, open-session messages and assistant

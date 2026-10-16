@@ -19,6 +19,7 @@ import {
   prepareTeamScaleSidebarListChurn,
   type TeamScaleLiveEvent,
 } from "./control-ui-sidebar-list-fixture.ts";
+import { teamScaleWidgetHtml, type TeamScaleFixtureAsset } from "./control-ui-team-scale-assets.ts";
 
 const TEAM_SCALE_COUNTS = {
   sessions: 300,
@@ -42,7 +43,6 @@ export const TEAM_SCALE_SELF_INSTANCE_ID = "team-scale-self";
 type TeamScaleCatalogEvent = { event: "sessions.catalog.host"; payload: SessionsCatalogHostEvent };
 type TeamScaleEvent = TeamScaleCatalogEvent | { event: "presence"; payload: PresencePayload };
 
-type FixtureAsset = { body: string; contentType: string; status?: number; delayMs?: number };
 type TeamScaleSession = GatewaySessionRow & { updatedAt: number; sessionId: string };
 type FixtureOptions = {
   baseUrl?: string;
@@ -51,6 +51,7 @@ type FixtureOptions = {
   sandboxUrl?: string;
   sandboxPort?: number;
   liveRun?: boolean;
+  liveDurationMs?: number;
   sidebarListChurn?: boolean;
   sidebarLiveChurn?: boolean;
   duplicateBootReads?: boolean;
@@ -60,19 +61,12 @@ function personId(index: number) {
   return `team-person-${String(index + 1).padStart(3, "0")}`;
 }
 
-function widgetHtml(index: number) {
-  return `<!doctype html><html><head><meta charset="utf-8"><title>Team metric ${index + 1}</title>
-<style>:root{color-scheme:dark light;font-family:system-ui}body{margin:0;padding:20px}h2{font-size:18px}progress{width:100%}</style></head>
-<body><h2>Team metric ${index + 1}</h2><p>Synthetic completed work: ${60 + index}%</p>
-<progress value="${60 + index}" max="100"></progress><p>All fixture systems are available.</p></body></html>`;
-}
-
 /** One deterministic inventory shared by browser benchmarks and focused UI proofs. */
 export function createControlUiTeamScaleFixture(options: FixtureOptions = {}) {
   const counts = TEAM_SCALE_COUNTS;
   const now = options.now ?? Date.now();
   const baseUrl = options.baseUrl ?? "http://127.0.0.1:19626/";
-  const assets = new Map<string, FixtureAsset>();
+  const assets = new Map<string, TeamScaleFixtureAsset>();
   const agentNames = ["Harbor", "Forge", "Scout", "Atlas", "Cedar", "Beacon"];
   const agents: AgentsListResult = {
     defaultId: "main",
@@ -362,7 +356,7 @@ export function createControlUiTeamScaleFixture(options: FixtureOptions = {}) {
     };
   });
   const boardPath = `/__openclaw__/board/${encodeURIComponent(selectedSessionKey)}/team-overview/index.html`;
-  assets.set(boardPath, { contentType: "text/html", body: widgetHtml(0) });
+  assets.set(boardPath, { contentType: "text/html", body: teamScaleWidgetHtml(0) });
   const sandbox = { sandboxUrl: options.sandboxUrl, sandboxPort: options.sandboxPort };
   const board: BoardSnapshot = {
     sessionKey: selectedSessionKey,
@@ -392,6 +386,13 @@ export function createControlUiTeamScaleFixture(options: FixtureOptions = {}) {
     ...pinnedKeys.map((key) => `session:${key}`),
     ...plugins.map((plugin) => `plugin:${plugin.pluginId}/overview`),
   ];
+  const inFlightRun = {
+    runId: TEAM_SCALE_LIVE_RUN_ID,
+    text: "Synthetic streaming progress 0",
+    startedAt: now,
+    events: [],
+  };
+  const transcript = { messages: historyMessages, inFlightRun };
   const scenario: ControlUiMockGatewayScenario = {
     awaitInitialRoster: false,
     authMethod: "trusted-proxy",
@@ -411,16 +412,7 @@ export function createControlUiTeamScaleFixture(options: FixtureOptions = {}) {
         ]),
       ),
     },
-    ...(options.liveRun
-      ? {
-          inFlightRun: {
-            runId: TEAM_SCALE_LIVE_RUN_ID,
-            text: "Synthetic streaming progress 0",
-            startedAt: now,
-            events: [],
-          },
-        }
-      : {}),
+    sessionTranscripts: options.liveRun ? { [selectedSessionKey]: transcript } : undefined,
     featureMethods: [
       ...defaultControlUiFeatureMethods,
       "sessions.list",
@@ -487,7 +479,7 @@ export function createControlUiTeamScaleFixture(options: FixtureOptions = {}) {
       "canvas.document.view": {
         cases: Array.from({ length: counts.inlineWidgets }, (_, index) => ({
           match: { docId: `team-scale-chart-${index + 1}` },
-          response: { html: widgetHtml(index), ...sandbox },
+          response: { html: teamScaleWidgetHtml(index), ...sandbox },
         })),
       },
       "progressCard.get": {
@@ -505,7 +497,7 @@ export function createControlUiTeamScaleFixture(options: FixtureOptions = {}) {
       },
     },
   };
-  // 125 frames over 20 seconds: streaming is mixed with unrelated Team activity.
+  // By default, 125 frames over 20 seconds mix streaming with unrelated Team activity.
   const liveKinds = [
     ...Array<string>(5).fill("presence.offscreen"),
     ...Array<string>(2).fill("presence.visible"),
@@ -519,10 +511,11 @@ export function createControlUiTeamScaleFixture(options: FixtureOptions = {}) {
     ...Array<string>(2).fill("run-state.unrelated"),
   ];
   const livePresence = presenceEntries.map((entry) => Object.assign({}, entry));
-  const liveEvents: TeamScaleLiveEvent[] = Array.from({ length: 125 }, (_, index) => {
+  let messageSequence = counts.transcriptMessages;
+  const liveCount = Math.ceil((options.liveDurationMs ?? 20_000) / 160);
+  const liveEvents: TeamScaleLiveEvent[] = Array.from({ length: liveCount }, (_, index) => {
     const kind = liveKinds[index % liveKinds.length]!;
     const ts = now + (index + 1) * 160;
-    const runId = TEAM_SCALE_LIVE_RUN_ID;
     let event: string;
     let payload: unknown;
     let history: TeamScaleLiveEvent["history"];
@@ -568,19 +561,20 @@ export function createControlUiTeamScaleFixture(options: FixtureOptions = {}) {
       };
     } else if (kind === "session.message.open") {
       event = "session.message";
+      const messageSeq = ++messageSequence;
       const message = {
         role: "user",
         content: [{ type: "text", text: `Synthetic live checkpoint ${index + 1}` }],
         timestamp: ts,
-        __openclaw: { id: `team-scale-live-message-${index}` },
+        __openclaw: { id: `team-scale-live-message-${index}`, seq: messageSeq },
       };
       history = { message };
       payload = {
         sessionKey: selectedSessionKey,
-        clientRunId: runId,
+        clientRunId: TEAM_SCALE_LIVE_RUN_ID,
         messageId: `team-scale-live-message-${index}`,
-        messageSeq: counts.transcriptMessages + index + 1,
-        activeRunIds: [runId],
+        messageSeq,
+        activeRunIds: [TEAM_SCALE_LIVE_RUN_ID],
         hasActiveRun: true,
         message,
       };
@@ -589,7 +583,7 @@ export function createControlUiTeamScaleFixture(options: FixtureOptions = {}) {
       history = { text: `Synthetic streaming progress ${index + 1}` };
       payload = {
         sessionKey: selectedSessionKey,
-        runId,
+        runId: TEAM_SCALE_LIVE_RUN_ID,
         seq: index + 1,
         state: "delta",
         message: {
@@ -696,19 +690,7 @@ export function createControlUiTeamScaleFixture(options: FixtureOptions = {}) {
           owners: list([]).owners,
         }
       : undefined,
-    liveHistory: options.liveRun
-      ? {
-          sessionId: pinnedRows[0]!.sessionId,
-          sessionInfo: pinnedRows[0]!,
-          messages: historyMessages,
-          inFlightRun: {
-            runId: TEAM_SCALE_LIVE_RUN_ID,
-            text: "Synthetic streaming progress 0",
-            startedAt: now,
-            events: [],
-          },
-        }
-      : undefined,
+    liveHistory: options.liveRun ? { sessionKey: selectedSessionKey, ...transcript } : undefined,
     counts,
     assets,
   };
