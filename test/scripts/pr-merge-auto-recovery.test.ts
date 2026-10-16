@@ -4,6 +4,17 @@ import { createMergeOutcomeFixtureHarness } from "./pr-merge-outcome.test-suppor
 const { fixture, reuseCompletedSetup, outcomeRef, describePosix } =
   createMergeOutcomeFixtureHarness();
 
+function autoFixture(mode = "pending", cancellation = "success") {
+  const f = fixture();
+  f.save({
+    ...f.state(),
+    mode,
+    cancellation,
+    pr: { ...f.state().pr, mergeStateStatus: "BLOCKED" },
+  });
+  return f;
+}
+
 const changedAutoHead = reuseCompletedSetup(function (variant: string) {
   const f = fixture();
   f.save({
@@ -50,30 +61,21 @@ describePosix("native auto-merge recovery", () => {
     );
     const original = f.record();
     const before = f.state();
-    let explicit = selected;
+    const heads: Record<string, string> = {
+      unselected: "",
+      "wrong selection": f.base,
+      "same head": f.head,
+      "unavailable commit": "f".repeat(40),
+    };
+    const explicit = heads[fault] ?? selected;
     const next = f.state();
-    if (fault === "unselected") {
-      explicit = "";
-    }
-    if (fault === "wrong selection") {
-      explicit = f.base;
-    }
-    if (fault === "same head") {
-      explicit = f.head;
-    }
-    if (fault === "unavailable commit") {
-      next.pr.headRefOid = explicit = "f".repeat(40);
-    }
-    if (fault === "armed") {
-      next.pr.autoMergeRequest = { mergeMethod: "SQUASH" };
-    }
-    if (fault === "queue") {
-      next.pr.isMergeQueueEnabled = true;
-    }
-    if (fault === "MERGED") {
-      next.pr.state = "MERGED";
-      next.pr.mergeCommit = { oid: f.head };
-    }
+    const prChanges: Record<string, Partial<typeof next.pr>> = {
+      "unavailable commit": { headRefOid: explicit },
+      armed: { autoMergeRequest: { mergeMethod: "SQUASH" } },
+      queue: { isMergeQueueEnabled: true },
+      MERGED: { state: "MERGED", mergeCommit: { oid: f.head } },
+    };
+    Object.assign(next.pr, prChanges[fault]);
     if (fault === "CAS collision") {
       next.crash = "successor";
     }
@@ -165,8 +167,7 @@ describePosix("native auto-merge recovery", () => {
   });
 
   it("retires an absent request at an explicitly observed changed head without dispatch", () => {
-    const f = fixture();
-    f.save({ ...f.state(), mode: "pending", pr: { ...f.state().pr, mergeStateStatus: "BLOCKED" } });
+    const f = autoFixture();
     expect(f.run(true).status).toBe(0);
     const accepted = f.git(["rev-parse", outcomeRef]);
     const original = f.record();
@@ -217,12 +218,7 @@ describePosix("native auto-merge recovery", () => {
   it.each(["before cancellation", "after cancellation"])(
     "retires the original auto request when mergeability settles %s",
     (phase) => {
-      const f = fixture();
-      f.save({
-        ...f.state(),
-        mode: "pending",
-        pr: { ...f.state().pr, mergeStateStatus: "BLOCKED" },
-      });
+      const f = autoFixture();
       expect(f.run(true).status).toBe(0);
       const accepted = f.git(["rev-parse", outcomeRef]);
       f.save({
@@ -254,13 +250,7 @@ describePosix("native auto-merge recovery", () => {
   ])(
     "retires auto before recovering a reviewed replacement (submission=$mode, cancellation=$cancellation, absent=$absent)",
     ({ mode, cancellation, absent }) => {
-      const f = fixture();
-      f.save({
-        ...f.state(),
-        mode,
-        cancellation,
-        pr: { ...f.state().pr, mergeStateStatus: "BLOCKED" },
-      });
+      const f = autoFixture(mode, cancellation);
       const pending = f.run(true);
       const acknowledged = mode === "pending";
       expect(pending.status, pending.output).toBe(acknowledged ? 0 : 1);
@@ -330,13 +320,7 @@ describePosix("native auto-merge recovery", () => {
     },
   );
   it("never repeats an uncertain auto cancellation and confirms its later observed retirement", () => {
-    const f = fixture();
-    f.save({
-      ...f.state(),
-      mode: "pending-error",
-      cancellation: "rejected",
-      pr: { ...f.state().pr, mergeStateStatus: "BLOCKED" },
-    });
+    const f = autoFixture("pending-error", "rejected");
     expect(f.run(true).status).toBe(1);
     expect(f.recover()).toBe(false);
     const first = f.cancel(f.git(["rev-parse", outcomeRef]));
@@ -355,13 +339,7 @@ describePosix("native auto-merge recovery", () => {
     expect(f.record()).toMatchObject({ accepted: false, cancellation: { state: "confirmed" } });
   });
   it("reconciles a concurrent merge during auto cancellation without a second merge", () => {
-    const f = fixture();
-    f.save({
-      ...f.state(),
-      mode: "pending",
-      cancellation: "merged",
-      pr: { ...f.state().pr, mergeStateStatus: "BLOCKED" },
-    });
+    const f = autoFixture("pending", "merged");
     expect(f.run(true).status).toBe(0);
     const result = f.cancel(f.git(["rev-parse", outcomeRef]));
     expect(result.status, result.output).toBe(0);
@@ -378,12 +356,7 @@ describePosix("native auto-merge recovery", () => {
   ] as const)(
     "preserves auto cancellation authority when %s changes %s dispatch",
     (change, stage) => {
-      const f = fixture();
-      f.save({
-        ...f.state(),
-        mode: "pending",
-        pr: { ...f.state().pr, mergeStateStatus: "BLOCKED" },
-      });
+      const f = autoFixture();
       expect(f.run(true).status).toBe(0);
       const accepted = f.git(["rev-parse", outcomeRef]);
       const next = f.state();

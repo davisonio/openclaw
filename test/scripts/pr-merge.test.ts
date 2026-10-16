@@ -41,6 +41,24 @@ type BodyScenario = {
   overrideBody?: string;
 };
 
+type SourceCommit = NonNullable<BodyScenario["sourceCommits"]>[number];
+const contributor = { name: "Contributor", email: "contributor@example.com" };
+const robot = { name: "roboclaw-bot", email: "309084314+roboclaw-bot@users.noreply.github.com" };
+const refreshAuthor = { name: "Refresh Author", email: "refresh@example.com" };
+const source = (
+  message: string,
+  author?: SourceCommit["author"],
+  extra: Partial<SourceCommit> = {},
+): SourceCommit => ({ message, ...(author ? { author } : {}), ...extra });
+function authorEnv({ name, email }: NonNullable<SourceCommit["author"]>) {
+  return {
+    GIT_AUTHOR_NAME: name,
+    GIT_AUTHOR_EMAIL: email,
+    GIT_COMMITTER_NAME: name,
+    GIT_COMMITTER_EMAIL: email,
+  };
+}
+
 function prepareBody(scenario: BodyScenario, parentEnv: NodeJS.ProcessEnv = process.env) {
   const root = tempDirs.make("openclaw-merge-attribution-");
   const sourceRepo = join(root, "source");
@@ -89,12 +107,10 @@ function prepareBody(scenario: BodyScenario, parentEnv: NodeJS.ProcessEnv = proc
     let main = base;
     if (scenario.refreshMergeAuthor) {
       git(["switch", "-qc", "main-refresh"]);
-      git(["commit", "--allow-empty", "-qm", "Main refresh"], {
-        GIT_AUTHOR_NAME: "Main Author",
-        GIT_AUTHOR_EMAIL: "main@example.com",
-        GIT_COMMITTER_NAME: "Main Author",
-        GIT_COMMITTER_EMAIL: "main@example.com",
-      });
+      git(
+        ["commit", "--allow-empty", "-qm", "Main refresh"],
+        authorEnv({ name: "Main Author", email: "main@example.com" }),
+      );
       main = git(["rev-parse", "HEAD"]);
       git(["switch", "-qc", "pr", base]);
     }
@@ -129,14 +145,7 @@ function prepareBody(scenario: BodyScenario, parentEnv: NodeJS.ProcessEnv = proc
           "-qm",
           message,
         ],
-        author
-          ? {
-              GIT_AUTHOR_NAME: author.name,
-              GIT_AUTHOR_EMAIL: author.email,
-              GIT_COMMITTER_NAME: author.name,
-              GIT_COMMITTER_EMAIL: author.email,
-            }
-          : undefined,
+        author ? authorEnv(author) : undefined,
       );
       const sha = git(["rev-parse", "HEAD"]);
       githubCommits[sha] = {
@@ -161,23 +170,13 @@ function prepareBody(scenario: BodyScenario, parentEnv: NodeJS.ProcessEnv = proc
           scenario.refreshMergeMessage ?? "Merge branch 'main' into repair",
           main,
         ],
-        {
-          GIT_AUTHOR_NAME: author.name,
-          GIT_AUTHOR_EMAIL: author.email,
-          GIT_COMMITTER_NAME: author.name,
-          GIT_COMMITTER_EMAIL: author.email,
-        },
+        authorEnv(author),
       );
     }
     publishedHead = git(["rev-parse", "HEAD"]);
     if (scenario.localFixup) {
       const { author, message } = scenario.localFixup;
-      git(["commit", "--allow-empty", "-qm", message], {
-        GIT_AUTHOR_NAME: author.name,
-        GIT_AUTHOR_EMAIL: author.email,
-        GIT_COMMITTER_NAME: author.name,
-        GIT_COMMITTER_EMAIL: author.email,
-      });
+      git(["commit", "--allow-empty", "-qm", message], authorEnv(author));
     }
     localHead = git(["rev-parse", "HEAD"]);
     if (scenario.signedSource) {
@@ -419,18 +418,18 @@ describePosix("native squash attribution", () => {
         restPreview: true,
         previewBody: "Reviewed repair",
         sourceCommits: [
-          { message: "First repair", author: { name: "First", email: "first@example.com" } },
-          {
-            message: "Automated repair",
-            author: { name: "Automation", email: "automation@example.com" },
-            githubAuthor: { login: "automation", type: "Bot" },
-          },
-          { message: "Second repair", author: { name: "Second", email: "second@example.com" } },
-          {
-            message: "Unlinked repair",
-            author: { name: "Unlinked", email: "unlinked@example.com" },
-            githubAuthor: null,
-          },
+          source("First repair", { name: "First", email: "first@example.com" }),
+          source(
+            "Automated repair",
+            { name: "Automation", email: "automation@example.com" },
+            { githubAuthor: { login: "automation", type: "Bot" } },
+          ),
+          source("Second repair", { name: "Second", email: "second@example.com" }),
+          source(
+            "Unlinked repair",
+            { name: "Unlinked", email: "unlinked@example.com" },
+            { githubAuthor: null },
+          ),
         ],
       },
       "Reviewed repair\n\nCo-authored-by: First <first@example.com>\nCo-authored-by: Second <second@example.com>\n",
@@ -460,26 +459,17 @@ describePosix("native squash attribution", () => {
     [
       "omits preview credit backed only by a refresh merge author",
       {
-        sourceCommits: [
-          { message: "Repair", author: { name: "Contributor", email: "contributor@example.com" } },
-        ],
-        refreshMergeAuthor: { name: "Vincent Koc", email: "vincent@example.com" },
         previewBody:
           "Repair summary\n\n---------\n\nCo-authored-by: Vincent Koc <vincent@example.com>",
+        sourceCommits: [source("Repair", contributor)],
+        refreshMergeAuthor: { name: "Vincent Koc", email: "vincent@example.com" },
       },
       "Repair summary\n",
     ],
     [
       "preserves reviewed explicit credit for a tree-identical commit author",
       {
-        sourceCommits: [
-          { message: "Repair" },
-          {
-            message: "Refresh",
-            empty: true,
-            author: { name: "Refresh Author", email: "refresh@example.com" },
-          },
-        ],
+        sourceCommits: [source("Repair"), source("Refresh", refreshAuthor, { empty: true })],
         previewBody: "Repair\n\nCo-authored-by: Refresh Author <refresh@example.com>",
         overrideBody:
           "Reviewed credit.\r\n\r\nCo-authored-by: Refresh Author <refresh@example.com>\r\n\r\n",
@@ -490,14 +480,10 @@ describePosix("native squash attribution", () => {
       "keeps exact reviewed human credit instead of adding the machine source author",
       {
         sourceCommits: [
-          {
-            message:
-              "Repair\n\nCo-authored-by: Takhoffman <781889+Takhoffman@users.noreply.github.com>",
-            author: {
-              name: "roboclaw-bot",
-              email: "309084314+roboclaw-bot@users.noreply.github.com",
-            },
-          },
+          source(
+            "Repair\n\nCo-authored-by: Takhoffman <781889+Takhoffman@users.noreply.github.com>",
+            robot,
+          ),
         ],
         previewBody:
           "Repair summary\n\nCo-authored-by: Takhoffman <781889+Takhoffman@users.noreply.github.com>\nCo-authored-by: roboclaw-bot <309084314+roboclaw-bot@users.noreply.github.com>",
@@ -509,15 +495,7 @@ describePosix("native squash attribution", () => {
     [
       "drops a machine source-author preview credit without a reviewed body",
       {
-        sourceCommits: [
-          {
-            message: "Repair",
-            author: {
-              name: "roboclaw-bot",
-              email: "309084314+roboclaw-bot@users.noreply.github.com",
-            },
-          },
-        ],
+        sourceCommits: [source("Repair", robot)],
         previewBody:
           "Repair\n\nCo-authored-by: roboclaw-bot <309084314+roboclaw-bot@users.noreply.github.com>",
       },
@@ -546,14 +524,11 @@ describePosix("native squash attribution", () => {
       "drops machine credit replayed in commit bullets and keeps human source credit",
       {
         sourceCommits: [
-          {
-            message: "First repair\n\nDetails.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
-            author: { name: "Contributor", email: "contributor@example.com" },
-          },
-          {
-            message: "Second repair\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
-            author: { name: "Contributor", email: "contributor@example.com" },
-          },
+          source(
+            "First repair\n\nDetails.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+            contributor,
+          ),
+          source("Second repair\n\nCo-Authored-By: Claude <noreply@anthropic.com>", contributor),
         ],
         refreshMergeAuthor: { name: "Maintainer", email: "maintainer@example.com" },
         refreshMergeMessage:
@@ -567,11 +542,10 @@ describePosix("native squash attribution", () => {
       "appends human source trailers the preview omitted while dropping machine ones",
       {
         sourceCommits: [
-          {
-            message:
-              "Repair\n\nCo-authored-by: Codex <codex@openai.com>\nCo-authored-by: Pair Partner <pair@example.com>",
-            author: { name: "Contributor", email: "contributor@example.com" },
-          },
+          source(
+            "Repair\n\nCo-authored-by: Codex <codex@openai.com>\nCo-authored-by: Pair Partner <pair@example.com>",
+            contributor,
+          ),
         ],
         previewBody:
           "Repair\n\nCo-authored-by: Codex <codex@openai.com>\n\n---------\n\nCo-authored-by: Contributor <contributor@example.com>\nCo-authored-by: Codex <codex@openai.com>\n",
@@ -582,14 +556,8 @@ describePosix("native squash attribution", () => {
       "drops a folded machine trailer replayed inside a commit bullet",
       {
         sourceCommits: [
-          {
-            message: "Repair\n\nCo-Authored-By: Claude\n <noreply@anthropic.com>",
-            author: { name: "Contributor", email: "contributor@example.com" },
-          },
-          {
-            message: "Follow-up",
-            author: { name: "Contributor", email: "contributor@example.com" },
-          },
+          source("Repair\n\nCo-Authored-By: Claude\n <noreply@anthropic.com>", contributor),
+          source("Follow-up", contributor),
         ],
         previewBody:
           "* Repair\n\nCo-Authored-By: Claude\n <noreply@anthropic.com>\n\n* Follow-up\n\n---------\n\nCo-authored-by: Contributor <contributor@example.com>\n",
@@ -599,9 +567,7 @@ describePosix("native squash attribution", () => {
     [
       "drops an indented machine credit line from the default preview",
       {
-        sourceCommits: [
-          { message: "Repair", author: { name: "Contributor", email: "contributor@example.com" } },
-        ],
+        sourceCommits: [source("Repair", contributor)],
         previewBody:
           "Repair\n\n  Co-authored-by: Claude <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Contributor <contributor@example.com>\n",
       },
@@ -610,9 +576,7 @@ describePosix("native squash attribution", () => {
     [
       "drops a machine trailer followed by indented text from the default preview",
       {
-        sourceCommits: [
-          { message: "Repair", author: { name: "Contributor", email: "contributor@example.com" } },
-        ],
+        sourceCommits: [source("Repair", contributor)],
         previewBody:
           "Repair\n\nCo-authored-by: Claude <noreply@anthropic.com>\n  indented note\n\n---------\n\nCo-authored-by: Contributor <contributor@example.com>\n",
       },
@@ -683,14 +647,7 @@ describePosix("native squash attribution", () => {
     [
       "rejects queue admission when tree-identical refresh credit needs removal",
       {
-        sourceCommits: [
-          { message: "Repair" },
-          {
-            message: "Refresh",
-            empty: true,
-            author: { name: "Refresh Author", email: "refresh@example.com" },
-          },
-        ],
+        sourceCommits: [source("Repair"), source("Refresh", refreshAuthor, { empty: true })],
         previewBody: "Repair\n\nCo-authored-by: Refresh Author <refresh@example.com>",
         previewQueue: true,
       },
@@ -699,15 +656,7 @@ describePosix("native squash attribution", () => {
     [
       "rejects queue admission when the preview carries machine credit",
       {
-        sourceCommits: [
-          {
-            message: "Repair",
-            author: {
-              name: "roboclaw-bot",
-              email: "309084314+roboclaw-bot@users.noreply.github.com",
-            },
-          },
-        ],
+        sourceCommits: [source("Repair", robot)],
         previewBody:
           "Repair\n\nCo-authored-by: roboclaw-bot <309084314+roboclaw-bot@users.noreply.github.com>",
         previewQueue: true,

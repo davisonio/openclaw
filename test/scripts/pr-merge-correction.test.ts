@@ -8,6 +8,25 @@ import { validReview, writeReviewArtifacts } from "./pr-review-artifact-fixture.
 const { fixture, outcomeRef, describePosix, scripts, nodeExecutable, gitEnv } =
   createMergeOutcomeFixtureHarness();
 
+type Fixture = ReturnType<typeof fixture>;
+const localPath = (f: Fixture, name: string) => join(f.worktree, ".local", name);
+function pendingGates(f: Fixture, head = f.head) {
+  writeFileSync(
+    localPath(f, "gates.env"),
+    `PR_NUMBER=123\nGATES_MODE=github_pending\nHOSTED_GATES_TARGET_HEAD_SHA=${head}\n`,
+  );
+}
+function publish(f: Fixture, head: string) {
+  f.git([
+    "push",
+    "-q",
+    "--force",
+    "origin",
+    `${head}:refs/pull/123/head`,
+    `${head}:refs/heads/topic`,
+  ]);
+}
+
 function configureCorrection(f: ReturnType<typeof fixture>) {
   const incoming = f.sourceCommits[0];
   if (!incoming) {
@@ -109,23 +128,13 @@ describePosix("correction authority through native merge admission", () => {
         throw new Error("Missing incoming fixture commit");
       }
       const hosted = f.commit(f.tree("corrected\n"), [incoming], "Hosted correction\n");
-      f.git([
-        "push",
-        "-q",
-        "--force",
-        "origin",
-        `${hosted}:refs/pull/123/head`,
-        `${hosted}:refs/heads/topic`,
-      ]);
+      publish(f, hosted);
       f.prepare(hosted, f.base, f.head);
       configureCorrection(f);
       const state = f.state();
       state.pr.headRefOid = hosted;
       if (mode === "github_pending") {
-        writeFileSync(
-          join(f.worktree, ".local/gates.env"),
-          `PR_NUMBER=123\nGATES_MODE=github_pending\nHOSTED_GATES_TARGET_HEAD_SHA=${hosted}\n`,
-        );
+        pendingGates(f, hosted);
         state.requiredCheckName = "openclaw/ci-gate";
         state.gates = "pending";
       }
@@ -133,8 +142,7 @@ describePosix("correction authority through native merge admission", () => {
       const result = f.run(mode === "github_pending");
       expect(result.status, result.output).toBe(0);
       expect(f.state().mutations).toBe(1);
-      expect(f.record().localHead).toBe(f.head);
-      expect(f.record().head).toBe(hosted);
+      expect(f.record()).toMatchObject({ localHead: f.head, head: hosted });
     },
   );
 
@@ -147,10 +155,7 @@ describePosix("correction authority through native merge admission", () => {
     "final-review",
   ])("refuses deferred correction merge with %s", (fault) => {
     const f = correctionFixture();
-    writeFileSync(
-      join(f.worktree, ".local/gates.env"),
-      `PR_NUMBER=123\nGATES_MODE=github_pending\nHOSTED_GATES_TARGET_HEAD_SHA=${fault === "stale-gates" ? f.base : f.head}\n`,
-    );
+    pendingGates(f, fault === "stale-gates" ? f.base : f.head);
     const state = f.state();
     state.requiredCheckName = fault === "missing-gate" ? "CI" : "openclaw/ci-gate";
     state.gates = fault === "failed-check" ? "fail" : "pending";
@@ -159,7 +164,7 @@ describePosix("correction authority through native merge admission", () => {
     }
     f.save(state);
     if (fault === "stale-review") {
-      const path = join(f.worktree, ".local/correction-review.json");
+      const path = localPath(f, "correction-review.json");
       const review = JSON.parse(readFileSync(path, "utf8"));
       review.pr.headSha = f.base;
       writeFileSync(path, JSON.stringify(review));
@@ -189,14 +194,7 @@ describePosix("correction authority through native merge admission", () => {
       "Reviewed replacement\n",
     );
     f.git(["-C", f.worktree, "checkout", "-B", "pr-123-prep", replacement]);
-    f.git([
-      "push",
-      "-q",
-      "--force",
-      "origin",
-      `${replacement}:refs/pull/123/head`,
-      `${replacement}:refs/heads/topic`,
-    ]);
+    publish(f, replacement);
     f.prepare(replacement);
     configureCorrection(f);
     const state = f.state();
@@ -204,18 +202,15 @@ describePosix("correction authority through native merge admission", () => {
     state.pr.headRefOid = replacement;
     f.save(state);
     if (fault === "incoming digest") {
-      const path = join(f.worktree, ".local/review.json");
+      const path = localPath(f, "review.json");
       writeFileSync(path, readFileSync(path, "utf8") + "\n");
     } else if (fault === "foreign review") {
-      const path = join(f.worktree, ".local/correction-review.json");
+      const path = localPath(f, "correction-review.json");
       const review = JSON.parse(readFileSync(path, "utf8"));
       review.pr.headSha = f.head;
       writeFileSync(path, JSON.stringify(review));
     } else if (fault === "pending gates") {
-      writeFileSync(
-        join(f.worktree, ".local/gates.env"),
-        `PR_NUMBER=123\nGATES_MODE=github_pending\nHOSTED_GATES_TARGET_HEAD_SHA=${replacement}\n`,
-      );
+      pendingGates(f, replacement);
     } else if (fault === "stale gates") {
       const path = join(f.worktree, ".local/gates.env");
       writeFileSync(path, readFileSync(path, "utf8").replaceAll(replacement, f.head));
