@@ -215,7 +215,7 @@ describe("registerTelegramNativeCommands /login", () => {
 
   it("routes the login button through the non-blocking native login flow", async () => {
     const finishLogin = createDeferred<void>();
-    const loginFlow = vi.fn(async (params: ModelsAuthLoginFlowOptions) => {
+    const loginFlow = vi.fn<TelegramLoginFlow>(async (params) => {
       await params.prompter.deviceCode?.({
         title: "OpenAI Codex device code",
         code: "BUTTON-CODE",
