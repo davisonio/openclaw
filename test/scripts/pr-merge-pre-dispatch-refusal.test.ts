@@ -44,6 +44,9 @@ const historicalRefusals = {
 const hash = (text: string) =>
   execFileSync("git", ["hash-object", "--stdin"], { input: text, encoding: "utf8" }).trim();
 const describePosix = process.platform === "win32" ? describe.skip : describe;
+type TimeoutOverrides = { diagnosticsEnabled?: boolean } & Partial<
+  Record<"producer" | "command" | "version" | "sourceRevision" | "executableSha256", string>
+>;
 
 function refusalEvidence(contents: string, proof: unknown) {
   const root = temps.make("pr-refusal-evidence-");
@@ -65,22 +68,22 @@ function refusalEvidence(contents: string, proof: unknown) {
 }
 
 describePosix("operator-qualified pre-dispatch evidence", () => {
-  it.each([
-    "diagnostics-not-requested",
-    "wrong-producer",
-    "wrong-command",
-    "wrong-version",
-    "wrong-revision",
-    "wrong-executable",
-    "missing-source",
-    "extra-source",
-    "source:cmd/octopool/string_rewrites_pr.go",
-    "other-class",
-    "extra-newline",
-    "missing-newline",
-    "diagnostic",
-    "response-headers",
-  ])("bounds the inspected initial policy timeout: %s", (fault) => {
+  it.each<[string, TimeoutOverrides?]>([
+    ["diagnostics-not-requested", { diagnosticsEnabled: false }],
+    ["wrong-producer", { producer: "gh" }],
+    ["wrong-command", { command: "pr view" }],
+    ["wrong-version", { version: "0.7.2" }],
+    ["wrong-revision", { sourceRevision: "a".repeat(40) }],
+    ["wrong-executable", { executableSha256: "a".repeat(64) }],
+    ["missing-source"],
+    ["extra-source"],
+    ["source:cmd/octopool/string_rewrites_pr.go"],
+    ["other-class"],
+    ["extra-newline"],
+    ["missing-newline"],
+    ["diagnostic"],
+    ["response-headers"],
+  ])("bounds the inspected initial policy timeout: %s", (fault, overrides) => {
     const sourceSha256: Record<string, string> = { ...policyTimeoutQualification.sourceSha256 };
     if (fault.startsWith("source:")) {
       sourceSha256[fault.slice("source:".length)] = "0".repeat(64);
@@ -104,19 +107,12 @@ describePosix("operator-qualified pre-dispatch evidence", () => {
       outcome,
       capture: hash(contents),
       inspected: true,
-      diagnosticsEnabled: fault !== "diagnostics-not-requested",
-      producer: fault === "wrong-producer" ? "gh" : policyTimeoutQualification.producer,
-      command: fault === "wrong-command" ? "pr view" : policyTimeoutQualification.command,
-      version: fault === "wrong-version" ? "0.7.2" : policyTimeoutQualification.version,
-      sourceRevision:
-        fault === "wrong-revision" ? "a".repeat(40) : policyTimeoutQualification.sourceRevision,
-      executableSha256:
-        fault === "wrong-executable" ? "a".repeat(64) : policyTimeoutQualification.executableSha256,
+      diagnosticsEnabled: true,
       sourceSha256,
+      ...overrides,
     };
     const result = refusalEvidence(contents, proof).run();
-    expect(result.status, result.stderr).toBe(1);
-    expect(result.stdout).toBe("");
+    expect(result, result.stderr).toMatchObject({ status: 1, stdout: "" });
   });
 
   it.each([
@@ -212,8 +208,7 @@ describePosix("operator-qualified pre-dispatch evidence", () => {
         files: { [capture]: proof.capture },
       });
     } else {
-      expect(result.status, result.stderr).toBe(1);
-      expect(result.stdout).toBe("");
+      expect(result, result.stderr).toMatchObject({ status: 1, stdout: "" });
     }
   });
 });

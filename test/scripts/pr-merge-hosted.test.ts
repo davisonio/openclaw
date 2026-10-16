@@ -31,6 +31,19 @@ const outcomeRecord = (f: Fixture) =>
 function expectNoIntent(f: Fixture) {
   expect(f.git(f.canonical, "for-each-ref", "--format=%(refname)", outcomeRef)).toBe("");
 }
+function verify(f: Fixture, autoMergeRequested = false) {
+  const options = {
+    replacementHead: "",
+    autoMergeRequested,
+    observation: null,
+    qualifiedRefusal: false,
+  };
+  return f.shell(`merge_verify 42 '${JSON.stringify(options)}' || exit 1`);
+}
+function checkRow(bucket: "skipping" | "pending" | "pass" | "fail", name = "openclaw/ci-gate") {
+  const states = { skipping: "SKIPPED", pending: "PENDING", pass: "SUCCESS", fail: "FAILURE" };
+  return { name, bucket, state: states[bucket] };
+}
 
 describePosix("native hosted merge handoff", () => {
   let f: ReturnType<typeof createMainRefreshFixture>;
@@ -48,8 +61,7 @@ describePosix("native hosted merge handoff", () => {
       ]),
     });
     delete f.env.OPENCLAW_TESTBOX;
-    // A changelog-only checkout must not narrow the prepared source change's
-    // gates, nor may a PR-controlled helper replace the canonical verifier.
+    // Neither unrelated checkout changes nor a PR-controlled verifier may replace prepared proof.
     f.git(f.worktree, "checkout", "--detach", f.main);
     writeFileSync(join(f.worktree, "CHANGELOG.md"), "Unrelated changelog-only checkout.\n");
     f.git(f.worktree, "add", "CHANGELOG.md");
@@ -61,8 +73,7 @@ describePosix("native hosted merge handoff", () => {
   });
 
   beforeEach(() => {
-    // Reuse one successful preparation. Rejections must not dispatch or damage
-    // that state; the final case alone completes the synthetic server merge.
+    // Only the final case may consume the shared preparation by merging.
     f.configure({ hostedCi: "release", requiredChecks: "pass" });
     writeGates(f, preparedGates);
     rmSync(join(f.local, "merge-checks-watch.log"), { force: true });
@@ -76,14 +87,12 @@ describePosix("native hosted merge handoff", () => {
     "required-pending",
     "required-api-error",
   ] as const)("blocks %s evidence before merge dispatch in an OR-list caller", (fault) => {
-    const requiredChecks =
-      fault === "required-fail"
-        ? "fail"
-        : fault === "required-pending"
-          ? "pending"
-          : fault === "required-api-error"
-            ? "api-error"
-            : undefined;
+    const requiredFaults: Partial<Record<string, "fail" | "pending" | "api-error">> = {
+      "required-fail": "fail",
+      "required-pending": "pending",
+      "required-api-error": "api-error",
+    };
+    const requiredChecks = requiredFaults[fault];
     if (requiredChecks) {
       f.configure({ requiredChecks });
     } else if (fault === "missing" || fault === "api-error") {
@@ -122,11 +131,7 @@ describePosix("native hosted merge handoff", () => {
   it.each(["full", "remote_crabbox_aws"])("retains the PR CI wait for %s preparation", (mode) => {
     f.configure({ hostedCi: "scheduled" });
     writeGates(f, preparedGates.replace("hosted_exact_or_recent_parent", mode));
-    const { events } = observe(f, () =>
-      f.shell(
-        `merge_verify 42 '{"replacementHead":"","autoMergeRequested":false,"observation":null,"qualifiedRefusal":false}' || exit 1`,
-      ),
-    );
+    const { events } = observe(f, () => verify(f));
     const watched = events.findIndex((event) => event.kind === "ci-watched");
     expect(watched).toBeGreaterThanOrEqual(0);
     expect(events.findIndex((event) => event.kind === "required-checks")).toBeGreaterThan(watched);
@@ -235,35 +240,19 @@ describePosix("native pending GitHub merge handoff", () => {
     (bucket) => {
       f.configure({
         requiredChecks: bucket,
-        requiredCheckRows: [
-          { name: "openclaw/ci-gate", bucket: "skipping", state: "SKIPPED" },
-          { name: "openclaw/ci-gate", bucket, state: bucket === "pass" ? "SUCCESS" : "PENDING" },
-        ],
+        requiredCheckRows: [checkRow("skipping"), checkRow(bucket)],
       });
-      observe(f, () =>
-        f.shell(
-          `merge_verify 42 '{"replacementHead":"","autoMergeRequested":true,"observation":null,"qualifiedRefusal":false}' || exit 1`,
-        ),
-      );
+      observe(f, () => verify(f, true));
     },
   );
 
   it.each([
-    ["skipped only", [{ name: "openclaw/ci-gate", bucket: "skipping", state: "SKIPPED" }]],
+    ["skipped only", [checkRow("skipping")]],
     [
       "unmatched skipped gate",
-      [
-        { name: "openclaw/ci-gate", bucket: "pending", state: "PENDING" },
-        { name: "independent required check", bucket: "skipping", state: "SKIPPED" },
-      ],
+      [checkRow("pending"), checkRow("skipping", "independent required check")],
     ],
-    [
-      "failed current gate",
-      [
-        { name: "openclaw/ci-gate", bucket: "skipping", state: "SKIPPED" },
-        { name: "openclaw/ci-gate", bucket: "fail", state: "FAILURE" },
-      ],
-    ],
+    ["failed current gate", [checkRow("skipping"), checkRow("fail")]],
   ])("rejects %s before auto-merge dispatch", (_name, requiredCheckRows) => {
     f.configure({ requiredCheckRows });
     const { output, events } = observe(f, () => f.shell("merge_run 42 true || exit 1"), 1);
@@ -400,10 +389,6 @@ describePosix("native superseded-only UNSTABLE merge handoff", () => {
     expect(events.some(isMerge)).toBe(false);
     expect(events.some((event) => event.kind === "ci-watched")).toBe(true);
     expect(events.some((event) => event.kind === "rollup-read")).toBe(true);
-    expect(outcomeRecord(f)).toMatchObject({
-      head: f.head,
-      route: "immediate",
-      phase: "complete",
-    });
+    expect(outcomeRecord(f)).toMatchObject({ head: f.head, route: "immediate", phase: "complete" });
   });
 });

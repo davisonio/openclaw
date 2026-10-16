@@ -495,25 +495,18 @@ describePosix("explicit prior-CI admin landing", () => {
       state.priorCi.omitPullRequests = true;
       state.priorCi.runRepository = { id: 654321, full_name: "unrelated/repo" };
     }
-    if (
-      [
-        "stale review head",
-        "different review run",
-        "different review attempt",
-        "green review claim",
-      ].includes(fault)
-    ) {
+    const reviewChanges: Record<
+      string,
+      Partial<{ head: string; runId: number; runAttempt: number }>
+    > = {
+      "stale review head": { head: f.base },
+      "different review run": { runId: 502 },
+      "different review attempt": { runAttempt: 1 },
+    };
+    if (reviewChanges[fault] || fault === "green review claim") {
       const reviewPath = join(f.worktree, ".local/review.json");
       const review = JSON.parse(readFileSync(reviewPath, "utf8"));
-      if (fault === "stale review head") {
-        review.tests.preExistingCi.head = f.base;
-      }
-      if (fault === "different review run") {
-        review.tests.preExistingCi.runId = 502;
-      }
-      if (fault === "different review attempt") {
-        review.tests.preExistingCi.runAttempt = 1;
-      }
+      Object.assign(review.tests.preExistingCi, reviewChanges[fault]);
       if (fault === "green review claim") {
         review.tests.result = "pass";
       }
