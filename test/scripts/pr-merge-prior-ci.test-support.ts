@@ -214,11 +214,9 @@ export function createPriorCiCandidateFactory(
       runId: 501,
       runAttempt: 2,
       deltaSha256: digest(rawDelta(f, state.priorCi.head)),
-      reason: "Explicit operator approval after resolving the source conflict",
+      reason: "Operator approved the resolved conflict",
       contracts: ["owner output"],
-      checks: [
-        { command: "owner test", result: "passed", evidence: "Observed resolved owner output" },
-      ],
+      checks: [{ command: "owner test", result: "passed", evidence: "Resolved owner output" }],
     };
     writeFileSync(path, JSON.stringify(evidence));
     return { ...f, path, evidence };
@@ -241,42 +239,36 @@ export function createPriorCiCandidateFactory(
     state.priorCi.runConclusion = "cancelled";
     state.priorCi.security.enabled = true;
     state.priorCi.security.sourceSha = main;
-    const job = (id: number, name: string, conclusion: string) => ({
-      id,
+    state.priorCi.jobs = (
+      [
+        ["owner-tests", "failure"],
+        ["openclaw/ci-gate", "failure"],
+        ["pr-fail-fast", "success"],
+        ["cancelled-sibling", "cancelled"],
+        ["security-fast", "success"],
+      ] as const
+    ).map(([name, conclusion], index) => ({
+      id: 601 + index,
       name,
       conclusion,
       status: "completed",
       run_id: 501,
       head_sha: f.head,
       steps: [],
-    });
-    state.priorCi.jobs = [
-      job(601, "owner-tests", "failure"),
+    }));
+    state.priorCi.jobs[1]!.check_run_url = "https://api.github.com/repos/fixture/repo/check-runs/1";
+    // Retained receipts still use the retired workflow's cancellation step.
+    state.priorCi.jobs[2]!.steps = [
       {
-        ...job(602, "openclaw/ci-gate", "failure"),
-        check_run_url: "https://api.github.com/repos/fixture/repo/check-runs/1",
+        number: 2,
+        name: "Cancel remaining PR work after a failure",
+        status: "completed",
+        conclusion: "success",
       },
-      {
-        // This fixture decodes retained receipts from before workflow cancellation was removed.
-        ...job(603, "pr-fail-fast", "success"),
-        steps: [
-          {
-            number: 2,
-            name: "Cancel remaining PR work after a failure",
-            status: "completed",
-            conclusion: "success",
-          },
-        ],
-      },
-      job(604, "cancelled-sibling", "cancelled"),
-      job(605, "security-fast", "success"),
     ];
     f.save(state);
     const artifact = join(f.root, "qualification.txt");
-    writeFileSync(
-      artifact,
-      "Inspected checkout, unchanged sibling input, independent baseline failure, and fail-fast cancellation.\n",
-    );
+    writeFileSync(artifact, "Inspected unchanged input, baseline failure, and cancellation.\n");
     const evidence = {
       ...f.evidence,
       changeKind: "pre-existing-failure",
@@ -284,17 +276,13 @@ export function createPriorCiCandidateFactory(
       testedMerge: f.commit(f.git(["merge-tree", "--write-tree", main, f.head]), [main, f.head]),
       deltaSha256: digest(rawDelta(f, main)),
       artifacts: [
-        {
-          name: "qualification",
-          path: artifact,
-          sha256: digest(readFileSync(artifact)),
-        },
+        { name: "qualification", path: artifact, sha256: digest(readFileSync(artifact)) },
       ],
-      checkout: qualification("Inspected the exact preflight checkout"),
+      checkout: qualification("Inspected exact preflight checkout"),
       failures: [
         {
           jobId: 601,
-          ...qualification("The same independent failure predates the PR"),
+          ...qualification("Independent failure predates PR"),
           cases: ["sibling assertion"],
           sourcePaths: ["sibling.txt"],
         },
@@ -302,14 +290,14 @@ export function createPriorCiCandidateFactory(
       aggregate: {
         jobId: 602,
         causedBy: [601],
-        ...qualification("Aggregate reports the admitted root failure"),
+        ...qualification("Aggregate reports admitted root"),
       },
       cancellation: {
         jobId: 603,
         step: 2,
         jobIds: [604],
         causedBy: [601],
-        ...qualification("Inspected fail-fast step cancelled the sibling"),
+        ...qualification("Fail-fast step cancelled sibling"),
       },
     };
     writeFileSync(f.path, JSON.stringify(evidence));
@@ -320,7 +308,7 @@ export function createPriorCiCandidateFactory(
       head: f.head,
       runId: 501,
       runAttempt: 2,
-      reason: "Independently qualified baseline failure; cancelled siblings remain unrun",
+      reason: "Qualified baseline failure; cancelled siblings remain unrun",
     };
     writeFileSync(reviewPath, JSON.stringify(review));
     return { ...f, base: main, evidence, artifact };

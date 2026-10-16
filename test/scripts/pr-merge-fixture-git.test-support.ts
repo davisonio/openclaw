@@ -26,7 +26,7 @@ type SourceArgs = [
   author?: { name: string; email: string },
 ];
 
-function createFixtureGit(repo: string, gitEnv: NodeJS.ProcessEnv, fixedTreeEntries = "") {
+export function createFixtureGit(repo: string, gitEnv: NodeJS.ProcessEnv, fixedTreeEntries = "") {
   const git = (args: string[], input?: string, cwd = repo, env?: NodeJS.ProcessEnv) =>
     execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", ...args], {
       cwd,
@@ -48,9 +48,15 @@ function createFixtureGit(repo: string, gitEnv: NodeJS.ProcessEnv, fixedTreeEntr
     parents: string[],
     message = "Fixture commit\n",
     author?: { name: string; email: string },
+    signed = false,
   ) =>
     git(
-      ["commit-tree", contents, ...parents.flatMap((parent) => ["-p", parent])],
+      [
+        "commit-tree",
+        ...(signed ? ["-S"] : []),
+        contents,
+        ...parents.flatMap((parent) => ["-p", parent]),
+      ],
       message,
       repo,
       author

@@ -1,8 +1,9 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
+import { createFixtureGit } from "./pr-merge-fixture-git.test-support.js";
 import { createIndependentPrFixtureEnv } from "./pr-wrapper.test-support.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -50,15 +51,6 @@ const source = (
   author?: SourceCommit["author"],
   extra: Partial<SourceCommit> = {},
 ): SourceCommit => ({ message, ...(author ? { author } : {}), ...extra });
-function authorEnv({ name, email }: NonNullable<SourceCommit["author"]>) {
-  return {
-    GIT_AUTHOR_NAME: name,
-    GIT_AUTHOR_EMAIL: email,
-    GIT_COMMITTER_NAME: name,
-    GIT_COMMITTER_EMAIL: email,
-  };
-}
-
 function prepareBody(scenario: BodyScenario = {}, parentEnv: NodeJS.ProcessEnv = process.env) {
   const root = tempDirs.make("openclaw-merge-attribution-");
   const sourceRepo = join(root, "source");
@@ -72,38 +64,26 @@ function prepareBody(scenario: BodyScenario = {}, parentEnv: NodeJS.ProcessEnv =
   }
   const githubCommits: Record<string, unknown> = {};
   mkdirSync(sourceRepo);
-  const git = (args: string[], env?: NodeJS.ProcessEnv) =>
-    execFileSync(
-      "git",
-      [
-        ...[
-          "user.name=Maintainer",
-          "user.email=maintainer@example.com",
-          "commit.gpgsign=false",
-          "core.hooksPath=/dev/null",
-        ].flatMap((setting) => ["-c", setting]),
-        ...args,
-      ],
-      { cwd: sourceRepo, encoding: "utf8", env: { ...process.env, ...env } },
-    ).trim();
+  const {
+    git,
+    tree,
+    commit: commitTree,
+  } = createFixtureGit(sourceRepo, {
+    ...process.env,
+    GIT_AUTHOR_NAME: "Maintainer",
+    GIT_AUTHOR_EMAIL: "maintainer@example.com",
+    GIT_COMMITTER_NAME: "Maintainer",
+    GIT_COMMITTER_EMAIL: "maintainer@example.com",
+  });
+  // Preserve the newline-normalized messages produced by the former porcelain fixture.
+  const commit: typeof commitTree = (contents, parents, message, author, signed) =>
+    commitTree(contents, parents, `${(message ?? "").trimEnd()}\n`, author, signed);
   git(["init", "-q"]);
-  git([
-    "commit",
-    "--allow-empty",
-    "-qm",
-    "Main change\n\nCo-authored-by: Main Only <main@example.com>",
-  ]);
-  const base = git(["rev-parse", "HEAD"]);
-  let main = base;
-  if (scenario.refreshMergeAuthor) {
-    git(["switch", "-qc", "main-refresh"]);
-    git(
-      ["commit", "--allow-empty", "-qm", "Main refresh"],
-      authorEnv({ name: "Main Author", email: "main@example.com" }),
-    );
-    main = git(["rev-parse", "HEAD"]);
-    git(["switch", "-qc", "pr", base]);
-  }
+  let contents = git(["mktree"], "");
+  let head = commit(contents, [], "Main change\n\nCo-authored-by: Main Only <main@example.com>");
+  const main = scenario.refreshMergeAuthor
+    ? commit(contents, [head], "Main refresh", person("Main Author", "main@example.com"))
+    : head;
   git(["update-ref", "refs/remotes/origin/main", main]);
   if (scenario.signedSource) {
     const key = join(root, "fixture-signing-key");
@@ -120,51 +100,29 @@ function prepareBody(scenario: BodyScenario = {}, parentEnv: NodeJS.ProcessEnv =
     (scenario.sourceMessages ?? ["Repair"]).map((message) => ({ message }));
   for (const [index, { message, author, githubAuthor, empty }] of sourceCommits.entries()) {
     if (!empty) {
-      writeFileSync(join(sourceRepo, "change.txt"), `${index}\n`);
-      git(["add", "change.txt"]);
+      contents = tree(`${index}\n`);
     }
-    git(
-      [
-        "-c",
-        `commit.gpgsign=${scenario.signedSource ?? false}`,
-        "commit",
-        "--allow-empty",
-        "-qm",
-        message,
-      ],
-      author ? authorEnv(author) : undefined,
-    );
-    const sha = git(["rev-parse", "HEAD"]);
-    githubCommits[sha] = {
-      sha,
-      commit: {
-        author: {
-          name: author?.name ?? "Maintainer",
-          email: author?.email ?? "maintainer@example.com",
-        },
-      },
+    head = commit(contents, [head], message, author, scenario.signedSource);
+    githubCommits[head] = {
+      sha: head,
+      commit: { author: author ?? person("Maintainer") },
       author: githubAuthor === undefined ? { login: "fixture-human", type: "User" } : githubAuthor,
     };
   }
   if (scenario.refreshMergeAuthor) {
-    const author = scenario.refreshMergeAuthor;
-    git(
-      [
-        "merge",
-        "--no-ff",
-        "-qm",
-        scenario.refreshMergeMessage ?? "Merge branch 'main' into repair",
-        main,
-      ],
-      authorEnv(author),
+    head = commit(
+      contents,
+      [head, main],
+      scenario.refreshMergeMessage ?? "Merge branch 'main' into repair",
+      scenario.refreshMergeAuthor,
     );
   }
-  const publishedHead = git(["rev-parse", "HEAD"]);
+  const publishedHead = head;
   if (scenario.localFixup) {
     const { author, message } = scenario.localFixup;
-    git(["commit", "--allow-empty", "-qm", message], authorEnv(author));
+    head = commit(contents, [head], message, author);
   }
-  const localHead = git(["rev-parse", "HEAD"]);
+  const localHead = head;
   if (scenario.signedSource) {
     git(["verify-commit", localHead]);
     git(["notes", "add", "-m", "Unrelated operator note", localHead]);
@@ -173,12 +131,12 @@ function prepareBody(scenario: BodyScenario = {}, parentEnv: NodeJS.ProcessEnv =
     git(["config", "log.decorate", "full"]);
     git(["config", "i18n.logOutputEncoding", "ISO-8859-1"]);
   }
-  git([
-    "commit",
-    "--allow-empty",
-    "-qm",
+  const unprepared = commit(
+    contents,
+    [head],
     "Unprepared change\n\nCo-authored-by: Unprepared <unprepared@example.com>",
-  ]);
+  );
+  git(["update-ref", "HEAD", unprepared]);
   // Match the native worktree: Git setup may change cwd when the temp root
   // itself is inside another repository, so the body belongs in sourceRepo.
   mkdirSync(join(sourceRepo, ".local"));
