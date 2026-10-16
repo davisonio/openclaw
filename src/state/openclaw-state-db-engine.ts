@@ -147,6 +147,12 @@ const statePostgresSchema = {
   }),
 };
 
+// State v26 only retires these credential tables; all other DDL is unchanged.
+const statePostgresV25 = {
+  ...statePostgresSchema,
+  postgres: `${runtime.eagerSql}\n${runtime.clientCredentialSource.sql}`,
+};
+
 export const stateEngineSchema: StoreSchema = {
   id: "state",
   version: OPENCLAW_STATE_SCHEMA_VERSION,
@@ -156,7 +162,13 @@ export const stateEngineSchema: StoreSchema = {
     {
       version: 25,
       sql: runtime.operatorRecoveryV25Sql,
-      fromSchema: statePostgresSchema,
+      fromSchema: statePostgresV25,
+      schema: statePostgresV25,
+    },
+    {
+      version: 26,
+      sql: runtime.clientCredentialV26Sql,
+      fromSchema: statePostgresV25,
       schema: statePostgresSchema,
     },
   ],

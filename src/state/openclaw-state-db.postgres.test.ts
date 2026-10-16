@@ -33,6 +33,7 @@ import {
   closeOpenClawStateDatabaseForTest,
   runOpenClawStateWriteTransaction,
 } from "./openclaw-state-db.js";
+import { statePostgresRuntime } from "./postgres-schema.generated/runtime.js";
 
 const configured: unknown = getEnvironmentData("openclaw.test.state.conformance.connection");
 const connection = typeof configured === "string" ? configured : undefined;
@@ -40,7 +41,7 @@ const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 type Result = { namespace: string; admissionId: string; catalogReads: number; threadId: number };
 
 describe.skipIf(!connection)("PostgreSQL shared-state owner", () => {
-  it("bootstraps, migrates authority metadata, retains lazy fragments, reuses admission and closes paired handles", async () => {
+  it("bootstraps, retains lazy fragments and admission, and refuses an older schema without captured custody", async () => {
     const pathname = path.join(tempDirs.make("state-postgres-"), "state.sqlite");
     const run = async (mode: "bootstrap" | "restart" | "migrate") => {
       const anchor = openNodeSqliteDatabase(pathname);
@@ -96,8 +97,25 @@ describe.skipIf(!connection)("PostgreSQL shared-state owner", () => {
       namespace = cold.namespace;
       expect(cold.threadId).not.toBe(0);
       await client.query(`SET search_path = "${namespace}"`);
+      const restart = await run("restart");
+      expect(restart.namespace).toBe(cold.namespace);
+      expect(restart.admissionId).not.toBe(cold.admissionId);
+      await client.query(`UPDATE "${namespace}".schema_meta SET schema_version = $1`, [
+        OPENCLAW_STATE_SCHEMA_VERSION + 1,
+      ]);
+      await expect(run("restart")).rejects.toThrow("PostgreSQL state metadata mismatch");
+      await client.query(`UPDATE "${namespace}".schema_meta SET schema_version = $1`, [
+        OPENCLAW_STATE_SCHEMA_VERSION,
+      ]);
+      await client.query(`DROP TABLE "${namespace}".secret_store_entries`);
+      await expect(run("restart")).rejects.toThrow("PostgreSQL schema drift detected");
+      await client.query(
+        statePostgresRuntime.fragments.find((fragment) => fragment.id === "secret_store_entries")!
+          .sql,
+      );
       await client.query(`BEGIN;
-        UPDATE openclaw_schema_meta SET version = 24 WHERE store = 'state';
+        ${statePostgresRuntime.clientCredentialSource.sql}
+        UPDATE openclaw_schema_meta SET version = 24, fingerprint = NULL, ddl_hash = NULL, server_major = NULL WHERE store = 'state';
         UPDATE schema_meta SET schema_version = 24 WHERE meta_key = 'primary';
         UPDATE config_machine_state SET value_json = '24'
           WHERE state_key = 'state.schema.contentVersion';
@@ -107,7 +125,9 @@ describe.skipIf(!connection)("PostgreSQL shared-state owner", () => {
             '{"completion":{"resultText":"Interrupted by Gateway restart"}}');
         COMMIT;`);
       const retained = (await client.query("SELECT * FROM subagent_runs")).rows;
-      expect((await run("migrate")).namespace).toBe(namespace);
+      await expect(run("migrate")).rejects.toThrow(
+        "Client credentials require backed-up migration custody",
+      );
       expect((await client.query("SELECT * FROM subagent_runs")).rows).toEqual(retained);
       expect(
         (
@@ -115,16 +135,7 @@ describe.skipIf(!connection)("PostgreSQL shared-state owner", () => {
             "SELECT version::int AS version FROM openclaw_schema_meta WHERE store = 'state'",
           )
         ).rows,
-      ).toEqual([{ version: 25 }]);
-      const restart = await run("restart");
-      expect(restart.namespace).toBe(cold.namespace);
-      expect(restart.admissionId).not.toBe(cold.admissionId);
-      await client.query(`UPDATE "${namespace}".schema_meta SET schema_version = $1`, [
-        OPENCLAW_STATE_SCHEMA_VERSION + 1,
-      ]);
-      await expect(run("restart")).rejects.toThrow("PostgreSQL state metadata mismatch");
-      await client.query(`DROP TABLE "${namespace}".secret_store_entries`);
-      await expect(run("restart")).rejects.toThrow("PostgreSQL schema drift detected");
+      ).toEqual([{ version: 24 }]);
     } finally {
       if (!namespace) {
         const anchor = openNodeSqliteDatabase(pathname);

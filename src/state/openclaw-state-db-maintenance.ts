@@ -18,6 +18,7 @@ import {
   type SqliteTransactionOptions,
 } from "../infra/sqlite-transaction.js";
 import { readSqliteUserVersion } from "../infra/sqlite-user-version.js";
+import { runUpdateSqliteMigration } from "../infra/update-doctor-migration-attribution.js";
 import { VERSION } from "../version.js";
 import {
   getStateRuntimeSchemaAdmission,
@@ -25,6 +26,7 @@ import {
   publishStateSchemaVersionAdmission,
 } from "./openclaw-state-db-admission.js";
 import {
+  CLIENT_CREDENTIAL_CUTOVER_SCHEMA_VERSION,
   LAZY_ADDITIVE_STATE_TABLES,
   DOCTOR_OWNED_STATE_TABLES,
   OPENCLAW_STATE_SCHEMA_VERSION,
@@ -135,8 +137,6 @@ export function prepareStateDatabaseSchemaRepair(
 }
 
 const STATE_V6_ADDITIVE_TABLES = [
-  // v6-v12 databases may predate this former same-version lazy table.
-  "gateway_origin_device_tokens",
   ...LAZY_ADDITIVE_STATE_TABLES,
   "worker_session_tool_operations",
   "worker_turn_tool_authorities",
@@ -462,6 +462,20 @@ const stateSubagentOperatorRecoveryMigration = {
   applied: "Required original operator authority for subagent recovery (v25)",
 };
 
+const stateClientCredentialMigration = {
+  version: CLIENT_CREDENTIAL_CUTOVER_SCHEMA_VERSION,
+  tables: [
+    "device_identities",
+    "device_auth_tokens",
+    "gateway_origin_device_tokens",
+    "exec_approvals_config",
+  ],
+  columns: [],
+  // The credential owner copies, verifies, and retires these before schema publication.
+  migrate: () => false,
+  applied: "Moved client credentials and native socket material to the local owner (v26)",
+};
+
 /** Version-gated column and row migrations, oldest first; each runs inside the caller's schema transaction. */
 export const versionedStateMigrations: ReadonlyArray<{
   migrate: (db: DatabaseSync, previousVersion: number) => boolean;
@@ -505,6 +519,7 @@ export function migrateBoundedStateSchema(
     stateMeetingChronologyMigration,
     stateTaskIndexMigration,
     stateSubagentOperatorRecoveryMigration,
+    stateClientCredentialMigration,
   ];
   const pending = migrations.filter(({ version }) => version > previousVersion);
   // An undeclared destination keeps the legacy full runner and full-backup requirement.
@@ -557,6 +572,24 @@ export function migrateBoundedStateSchema(
 }
 
 export function runStateSchemaMigrationTransaction<T>(
+  db: DatabaseSync,
+  pathname: string,
+  migrate: () => T,
+  transactionOptions: SqliteTransactionOptions,
+  prepareSchema?: () => void,
+): T {
+  return runUpdateSqliteMigration(db, pathname, () =>
+    runStateSchemaMigrationTransactionOwned(
+      db,
+      pathname,
+      migrate,
+      transactionOptions,
+      prepareSchema,
+    ),
+  );
+}
+
+function runStateSchemaMigrationTransactionOwned<T>(
   db: DatabaseSync,
   pathname: string,
   migrate: () => T,
