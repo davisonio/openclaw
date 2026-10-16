@@ -60,8 +60,17 @@ function session(sessionId: string, now: number, parentSessionKey?: string): Ses
   return { sessionId, updatedAt: now, ...(parentSessionKey && { parentSessionKey }) };
 }
 
-const children = async (key: string, now: number) =>
-  (await rowReader.row(key, { now }))?.childSessions;
+const children = async (key: string, now: number) => {
+  const projection = await rowReader.ready();
+  const query = { key, agentId: MAIN_AGENT_ID };
+  return projection.withPreparedExactRows(
+    () => [query],
+    (read) => {
+      const row = read.describe(query);
+      return row ? read.present(row, { now }).childSessions : undefined;
+    },
+  );
+};
 const loadChildren = (key: string, projection?: "list") =>
   loadGatewaySessionEntryReadOnlyInWorker({
     cfg: config.getRuntimeConfig(),

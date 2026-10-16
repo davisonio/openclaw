@@ -16,7 +16,6 @@ import {
   resolveOpenClawAgentSqlitePath,
   type OpenClawAgentDatabase,
 } from "../../state/openclaw-agent-db.js";
-import { SessionMetadataUnavailableError } from "../../state/session-metadata-unavailable-error.js";
 import {
   captureMemoryExactSessionReader,
   assertMemoryExactReadSource,
