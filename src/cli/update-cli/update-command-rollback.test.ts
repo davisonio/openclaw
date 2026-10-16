@@ -54,7 +54,6 @@ import * as packageModule from "./update-command-package.js";
 import { rollbackFailedUpdate } from "./update-command-rollback.js";
 import {
   expectActiveRollbackIdentity,
-  expectDoctorRollback,
   readRollbackFixtureSchemaVersions,
   registerRollbackReportTests,
   writeDoctorRollbackConfig,
@@ -84,6 +83,53 @@ function setVersion(file: string, version: number) {
   } finally {
     db.close();
   }
+}
+
+function failedCandidate(overrides: Partial<UpdateRunResult> = {}): UpdateRunResult {
+  return {
+    status: "error",
+    mode: "npm",
+    root: candidateRoot,
+    reason: "readyz-unhealthy",
+    before: { version: "2026.9.1" },
+    after: { version: "2026.9.3" },
+    steps: [],
+    durationMs: 1,
+    ...overrides,
+  };
+}
+
+function restoredStep(name = "rollback") {
+  return {
+    name,
+    activePackageRoot: previousRoot,
+    command: "restore",
+    cwd: previousRoot,
+    exitCode: 0,
+    durationMs: 1,
+  };
+}
+
+function stoppedService(
+  overrides: Partial<import("./update-command-service.js").PreManagedServiceStop> = {},
+) {
+  return {
+    stopped: true,
+    inspected: true,
+    runtimeInspected: true,
+    running: true,
+    serviceEnv: { OPENCLAW_STATE_DIR: serviceStateDir },
+    ...overrides,
+  };
+}
+
+function schemaCase(
+  change: string,
+  restored: boolean,
+  previousVerified = true,
+  service = "stopped",
+) {
+  return { change, restored, previousVerified, service };
 }
 
 describe("verified package rollback", () => {
@@ -137,11 +183,8 @@ describe("verified package rollback", () => {
     mocks.stop.mockImplementation(async ({ expectedService, updateRun }) => {
       const env = expectedService?.serviceEnv ?? updateRun?.env ?? {};
       const state = await readGatewayServiceState(resolveGatewayService(), { env });
-      return {
-        stopped: true,
+      return stoppedService({
         stoppedAtMs: 100,
-        inspected: true,
-        runtimeInspected: true,
         running: state.running,
         serviceEnv: env,
         serviceManagerUid: 2001,
@@ -149,7 +192,7 @@ describe("verified package rollback", () => {
           state,
           root: previousRoot,
         }),
-      };
+      });
     });
     mocks.restart.mockImplementation(async ({ onVerified }) => {
       onVerified?.(125);
@@ -182,26 +225,13 @@ describe("verified package rollback", () => {
       const detail = "Global project changed since staging: sibling";
       const outcome = await rollbackFailedUpdate({
         definitionRecovery: {},
-        result: {
-          status: "error",
-          mode: "pnpm",
-          root: candidateRoot,
-          reason: "readyz-unhealthy",
-          steps: [],
-          durationMs: 1,
-        },
+        result: failedCandidate({ mode: "pnpm", before: undefined, after: undefined }),
         previousRoot,
         schemaVersions,
         configSnapshot,
         opts: { json: true, run },
         timeoutMs: 1_000,
-        preManagedServiceStop: {
-          stopped: true,
-          inspected: true,
-          runtimeInspected: true,
-          running: true,
-          serviceEnv: env,
-        },
+        preManagedServiceStop: stoppedService(),
         packageTransaction: {
           backupRoot: "/backup",
           assertRollbackSafe: async () => {
@@ -241,196 +271,138 @@ describe("verified package rollback", () => {
       );
     },
   );
-  it.each([{ activated: true, healthy: false }])(
-    "retains Windows suspension through rollback (activated=$activated, healthy=$healthy)",
-    async ({ activated, healthy }) => {
-      const stateDir = serviceStateDir;
-      const env = { OPENCLAW_STATE_DIR: stateDir, OPENCLAW_WINDOWS_TASK_NAME: "rollback-fixture" };
-      const configSnapshot = await readPreviousConfig(env);
-      const config = configSnapshot.sourceConfigBeforeMigrations ?? configSnapshot.sourceConfig;
-      const schemaVersions = await readRollbackFixtureSchemaVersions({ stateDir, config, env });
-      let enabled = true;
-      const actions: string[] = [];
-      mocks.execSchtasks.mockImplementation(async (args) => {
-        if (args[0] === "/Query") {
-          return {
-            code: 0,
-            stdout: `<Task><Settings><Enabled>${enabled}</Enabled></Settings></Task>`,
-            stderr: "",
-          };
-        }
-        const action = args[0] === "/Run" ? "/Run" : args.at(-1)!;
-        actions.push(action);
-        if (action === "/Run") {
-          return { code: enabled ? 0 : 1, stdout: "", stderr: enabled ? "" : "task disabled" };
-        }
-        enabled = action === "/ENABLE";
-        return { code: 0, stdout: "", stderr: "" };
-      });
-      const original = createWindowsTaskAutoStartRecovery({ serviceEnv: env });
-      await original.suspended;
-      original.beginMutation();
-      if (activated) {
-        await original.restore(true);
+  it("retains Windows suspension through unhealthy rollback after activation", async () => {
+    const stateDir = serviceStateDir;
+    const env = { OPENCLAW_STATE_DIR: stateDir, OPENCLAW_WINDOWS_TASK_NAME: "rollback-fixture" };
+    const configSnapshot = await readPreviousConfig(env);
+    const config = configSnapshot.sourceConfigBeforeMigrations ?? configSnapshot.sourceConfig;
+    const schemaVersions = await readRollbackFixtureSchemaVersions({ stateDir, config, env });
+    let enabled = true;
+    const actions: string[] = [];
+    mocks.execSchtasks.mockImplementation(async (args) => {
+      if (args[0] === "/Query") {
+        return {
+          code: 0,
+          stdout: `<Task><Settings><Enabled>${enabled}</Enabled></Settings></Task>`,
+          stderr: "",
+        };
       }
-      let fresh: ReturnType<typeof createWindowsTaskAutoStartRecovery> | undefined;
-      const verdict = await inspectManagedGatewayServiceBeforeUpdate({
-        state: await readGatewayServiceState(resolveGatewayService(), { env }),
-        root: previousRoot,
-      });
-      if (verdict.kind !== "owned") {
-        throw new Error("Previous service fixture must resolve to its real package.");
+      const action = args[0] === "/Run" ? "/Run" : args.at(-1)!;
+      actions.push(action);
+      if (action === "/Run") {
+        return { code: enabled ? 0 : 1, stdout: "", stderr: enabled ? "" : "task disabled" };
       }
-      const service = {
-        stopped: true,
-        inspected: true,
-        runtimeInspected: true,
-        running: false,
-        serviceEnv: env,
-        serviceManagerUid: 2001,
-        serviceUpdateVerdict: {
-          ...verdict,
-          refreshDefinition: false,
+      enabled = action === "/ENABLE";
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    const original = createWindowsTaskAutoStartRecovery({ serviceEnv: env });
+    await original.suspended;
+    original.beginMutation();
+    await original.restore(true);
+    let fresh: ReturnType<typeof createWindowsTaskAutoStartRecovery> | undefined;
+    const verdict = await inspectManagedGatewayServiceBeforeUpdate({
+      state: await readGatewayServiceState(resolveGatewayService(), { env }),
+      root: previousRoot,
+    });
+    if (verdict.kind !== "owned") {
+      throw new Error("Previous service fixture must resolve to its real package.");
+    }
+    const service = stoppedService({
+      running: false,
+      serviceEnv: env,
+      serviceManagerUid: 2001,
+      serviceUpdateVerdict: {
+        ...verdict,
+        refreshDefinition: false,
+      },
+    });
+    mocks.stop.mockImplementationOnce(async () => {
+      fresh = createWindowsTaskAutoStartRecovery({ serviceEnv: env });
+      const suspended = await fresh.suspended;
+      if (!suspended) {
+        await fresh.complete();
+      }
+      return { ...service, windowsTaskAutoStartRecovery: suspended ? fresh : undefined };
+    });
+    mocks.restart.mockImplementationOnce(async ({ refreshServiceEnv }) => {
+      expect(refreshServiceEnv).toBe(false);
+      const running = await mocks.execSchtasks(["/Run", "/TN", "rollback-fixture"]);
+      if (running.code !== 0) {
+        throw new Error(running.stderr);
+      }
+      return "restart-health-failed";
+    });
+    try {
+      const outcome = await rollbackFailedUpdate({
+        definitionRecovery: {},
+        result: failedCandidate({ reason: "doctor-failed" }),
+        previousRoot,
+        schemaVersions,
+        previousVerified: true,
+        packageTransaction: {
+          backupRoot: "/backup",
+          complete: vi.fn(async () => {}),
+          rollback: async () => restoredStep("package rollback"),
         },
-      };
-      mocks.stop.mockImplementationOnce(async () => {
-        fresh = createWindowsTaskAutoStartRecovery({ serviceEnv: env });
-        const suspended = await fresh.suspended;
-        if (!suspended) {
-          await fresh.complete();
-        }
-        return { ...service, windowsTaskAutoStartRecovery: suspended ? fresh : undefined };
+        configSnapshot,
+        opts: { json: true },
+        preManagedServiceStop: { ...service, windowsTaskAutoStartRecovery: original },
+        timeoutMs: 1_000,
       });
-      mocks.restart.mockImplementationOnce(async ({ refreshServiceEnv }) => {
-        expect(refreshServiceEnv).toBe(false);
-        const running = await mocks.execSchtasks(["/Run", "/TN", "rollback-fixture"]);
-        if (running.code !== 0) {
-          throw new Error(running.stderr);
-        }
-        return healthy ? "ok" : "restart-health-failed";
+      expect(enabled).toBe(true);
+      expect(outcome.rolledBack).toBe(false);
+      expect(outcome.result.rollbackOutcome).toEqual({
+        status: "succeeded",
+        reason: "Previous package and configuration restored",
       });
-      try {
-        const outcome = await rollbackFailedUpdate({
-          definitionRecovery: {},
-          result: {
-            status: "error",
-            mode: "npm",
-            root: candidateRoot,
-            reason: "doctor-failed",
-            before: { version: "2026.9.1" },
-            after: { version: "2026.9.3" },
-            steps: [],
-            durationMs: 1,
-          },
-          previousRoot,
-          schemaVersions,
-          previousVerified: true,
-          packageTransaction: {
-            backupRoot: "/backup",
-            complete: vi.fn(async () => {}),
-            rollback: async () => ({
-              name: "package rollback",
-              activePackageRoot: previousRoot,
-              command: "restore",
-              cwd: previousRoot,
-              exitCode: 0,
-              durationMs: 1,
-            }),
-          },
-          configSnapshot,
-          opts: { json: true },
-          preManagedServiceStop: { ...service, windowsTaskAutoStartRecovery: original },
-          timeoutMs: 1_000,
-        });
-        expect(enabled).toBe(true);
-        expect(outcome.rolledBack).toBe(healthy);
-        expect(outcome.result.rollbackOutcome).toEqual({
-          status: "succeeded",
-          reason: "Previous package and configuration restored",
-        });
-        expect(outcome.result.recovery).toMatchObject({
-          packageRollbackVerified: true,
-          version: "2026.9.1",
-          service: healthy ? "healthy" : "failed",
-        });
-        const retained = outcome.stoppedForRollback?.windowsTaskAutoStartRecovery;
-        expect(retained).toBe(activated ? fresh : original);
-        await retained?.complete(healthy);
-        expect(enabled).toBe(healthy);
-        expect(actions.slice(-2)).toEqual(healthy ? ["/ENABLE", "/Run"] : ["/Run", "/DISABLE"]);
-      } finally {
-        await fresh?.complete(false);
-        await original.complete(false);
-      }
-    },
-  );
+      expect(outcome.result.recovery).toMatchObject({
+        packageRollbackVerified: true,
+        version: "2026.9.1",
+        service: "failed",
+      });
+      const retained = outcome.stoppedForRollback?.windowsTaskAutoStartRecovery;
+      expect(retained).toBe(fresh);
+      await retained?.complete(false);
+      expect(enabled).toBe(false);
+      expect(actions.slice(-2)).toEqual(["/Run", "/DISABLE"]);
+    } finally {
+      await fresh?.complete(false);
+      await original.complete(false);
+    }
+  });
   it.for([
-    { change: "none", previousVerified: true, restored: true, service: "stopped" },
-    ...(process.platform === "win32"
-      ? []
-      : [
-          { change: "readonly-config", previousVerified: true, restored: true, service: "stopped" },
-        ]),
-    { change: "doctor", previousVerified: true, restored: true, service: "stopped" },
-    {
-      change: "doctor-settled-exception",
-      previousVerified: true,
-      restored: true,
-      service: "stopped",
-    },
-    { change: "doctor-unchanged", previousVerified: true, restored: true, service: "stopped" },
-    { change: "doctor-compensated", previousVerified: true, restored: true, service: "stopped" },
-    { change: "doctor-missing-input", previousVerified: true, restored: false, service: "stopped" },
-    { change: "doctor-include", previousVerified: true, restored: true, service: "stopped" },
-    { change: "doctor-include-owned", previousVerified: true, restored: true, service: "stopped" },
-    {
-      change: "doctor-include-owned-alias",
-      previousVerified: true,
-      restored: true,
-      service: "stopped",
-    },
-    {
-      change: "doctor-include-owned-alias-edit",
-      previousVerified: true,
-      restored: false,
-      service: "stopped",
-    },
-    {
-      change: "doctor-include-owned-edit",
-      previousVerified: true,
-      restored: false,
-      service: "stopped",
-    },
-    { change: "doctor-include-edit", previousVerified: true, restored: false, service: "stopped" },
-    { change: "doctor-input-edit", previousVerified: true, restored: false, service: "stopped" },
-    { change: "doctor-capture-edit", previousVerified: true, restored: false, service: "stopped" },
-    { change: "doctor-operator-edit", previousVerified: true, restored: false, service: "stopped" },
-    { change: "doctor-locked-edit", previousVerified: true, restored: false, service: "stopped" },
-    { change: "doctor-stop-edit", previousVerified: true, restored: false, service: "stopped" },
-    { change: "doctor-restore-edit", previousVerified: true, restored: false, service: "stopped" },
-    { change: "new-agent", previousVerified: true, restored: true, service: "stopped" },
-    { change: "new-agent-foreign", previousVerified: true, restored: false, service: "stopped" },
-    {
-      change: "new-agent-previous-incompatible",
-      previousVerified: true,
-      restored: false,
-      service: "stopped",
-    },
-    {
-      change: "new-agent-previous-unknown",
-      previousVerified: true,
-      restored: false,
-      service: "stopped",
-    },
-    { change: "identity-read-failed", previousVerified: true, restored: true, service: "stopped" },
-    { change: "shared", previousVerified: true, restored: false, service: "stopped" },
-    { change: "new-shared-deferred", previousVerified: true, restored: false, service: "stopped" },
-    { change: "agent", previousVerified: true, restored: false, service: "stopped" },
-    { change: "during-stop", previousVerified: true, restored: false, service: "stopped" },
-    { change: "unknown-runtime", previousVerified: true, restored: false, service: "stopped" },
-    { change: "none", previousVerified: false, restored: false, service: "stopped" },
-    { change: "none", previousVerified: true, restored: false, service: "absent" },
-    { change: "none", previousVerified: true, restored: false, service: "no-restart" },
+    schemaCase("none", true),
+    ...(process.platform === "win32" ? [] : [schemaCase("readonly-config", true)]),
+    schemaCase("doctor", true),
+    schemaCase("doctor-settled-exception", true),
+    schemaCase("doctor-unchanged", true),
+    schemaCase("doctor-compensated", true),
+    schemaCase("doctor-missing-input", false),
+    schemaCase("doctor-include", true),
+    schemaCase("doctor-include-owned", true),
+    schemaCase("doctor-include-owned-alias", true),
+    schemaCase("doctor-include-owned-alias-edit", false),
+    schemaCase("doctor-include-owned-edit", false),
+    schemaCase("doctor-include-edit", false),
+    schemaCase("doctor-input-edit", false),
+    schemaCase("doctor-capture-edit", false),
+    schemaCase("doctor-operator-edit", false),
+    schemaCase("doctor-locked-edit", false),
+    schemaCase("doctor-stop-edit", false),
+    schemaCase("doctor-restore-edit", false),
+    schemaCase("new-agent", true),
+    schemaCase("new-agent-foreign", false),
+    schemaCase("new-agent-previous-incompatible", false),
+    schemaCase("new-agent-previous-unknown", false),
+    schemaCase("identity-read-failed", true),
+    schemaCase("shared", false),
+    schemaCase("new-shared-deferred", false),
+    schemaCase("agent", false),
+    schemaCase("during-stop", false),
+    schemaCase("unknown-runtime", false),
+    schemaCase("none", false, false),
+    schemaCase("none", false, true, "absent"),
+    schemaCase("none", false, true, "no-restart"),
   ])(
     "$change schema change; previous verified=$previousVerified; service=$service",
     async ({ change, previousVerified, restored, service }, context) => {
@@ -485,16 +457,11 @@ describe("verified package rollback", () => {
           return { stopped: true, inspected: true, runtimeInspected: true, running: false };
         });
       }
-      const result: UpdateRunResult = {
-        status: "error",
+      const result = failedCandidate({
         reason: change === "doctor-compensated" ? "doctor-failed" : "version-mismatch",
-        mode: "npm",
         root: change === "unknown-runtime" ? undefined : candidateRoot,
-        before: { version: "2026.9.1" },
-        after: { version: "2026.9.3" },
-        steps: [],
         durationMs: 10,
-      };
+      });
       const operatorEdit = () =>
         fs.appendFileSync(configPath, "\n// Operator edit after activation.\n");
       if (change.startsWith("doctor")) {
@@ -607,14 +574,7 @@ describe("verified package rollback", () => {
         if (change === "doctor-restore-edit") {
           operatorEdit();
         }
-        return {
-          name: "rollback",
-          activePackageRoot: previousRoot,
-          command: "restore",
-          cwd: previousRoot,
-          exitCode: 0,
-          durationMs: 1,
-        };
+        return restoredStep();
       });
       if (change === "identity-read-failed") {
         vi.spyOn(packageIdentity, "readPackageUpdateIdentity").mockRejectedValueOnce(
@@ -706,12 +666,8 @@ describe("verified package rollback", () => {
           preManagedServiceStop:
             service === "absent"
               ? undefined
-              : {
+              : stoppedService({
                   stopped: service === "stopped",
-                  inspected: true,
-                  runtimeInspected: true,
-                  running: true,
-                  serviceEnv: { OPENCLAW_STATE_DIR: stateDir },
                   serviceNodeRunner: "/previous/node",
                   serviceUpdateVerdict: {
                     kind: "owned",
@@ -719,7 +675,7 @@ describe("verified package rollback", () => {
                     fingerprint: "fixture",
                     refreshDefinition: true,
                   },
-                },
+                }),
           timeoutMs: 1_000,
         });
       } finally {
@@ -734,15 +690,7 @@ describe("verified package rollback", () => {
         expect(rollback).toHaveBeenCalledOnce();
         expect(fs.readFileSync(configPath, "utf8")).toBe(originalRaw);
       }
-      if (
-        change === "doctor" ||
-        change === "doctor-settled-exception" ||
-        change === "doctor-unchanged" ||
-        change === "doctor-compensated" ||
-        change === "doctor-include" ||
-        change === "doctor-include-owned" ||
-        change === "doctor-include-owned-alias"
-      ) {
+      if (change.startsWith("doctor") && restored) {
         expect(fs.readFileSync(configPath, "utf8")).toBe(originalRaw);
         if (process.platform !== "win32") {
           expect(fs.statSync(configPath).mode & 0o777).toBe(0o600);
@@ -771,20 +719,7 @@ describe("verified package rollback", () => {
       }
       expect(outcome.rolledBack, JSON.stringify(outcome)).toBe(restored);
       expect(rollback, JSON.stringify(outcome)).toHaveBeenCalledTimes(
-        change === "none" ||
-          change === "readonly-config" ||
-          change === "doctor" ||
-          change === "doctor-settled-exception" ||
-          change === "doctor-unchanged" ||
-          change === "doctor-compensated" ||
-          change === "doctor-include" ||
-          change === "doctor-include-owned" ||
-          change === "doctor-include-owned-alias" ||
-          change === "doctor-restore-edit" ||
-          change === "identity-read-failed" ||
-          change === "new-agent"
-          ? 1
-          : 0,
+        restored || change === "none" || change === "doctor-restore-edit" ? 1 : 0,
       );
       expect(mocks.restart).toHaveBeenCalledTimes(restored ? 1 : 0);
       if (service !== "stopped") {
@@ -816,7 +751,16 @@ describe("verified package rollback", () => {
           expect(activationConfig).toMatchObject({ raw: originalRaw, doctorOwned: true });
         }
         if (change === "doctor-compensated") {
-          expectDoctorRollback(activationConfig, outcome.result, configPath, originalRaw);
+          expect(activationConfig).toMatchObject({
+            path: configPath,
+            raw: originalRaw,
+            hash: hashConfigRaw(originalRaw),
+            doctorOwned: true,
+          });
+          expect(outcome.result).toMatchObject({
+            status: "error",
+            recovery: { serviceRestartSafe: true, packageRollbackVerified: true },
+          });
         }
         expect(mocks.stop.mock.invocationCallOrder[0]).toBeLessThan(
           rollback.mock.invocationCallOrder[0]!,
@@ -866,16 +810,7 @@ describe("verified package rollback", () => {
     let foreignWrite = false;
     const outcome = await rollbackFailedUpdate({
       definitionRecovery: {},
-      result: {
-        status: "error",
-        mode: "npm",
-        root: candidateRoot,
-        reason: "readyz-unhealthy",
-        steps: [],
-        durationMs: 1,
-        before: { version: "2026.9.1" },
-        after: { version: "2026.9.3" },
-      },
+      result: failedCandidate(),
       previousRoot,
       configSnapshot,
       schemaVersions,
@@ -887,13 +822,11 @@ describe("verified package rollback", () => {
         doctorOwned: true,
       },
       opts: { json: true },
-      preManagedServiceStop: {
-        inspected: true,
-        runtimeInspected: true,
+      preManagedServiceStop: stoppedService({
         running: false,
         stopped: false,
         serviceEnv: env,
-      },
+      }),
       packageTransaction: {
         backupRoot: previousRoot,
         complete: async () => {},
@@ -914,14 +847,7 @@ describe("verified package rollback", () => {
               throw error;
             }
           }
-          return {
-            name: "package rollback",
-            command: "restore",
-            cwd: previousRoot,
-            durationMs: 1,
-            exitCode: 0,
-            activePackageRoot: previousRoot,
-          };
+          return restoredStep("package rollback");
         },
       },
     });
@@ -958,14 +884,7 @@ describe("verified package rollback", () => {
     };
     const outcome = await rollbackFailedUpdate({
       definitionRecovery: {},
-      result: {
-        status: "error",
-        mode: "npm",
-        reason: "readyz-unhealthy",
-        root: candidateRoot,
-        steps: [],
-        durationMs: 1,
-      },
+      result: failedCandidate({ before: undefined, after: undefined }),
       previousRoot,
       rollbackBlockedReason: "state-migrated-no-rollback",
       configSnapshot: await readPreviousConfig({
@@ -973,14 +892,10 @@ describe("verified package rollback", () => {
       }),
       opts: { json: true },
       timeoutMs: 1_000,
-      preManagedServiceStop: {
-        stopped: true,
-        inspected: true,
-        runtimeInspected: true,
-        running: true,
+      preManagedServiceStop: stoppedService({
         serviceEnv: { OPENCLAW_STATE_DIR: dirs.make("rollback-finalization-") },
         windowsTaskAutoStartRecovery: stopped.windowsTaskAutoStartRecovery,
-      },
+      }),
     });
     expect(outcome).toMatchObject({ rolledBack: false });
     expect(outcome.stoppedForRollback).toBeUndefined();

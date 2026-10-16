@@ -27,7 +27,6 @@ import { CommandProcessCleanupError } from "../../process/exec-result.js";
 import { defaultRuntime } from "../../runtime.js";
 import { closeOpenClawStateDatabaseAsync } from "../../state/openclaw-state-db.js";
 import { printResult } from "./progress.js";
-import type { UpdateConfigSnapshot } from "./update-command-config-snapshot.js";
 import { rollbackFailedUpdate } from "./update-command-rollback.js";
 import { completeUpdateCommandRun } from "./update-command-run.js";
 
@@ -176,36 +175,22 @@ async function writeWithRefreshFailure(
   return doctorError;
 }
 
-export function expectDoctorRollback(
-  activationConfig: UpdateConfigSnapshot | undefined,
-  result: UpdateRunResult,
-  configPath: string,
-  originalRaw: string,
-): void {
-  expect(activationConfig).toMatchObject({
-    path: configPath,
-    raw: originalRaw,
-    hash: hashConfigRaw(originalRaw),
-    doctorOwned: true,
-  });
-  expect(result).toMatchObject({
-    status: "error",
-    recovery: { serviceRestartSafe: true, packageRollbackVerified: true },
-  });
-}
-
 export async function expectActiveRollbackIdentity(params: {
-  failure: string;
+  failure:
+    | "partial-restore"
+    | "restart-unhealthy"
+    | "restart-refused"
+    | "restart-threw"
+    | "restart-cleanup"
+    | "restart-timeout";
   candidateRoot: string;
   previousRoot: string;
   stateDir: string;
   restart: Mock<typeof import("./update-command-service.js").maybeRestartService>;
 }): Promise<void> {
   const { failure, candidateRoot, previousRoot, stateDir, restart } = params;
-  const restoredPackage = failure !== "source-failed" && failure !== "partial-restore";
-  const rollbackSucceeded = failure.startsWith("restart-");
-  const activePackageRoot =
-    failure === "partial-restore" ? null : restoredPackage ? previousRoot : candidateRoot;
+  const rollbackSucceeded = failure !== "partial-restore";
+  const activePackageRoot = rollbackSucceeded ? previousRoot : null;
   const env = { OPENCLAW_STATE_DIR: stateDir };
   const configSnapshot = await createConfigIO({
     env,
@@ -237,11 +222,7 @@ export async function expectActiveRollbackIdentity(params: {
         onVerificationFailure?.("channel-errors");
         return "restart-health-failed";
       }
-      return failure === "restart-timeout"
-        ? "readiness-pending"
-        : failure === "restart-verified"
-          ? "ok"
-          : "failed";
+      return failure === "restart-timeout" ? "readiness-pending" : "failed";
     });
   }
   const pending = rollbackFailedUpdate({
@@ -280,7 +261,7 @@ export async function expectActiveRollbackIdentity(params: {
   const outcome = await pending;
   expect(outcome.result).toMatchObject({
     root: activePackageRoot ?? undefined,
-    after: activePackageRoot === null ? undefined : restoredPackage ? result.before : result.after,
+    after: rollbackSucceeded ? result.before : undefined,
     reason: rollbackSucceeded ? result.reason : "source-rollback-failed",
     rollbackOutcome: { status: rollbackSucceeded ? "succeeded" : "failed" },
     steps: [
@@ -289,13 +270,11 @@ export async function expectActiveRollbackIdentity(params: {
         exitCode: rollbackSucceeded ? 0 : 1,
       }),
     ],
-    ...(!rollbackSucceeded
-      ? {}
-      : {
-          recovery: { serviceRestartSafe: true, packageRollbackVerified: true },
-        }),
+    ...(rollbackSucceeded
+      ? { recovery: { serviceRestartSafe: true, packageRollbackVerified: true } }
+      : {}),
   });
-  expect(outcome.rolledBack).toBe(failure === "restart-verified");
+  expect(outcome.rolledBack).toBe(false);
   expect(restart).toHaveBeenCalledTimes(rollbackSucceeded ? 1 : 0);
   if (rollbackSucceeded) {
     const report = await prepareUpdateFailureReport(
@@ -317,9 +296,7 @@ export async function expectActiveRollbackIdentity(params: {
             ? "unverified (restart-failed)"
             : "unverified (gateway-verification-incomplete)";
     expect(report.body).toContain(
-      failure === "restart-verified"
-        ? "Recovery outcome: package rollback verified; Gateway serving 2026.9.1; health verified"
-        : `Recovery outcome: package rollback verified (2026.9.1); Gateway health ${health}. Run \`openclaw gateway status --deep\``,
+      `Recovery outcome: package rollback verified (2026.9.1); Gateway health ${health}. Run \`openclaw gateway status --deep\``,
     );
   }
 }

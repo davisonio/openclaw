@@ -105,6 +105,12 @@ function setup() {
   return { env, fail, opts, prepared, result, run, target };
 }
 
+function expectUnused(...actions: (keyof typeof mocks)[]) {
+  for (const action of actions) {
+    expect(mocks[action]).not.toHaveBeenCalled();
+  }
+}
+
 beforeEach(() => {
   vi.resetAllMocks();
   mocks.select.mockResolvedValue("dismiss");
@@ -119,8 +125,7 @@ describe("verified rollback failure actions", () => {
   it("offers an optional report, previews it, and submits once only after confirmation", async () => {
     const f = setup();
     mocks.select.mockImplementation(async () => {
-      expect(mocks.prepare).not.toHaveBeenCalled();
-      expect(mocks.submit).not.toHaveBeenCalled();
+      expectUnused("prepare", "submit");
       return "report";
     });
     mocks.confirm.mockImplementation(async () => {
@@ -168,8 +173,7 @@ describe("verified rollback failure actions", () => {
 
     expect(defaultRuntime.log).toHaveBeenCalledWith(f.prepared.body);
     expect(defaultRuntime.log).toHaveBeenCalledWith("Update failure report cancelled.");
-    expect(mocks.submit).not.toHaveBeenCalled();
-    expect(mocks.triage).not.toHaveBeenCalled();
+    expectUnused("submit", "triage");
   });
 
   it("diagnoses the original failure only when selected", async () => {
@@ -181,45 +185,30 @@ describe("verified rollback failure actions", () => {
     expect(mocks.triage).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({ failure: { result: f.result }, target: f.target }),
     );
-    expect(mocks.prepare).not.toHaveBeenCalled();
-    expect(mocks.submit).not.toHaveBeenCalled();
+    expectUnused("prepare", "submit");
   });
 
-  it.each([{ name: "signal cancellation", signal: true }])(
-    "keeps $name rollback quiet",
-    async (testCase) => {
-      const f = setup();
-      if (testCase.signal) {
-        f.result.steps.push({
-          name: "update",
-          command: "synthetic-update",
-          cwd: "/synthetic",
-          durationMs: 1,
-          exitCode: 130,
-          termination: "signal",
-        });
-      }
-      await withTriageTerminal(true, async () => {
-        await expect(withUpdateFailureTriage(f.opts, f.target, f.fail)).rejects.toMatchObject({
-          code: 1,
-        });
-      });
-
-      expect(mocks.select).not.toHaveBeenCalled();
-      expect(mocks.prepare).not.toHaveBeenCalled();
-      expect(mocks.submit).not.toHaveBeenCalled();
-      expect(mocks.triage).not.toHaveBeenCalled();
-    },
-  );
-
-  it.each<{ name: string; recovery: UpdateRunResult["recovery"] }>([
-    {
-      name: "unverified service",
-      recovery: { serviceRestartSafe: true, packageRollbackVerified: true, version: "2026.9.1" },
-    },
-  ])("keeps ordinary failure actions for $name", async ({ recovery }) => {
+  it("keeps signal-cancelled rollback quiet", async () => {
     const f = setup();
-    f.result.recovery = recovery;
+    f.result.steps.push({
+      name: "update",
+      command: "synthetic-update",
+      cwd: "/synthetic",
+      durationMs: 1,
+      exitCode: 130,
+      termination: "signal",
+    });
+    await f.run();
+    expectUnused("select", "prepare", "submit", "triage");
+  });
+
+  it("keeps ordinary failure actions for an unverified service", async () => {
+    const f = setup();
+    f.result.recovery = {
+      serviceRestartSafe: true,
+      packageRollbackVerified: true,
+      version: "2026.9.1",
+    };
     await f.run();
     expect(mocks.select).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({ message: "Choose the next action for this failed update" }),
@@ -239,8 +228,7 @@ describe("verified rollback failure actions", () => {
         ).rejects.toMatchObject({ code: 1 });
       });
 
-      expect(mocks.select).not.toHaveBeenCalled();
-      expect(mocks.triage).not.toHaveBeenCalled();
+      expectUnused("select", "triage");
     },
   );
 
@@ -250,7 +238,6 @@ describe("verified rollback failure actions", () => {
       await withUpdateFailureTriage(f.opts, f.target, async () => {});
     });
 
-    expect(mocks.select).not.toHaveBeenCalled();
-    expect(mocks.triage).not.toHaveBeenCalled();
+    expectUnused("select", "triage");
   });
 });
