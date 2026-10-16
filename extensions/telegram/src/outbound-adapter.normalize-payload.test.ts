@@ -1,56 +1,55 @@
-import { adaptMessagePresentationForChannel } from "openclaw/plugin-sdk/interactive-runtime";
+import {
+  adaptMessagePresentationForChannel,
+  type MessagePresentationButton,
+} from "openclaw/plugin-sdk/interactive-runtime";
 import { describe, expect, it } from "vitest";
 import { telegramOutbound } from "./outbound-adapter.js";
 
+type Payload = Parameters<NonNullable<typeof telegramOutbound.normalizePayload>>[0]["payload"];
+const normalize = (payload: Payload) => telegramOutbound.normalizePayload?.({ cfg: {}, payload });
+const buttons = (...items: MessagePresentationButton[]) => ({
+  blocks: [{ type: "buttons" as const, buttons: items }],
+});
+const genericPresentation = buttons({ label: "Generic", value: "generic" });
+const nativeButtons = [[{ text: "Native", callback_data: "native" }]];
+const fallbackText = { text: "Pablo Daily Summary", replacesPayloadIndex: 0 };
+const reactionPayload = {
+  fallbackText,
+  channelData: { telegram: { reaction: { emoji: "+1", replyToId: "123" } } },
+};
+const firstButtons = [[{ text: "Open task 1", callback_data: "one" }]];
+const secondButtons = [[{ text: "Open task 2", callback_data: "two" }]];
+
 describe("telegramOutbound normalizePayload", () => {
   it("suppresses metadata-only button payloads when no fallback text exists", () => {
-    const normalized = telegramOutbound.normalizePayload?.({
-      cfg: {} as never,
-      payload: {
+    expect(
+      normalize({
         channelData: {
-          telegram: {
-            buttons: [[{ text: "Open task", url: "https://example.test/task" }]],
-          },
+          telegram: { buttons: [[{ text: "Open task", url: "https://example.test/task" }]] },
         },
-      },
-    });
-
-    expect(normalized).toBeNull();
+      }),
+    ).toBeNull();
   });
 
   it("suppresses unrelated metadata-only payloads even when fallback text exists", () => {
-    const normalized = telegramOutbound.normalizePayload?.({
-      cfg: {} as never,
-      payload: {
+    expect(
+      normalize({
         fallbackText: { text: "Pablo Daily Summary\n- Review the stuck cron." },
         channelData: { plugin: { traceId: "trace-1" } },
-      },
-    });
-
-    expect(normalized).toBeNull();
+      }),
+    ).toBeNull();
   });
 
   it("merges all fallback adopters into the linked summary and keeps reactions separate", () => {
     const payloads = [
       { text: "Pablo Daily Summary" },
-      {
-        fallbackText: { text: "Pablo Daily Summary", replacesPayloadIndex: 0 },
-        channelData: { telegram: { reaction: { emoji: "+1", replyToId: "123" } } },
-      },
-      {
-        fallbackText: { text: "Pablo Daily Summary", replacesPayloadIndex: 0 },
-        channelData: { telegram: { buttons: [[{ text: "Open task 1", callback_data: "one" }]] } },
-      },
-      {
-        fallbackText: { text: "Pablo Daily Summary", replacesPayloadIndex: 0 },
-        channelData: { telegram: { buttons: [[{ text: "Open task 2", callback_data: "two" }]] } },
-      },
+      reactionPayload,
+      { fallbackText, channelData: { telegram: { buttons: firstButtons } } },
+      { fallbackText, channelData: { telegram: { buttons: secondButtons } } },
     ];
-    const normalizedPayloads = payloads.map(
-      (payload) => telegramOutbound.normalizePayload?.({ cfg: {} as never, payload }) ?? payload,
-    );
+    const normalizedPayloads = payloads.map((payload) => normalize(payload) ?? payload);
     const normalized = telegramOutbound.normalizePayloadBatch?.({
-      cfg: {} as never,
+      cfg: {},
       payloads: normalizedPayloads.map((payload, index) => ({ index, payload })),
     });
 
@@ -80,17 +79,10 @@ describe("telegramOutbound normalizePayload", () => {
 describe("telegramOutbound presentation", () => {
   it("preserves fallback labels after core capability adaptation", async () => {
     const label = "Open the workspace with the complete deployment instructions for production";
-    const sourcePresentation = {
-      blocks: [
-        {
-          type: "buttons" as const,
-          buttons: [
-            { label: "Continue", action: { type: "command" as const, command: "/continue" } },
-            { label, action: { type: "web-app" as const, url: "https://example.com/app" } },
-          ],
-        },
-      ],
-    };
+    const sourcePresentation = buttons(
+      { label: "Continue", action: { type: "command", command: "/continue" } },
+      { label, action: { type: "web-app", url: "https://example.com/app" } },
+    );
     const rendered = await telegramOutbound.renderPresentation?.({
       payload: { presentationTextMode: "fallback" },
       presentation: adaptMessagePresentationForChannel({
@@ -112,20 +104,9 @@ describe("telegramOutbound presentation", () => {
     const rendered = await telegramOutbound.renderPresentation?.({
       payload: {
         text: "Use native buttons:",
-        channelData: {
-          telegram: {
-            buttons: [[{ text: "Native", callback_data: "native" }]],
-          },
-        },
+        channelData: { telegram: { buttons: nativeButtons } },
       },
-      presentation: {
-        blocks: [
-          {
-            type: "buttons",
-            buttons: [{ label: "Generic", value: "generic" }],
-          },
-        ],
-      },
+      presentation: genericPresentation,
       ctx: { cfg: {} } as never,
     });
 
@@ -139,18 +120,9 @@ describe("telegramOutbound presentation", () => {
     const rendered = await telegramOutbound.renderPresentation?.({
       payload: {
         text: "Choose:",
-        interactive: {
-          blocks: [{ type: "buttons", buttons: [{ label: "Legacy", value: "legacy" }] }],
-        },
+        interactive: buttons({ label: "Legacy", value: "legacy" }),
       },
-      presentation: {
-        blocks: [
-          {
-            type: "buttons",
-            buttons: [{ label: "Generic", value: "generic" }],
-          },
-        ],
-      },
+      presentation: genericPresentation,
       ctx: { cfg: {} } as never,
     });
     expect(rendered?.channelData?.telegram).toMatchObject({
@@ -164,32 +136,31 @@ describe("telegramOutbound presentation", () => {
 describe("telegramOutbound.sanitizeText", () => {
   const islandText =
     'before <details><summary>More</summary>body</details> <tg-math-block>x^2</tg-math-block> <ul><li><input type="checkbox" checked/>done</li></ul>';
-
-  it("converts HTML to plain markers for non-rich accounts", () => {
-    const sanitized = telegramOutbound.sanitizeText?.({
+  type SanitizeOptions = Parameters<NonNullable<typeof telegramOutbound.sanitizeText>>[0];
+  const sanitize = (cfg: SanitizeOptions["cfg"], accountId?: string) =>
+    telegramOutbound.sanitizeText?.({
       text: islandText,
       payload: { text: islandText },
-      cfg: { channels: { telegram: {} } } as never,
+      cfg,
+      accountId,
+    });
+  const preservesDetails = (telegram: { richMessages?: boolean }) =>
+    telegramOutbound.preserveMarkdownDetails?.({
+      cfg: { channels: { telegram } },
       accountId: "default",
     });
+
+  it("converts HTML to plain markers for non-rich accounts", () => {
+    const sanitized = sanitize({ channels: { telegram: {} } }, "default");
     expect(sanitized).not.toContain("<details>");
     expect(sanitized).toContain("**More**\n\nbody");
     expect(sanitized).toContain("• done");
   });
 
   it("resolves the effective named default account when accountId is omitted", () => {
-    const cfg = {
-      channels: {
-        telegram: {
-          defaultAccount: "rich-bot",
-          accounts: { "rich-bot": { richMessages: true } },
-        },
-      },
-    } as never;
-    const sanitized = telegramOutbound.sanitizeText?.({
-      text: islandText,
-      payload: { text: islandText },
-      cfg,
+    const accounts = { "rich-bot": { richMessages: true } };
+    const sanitized = sanitize({
+      channels: { telegram: { defaultAccount: "rich-bot", accounts } },
     });
     expect(sanitized).toContain("<details><summary>More</summary>");
     expect(sanitized).toContain("<tg-math-block>x^2</tg-math-block>");
@@ -197,17 +168,7 @@ describe("telegramOutbound.sanitizeText", () => {
   });
 
   it("advertises native details preservation only for rich accounts", () => {
-    expect(
-      telegramOutbound.preserveMarkdownDetails?.({
-        cfg: { channels: { telegram: { richMessages: true } } } as never,
-        accountId: "default",
-      }),
-    ).toBe(true);
-    expect(
-      telegramOutbound.preserveMarkdownDetails?.({
-        cfg: { channels: { telegram: {} } } as never,
-        accountId: "default",
-      }),
-    ).toBe(false);
+    expect(preservesDetails({ richMessages: true })).toBe(true);
+    expect(preservesDetails({})).toBe(false);
   });
 });
