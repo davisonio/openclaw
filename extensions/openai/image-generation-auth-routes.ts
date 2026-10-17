@@ -46,18 +46,23 @@ export function hasCodexResponseTransportProfileConfigured(
   if (!store) {
     return false;
   }
-  return modelAuth.listProfilesForProvider(store, "openai").some((profileId) => {
-    const credential = store.profiles[profileId];
-    return (
-      (credential?.type === "oauth" || credential?.type === "token") &&
-      resolveModelAuthPolicy({
-        provider: "openai",
-        mode: credential.type,
-        authFlow: credential.type === "oauth" ? credential.authFlow : undefined,
-        capability: "image-generation",
-      })?.compatible === true
-    );
-  });
+  return modelAuth
+    .listProfilesForProvider(store, "openai")
+    .some((profileId) => isCodexImageSubscription(store.profiles[profileId]));
+}
+
+function isCodexImageSubscription(
+  credential: AuthProfileStore["profiles"][string] | undefined,
+): credential is Extract<AuthProfileStore["profiles"][string], { type: "oauth" | "token" }> {
+  return (
+    (credential?.type === "oauth" || credential?.type === "token") &&
+    resolveModelAuthPolicy({
+      provider: "openai",
+      mode: credential.type,
+      authFlow: credential.type === "oauth" ? credential.authFlow : undefined,
+      capability: "image-generation",
+    })?.compatible === true
+  );
 }
 
 // Free ChatGPT plans cannot generate images through Codex sign-in, and the Codex client
@@ -84,15 +89,15 @@ export function hasOnlyFreeChatGPTPlanProfiles(
   if (credentials.some((credential) => credential?.type === "api_key")) {
     return false;
   }
-  const subscriptions = credentials.filter(
-    (credential) => credential?.type === "oauth" || credential?.type === "token",
-  );
+  // Sign in with ChatGPT profiles never reach the image routes, so they cannot veto
+  // another credential such as OPENAI_API_KEY.
+  const subscriptions = credentials.filter(isCodexImageSubscription);
   return (
     subscriptions.length > 0 &&
     subscriptions.every((credential) =>
-      credential?.type === "oauth"
+      credential.type === "oauth"
         ? isFreeChatGPTPlan(credential.access, credential.chatgptPlanType)
-        : credential?.type === "token" && isFreeChatGPTPlan(credential.token),
+        : isFreeChatGPTPlan(credential.token),
     )
   );
 }

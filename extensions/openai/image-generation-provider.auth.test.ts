@@ -253,5 +253,16 @@ describe("OpenAI image generation auth availability", () => {
       vi.stubEnv("OPENAI_API_KEY", "sk-test");
       await expectConfigured({ agentDir: "/tmp/agent" }, false);
     });
+
+    it("ignores Free Sign in with ChatGPT profiles that cannot reach the image routes", async () => {
+      authConfigured = true;
+      authStore = freePlanStore();
+      authStore.profiles["openai:default"] = {
+        ...authStore.profiles["openai:default"],
+        authFlow: "chatgpt-token-sharing",
+      } as AuthProfileStore["profiles"][string];
+      vi.stubEnv("OPENAI_API_KEY", "sk-test");
+      await expectConfigured({ agentDir: "/tmp/agent" }, true);
+    });
   });
 });

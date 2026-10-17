@@ -7,7 +7,8 @@ const { resolveApiKeyForProviderMock, postJsonRequestMock } = vi.hoisted(() => (
   postJsonRequestMock: vi.fn(),
 }));
 
-vi.mock("openclaw/plugin-sdk/provider-auth-runtime", () => ({
+vi.mock("openclaw/plugin-sdk/provider-auth-runtime", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("openclaw/plugin-sdk/provider-auth-runtime")>()),
   resolveApiKeyForProvider: resolveApiKeyForProviderMock,
 }));
 
@@ -16,7 +17,8 @@ vi.mock("openclaw/plugin-sdk/provider-http", async (importOriginal) => ({
   postJsonRequest: postJsonRequestMock,
 }));
 
-vi.mock("openclaw/plugin-sdk/logging-core", () => ({
+vi.mock("openclaw/plugin-sdk/logging-core", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("openclaw/plugin-sdk/logging-core")>()),
   createSubsystemLogger: vi.fn(() => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() })),
 }));
 
