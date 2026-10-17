@@ -29,7 +29,7 @@ import {
 } from "./default-models.js";
 import {
   hasCodexResponseTransportProfileConfigured,
-  hasOnlyFreeChatGPTPlanProfiles,
+  hasFreeChatGPTPlanProfile,
   hasOpenAIImageApiKeyProfile,
   isFreeChatGPTPlan,
   type OpenAIImageModelAuth,
@@ -38,6 +38,8 @@ import {
 import { resolveConfiguredOpenAIBaseUrl } from "./shared.js";
 
 const DEFAULT_OPENAI_IMAGE_BASE_URL = "https://api.openai.com/v1";
+const FREE_CHATGPT_PLAN_IMAGE_ERROR =
+  "OpenAI image generation is not included in the Free ChatGPT plan. Upgrade the plan, or configure an OpenAI API key to use the OpenAI Images API.";
 const DEFAULT_OPENAI_CODEX_IMAGE_BASE_URL = OPENAI_CODEX_RESPONSES_BASE_URL;
 const OPENAI_MODEL_REF_PREFIX = "openai/";
 const DEFAULT_OPENAI_CODEX_IMAGE_RESPONSES_MODEL = OPENAI_CODEX_DEFAULT_MODEL.slice(
@@ -454,9 +456,7 @@ async function generateOpenAICodexImage(params: {
 }): Promise<ImageGenerationResult> {
   const { req, apiKey } = params;
   if (isFreeChatGPTPlan(apiKey)) {
-    throw new Error(
-      "OpenAI image generation is not available on the Free ChatGPT plan through ChatGPT sign-in. Upgrade the plan, or configure models.providers.openai with an API key to use the OpenAI Images API.",
-    );
+    throw new Error(FREE_CHATGPT_PLAN_IMAGE_ERROR);
   }
   const timeoutMs = resolveOpenAIImageTimeoutMs(req.timeoutMs);
   const { createSubsystemLogger: createLogger } = await import("openclaw/plugin-sdk/logging-core");
@@ -662,17 +662,7 @@ export function buildOpenAIImageGenerationProvider(
         store: authStore,
         capability: "image-generation",
       });
-      if (!configured || !(directRoute || hasOpenAIImageProfileRoute(cfg, authStore, modelAuth))) {
-        return false;
-      }
-      // OPENAI_API_KEY does not count: ChatGPT sign-in keeps the Codex route.
-      if (hasExplicitOpenAIImageApiKeyConfig(cfg)) {
-        return true;
-      }
-      return !hasOnlyFreeChatGPTPlanProfiles(
-        authStore ?? (await resolveRequestAuthStore({ agentDir }, modelAuth)),
-        modelAuth,
-      );
+      return configured && (directRoute || hasOpenAIImageProfileRoute(cfg, authStore, modelAuth));
     },
     async generateImage(req) {
       const inputImages = req.inputImages ?? [];
@@ -737,6 +727,9 @@ export function buildOpenAIImageGenerationProvider(
         imageAuth = undefined;
       }
       if (!imageAuth?.apiKey) {
+        if (hasFreeChatGPTPlanProfile(await resolveRequestAuthStore(req, modelAuth), modelAuth)) {
+          throw new Error(FREE_CHATGPT_PLAN_IMAGE_ERROR);
+        }
         if (!publicOpenAIBaseUrl) {
           throw new Error("OpenAI API key missing");
         }

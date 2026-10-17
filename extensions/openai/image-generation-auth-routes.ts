@@ -46,13 +46,18 @@ export function hasCodexResponseTransportProfileConfigured(
   if (!store) {
     return false;
   }
-  return modelAuth
-    .listProfilesForProvider(store, "openai")
-    .some((profileId) => isCodexImageSubscription(store.profiles[profileId]));
+  return modelAuth.listProfilesForProvider(store, "openai").some((profileId) => {
+    const credential = store.profiles[profileId];
+    return isCodexImageSubscription(
+      credential,
+      credential?.type === "oauth" ? credential.chatgptPlanType : undefined,
+    );
+  });
 }
 
 function isCodexImageSubscription(
   credential: AuthProfileStore["profiles"][string] | undefined,
+  planType?: string,
 ): credential is Extract<AuthProfileStore["profiles"][string], { type: "oauth" | "token" }> {
   return (
     (credential?.type === "oauth" || credential?.type === "token") &&
@@ -60,14 +65,14 @@ function isCodexImageSubscription(
       provider: "openai",
       mode: credential.type,
       authFlow: credential.type === "oauth" ? credential.authFlow : undefined,
+      planType,
       capability: "image-generation",
     })?.compatible === true
   );
 }
 
-// Free ChatGPT plans cannot generate images through Codex sign-in, and the Codex client
-// withholds its image tool from them (openai/codex#34850). The refreshed access token
-// carries the current plan; the plan stored at login is the fallback. Unknown plans pass.
+// The auth policy filters logins whose stored plan is Free. Logins that never stored a
+// plan still carry it in the access token, so read the claim first. Unknown plans pass.
 export function isFreeChatGPTPlan(access: unknown, storedPlanType?: string): boolean {
   const planType =
     (typeof access === "string"
@@ -76,28 +81,21 @@ export function isFreeChatGPTPlan(access: unknown, storedPlanType?: string): boo
   return planType?.trim().toLowerCase() === "free";
 }
 
-export function hasOnlyFreeChatGPTPlanProfiles(
+/** True when a ChatGPT sign-in that could otherwise reach the image routes is on the Free plan. */
+export function hasFreeChatGPTPlanProfile(
   store: AuthProfileStore | undefined,
   modelAuth: OpenAIImageModelAuth,
 ): boolean {
   if (!store) {
     return false;
   }
-  const credentials = modelAuth
-    .listProfilesForProvider(store, "openai")
-    .map((profileId) => store.profiles[profileId]);
-  if (credentials.some((credential) => credential?.type === "api_key")) {
-    return false;
-  }
-  // Sign in with ChatGPT profiles never reach the image routes, so they cannot veto
-  // another credential such as OPENAI_API_KEY.
-  const subscriptions = credentials.filter(isCodexImageSubscription);
-  return (
-    subscriptions.length > 0 &&
-    subscriptions.every((credential) =>
-      credential.type === "oauth"
-        ? isFreeChatGPTPlan(credential.access, credential.chatgptPlanType)
-        : isFreeChatGPTPlan(credential.token),
-    )
-  );
+  return modelAuth.listProfilesForProvider(store, "openai").some((profileId) => {
+    const credential = store.profiles[profileId];
+    if (!isCodexImageSubscription(credential)) {
+      return false;
+    }
+    return credential.type === "oauth"
+      ? isFreeChatGPTPlan(credential.access, credential.chatgptPlanType)
+      : isFreeChatGPTPlan(credential.token);
+  });
 }

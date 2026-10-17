@@ -1,6 +1,10 @@
+import { type AuthProfileStore, listProfilesForProvider } from "openclaw/plugin-sdk/provider-auth";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildOpenAIImageGenerationProvider } from "./image-generation-provider.js";
-import { createChatGPTAccessToken } from "./image-generation-provider.test-support.js";
+import {
+  createChatGPTAccessToken,
+  createCodexOAuthAuthStore,
+} from "./image-generation-provider.test-support.js";
 
 const { resolveApiKeyForProviderMock, postJsonRequestMock } = vi.hoisted(() => ({
   resolveApiKeyForProviderMock: vi.fn(),
@@ -24,7 +28,7 @@ vi.mock("openclaw/plugin-sdk/logging-core", async (importOriginal) => ({
 
 const provider = buildOpenAIImageGenerationProvider({
   ensureAuthProfileStoreAsync: vi.fn(),
-  listProfilesForProvider: vi.fn(() => []),
+  listProfilesForProvider,
   isProviderApiKeyConfiguredAsync: vi.fn(),
 });
 
@@ -50,8 +54,34 @@ afterEach(() => {
 describe("OpenAI Codex image generation on ChatGPT plans", () => {
   it("fails before any request when the ChatGPT sign-in is on the Free plan", async () => {
     await expect(generateWithChatGPTPlan("free")).rejects.toThrow(
-      "OpenAI image generation is not available on the Free ChatGPT plan through ChatGPT sign-in.",
+      "OpenAI image generation is not included in the Free ChatGPT plan.",
     );
+    expect(postJsonRequestMock).not.toHaveBeenCalled();
+  });
+
+  it("names the Free plan when it is the only sign-in and no API key can serve images", async () => {
+    resolveApiKeyForProviderMock.mockRejectedValue(
+      new Error('No API key found for provider "openai".'),
+    );
+    const authStore: AuthProfileStore = {
+      version: 1,
+      profiles: {
+        "openai:default": {
+          ...createCodexOAuthAuthStore().profiles["openai:default"],
+          chatgptPlanType: "free",
+        },
+      },
+    };
+
+    await expect(
+      provider.generateImage({
+        provider: "openai",
+        model: "gpt-image-2",
+        prompt: "Draw an avatar",
+        cfg: {},
+        authStore,
+      }),
+    ).rejects.toThrow("OpenAI image generation is not included in the Free ChatGPT plan.");
     expect(postJsonRequestMock).not.toHaveBeenCalled();
   });
 
